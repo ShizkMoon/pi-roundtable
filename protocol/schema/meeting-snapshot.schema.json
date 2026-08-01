@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/v1/meeting-snapshot.schema.json",
+  "title": "Pi Roundtable meeting snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "meetingId", "sequence", "runtimeGeneration", "phase", "roles"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "meetingId": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "runtimeGeneration": { "type": "integer", "minimum": 0 },
+    "phase": { "enum": ["created", "live", "closed"] },
+    "activeSpeakerId": { "type": ["string", "null"] },
+    "pendingInterruptorId": { "type": ["string", "null"] },
+    "roles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["roleId", "displayName", "status"],
+        "properties": {
+          "roleId": { "type": "string", "minLength": 1 },
+          "displayName": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["idle", "thinking", "speaking", "tool", "offline"] }
+        }
+      }
+    }
+  }
+}

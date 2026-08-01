@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/v1/meeting-event.schema.json",
+  "title": "Pi Roundtable meeting event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocolVersion",
+    "meetingId",
+    "eventId",
+    "sequence",
+    "runtimeGeneration",
+    "kind",
+    "occurredAt",
+    "payload"
+  ],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "meetingId": { "$ref": "#/$defs/id" },
+    "eventId": { "$ref": "#/$defs/id" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "runtimeGeneration": { "type": "integer", "minimum": 1 },
+    "kind": {
+      "enum": [
+        "runtime.lease_acquired",
+        "runtime.lease_released",
+        "meeting.opened",
+        "meeting.closed",
+        "role.registered",
+        "role.left",
+        "speech.started",
+        "speech.delta",
+        "speech.completed",
+        "speech.cancelled",
+        "interruption.requested",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+        "subagent.spawned",
+        "subagent.progress",
+        "subagent.completed",
+        "subagent.failed"
+      ]
+    },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "actorId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "targetId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "causationId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "payload": { "type": "object", "additionalProperties": true }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$" }
+  }
+}

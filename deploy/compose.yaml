@@ -1,0 +1,11 @@
+services:
+  sync-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4317
+    ports:
+      - "127.0.0.1:4317:4317"
+    restart: unless-stopped

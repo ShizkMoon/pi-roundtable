@@ -1,0 +1,44 @@
+# Editors and operating systems
+.idea/
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
+
+# C++ / CMake
+out/
+build/
+CMakeUserPresets.json
+compile_commands.json
+
+# Node / TypeScript
+node_modules/
+**/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Android / Gradle
+.gradle/
+.kotlin/
+local.properties
+**/.cxx/
+**/captures/
+*.apk
+*.aab
+
+# WinUI / .NET
+**/bin/
+**/obj/
+AppPackages/
+BundleArtifacts/
+Generated Files/
+
+# Local runtime state and credentials
+.env
+.env.*
+!.env.example
+data/
+*.session.jsonl
+*.omp

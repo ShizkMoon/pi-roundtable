@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/v1/meeting-command.schema.json",
+  "title": "Pi Roundtable meeting command",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "meetingId", "commandId", "kind", "issuedAt", "payload"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "meetingId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "commandId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "kind": {
+      "enum": [
+        "meeting.open",
+        "meeting.close",
+        "role.add",
+        "role.remove",
+        "speech.prompt",
+        "speech.interrupt",
+        "generation.cancel",
+        "subagent.spawn",
+        "tool.invoke"
+      ]
+    },
+    "issuedAt": { "type": "string", "format": "date-time" },
+    "expectedSequence": { "type": ["integer", "null"], "minimum": 0 },
+    "runtimeGeneration": { "type": ["integer", "null"], "minimum": 1 },
+    "actorId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "targetId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "payload": { "type": "object", "additionalProperties": true }
+  }
+}

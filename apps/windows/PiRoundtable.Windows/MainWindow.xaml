@@ -1,0 +1,149 @@
+<Window
+    x:Class="PiRoundtable.Windows.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Pi Roundtable">
+
+    <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="52" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Grid
+            x:Name="AppTitleBar"
+            Padding="16,0"
+            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel VerticalAlignment="Center">
+                <TextBlock FontSize="16" FontWeight="SemiBold" Text="通行证定价评审" />
+                <TextBlock
+                    FontSize="11"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    Text="4 个角色 · Runtime 在线" />
+            </StackPanel>
+            <Border
+                Grid.Column="1"
+                Padding="12,5"
+                VerticalAlignment="Center"
+                Background="{ThemeResource SystemFillColorSuccessBackgroundBrush}"
+                CornerRadius="12">
+                <TextBlock FontSize="11" FontWeight="SemiBold" Text="LIVE" />
+            </Border>
+        </Grid>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="260" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="320" />
+            </Grid.ColumnDefinitions>
+
+            <Border
+                Padding="20"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="0,1,1,0">
+                <StackPanel Spacing="12">
+                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="圆桌角色" />
+                    <Border Padding="12" Background="{ThemeResource AccentFillColorSecondaryBrush}" CornerRadius="8">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="系统策划" />
+                            <TextBlock Opacity="0.75" Text="发言中 · 规则与长期循环" />
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="数值策划" />
+                            <TextBlock Opacity="0.75" Text="思考中 · 经济与成长曲线" />
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="玩法策划" />
+                            <TextBlock Opacity="0.75" Text="使用工具 · 机制与手感" />
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold" Text="主持人" />
+                            <TextBlock Opacity="0.75" Text="等待 · 议程与共识" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </Border>
+
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <ScrollViewer Padding="24">
+                    <StackPanel MaxWidth="880" HorizontalAlignment="Stretch" Spacing="14">
+                        <TextBlock FontSize="24" FontWeight="SemiBold" Text="实时交流" />
+                        <Border Padding="18" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="12">
+                            <StackPanel Spacing="9">
+                                <TextBlock FontWeight="SemiBold" Text="数值策划 · 14:31" />
+                                <TextBlock
+                                    Text="第一阶奖励应同时解释免费价值和付费增量，否则玩家只会看到两个互相冲突的锚点。"
+                                    TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+                        <Border Padding="18" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="12">
+                            <StackPanel Spacing="9">
+                                <TextBlock FontWeight="SemiBold" Text="系统策划 · 14:32" />
+                                <TextBlock
+                                    Text="打断一下。先冻结价格讨论：Lv1 必须让玩家在购买通行证之前就感到已经值回解锁成本，再谈额外奖励。"
+                                    TextWrapping="Wrap" />
+                                <TextBlock
+                                    Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                    Text="已打断数值策划 · generation 12" />
+                                <Button
+                                    HorizontalAlignment="Left"
+                                    Content="打断当前角色"
+                                    Style="{StaticResource AccentButtonStyle}" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+                <Grid
+                    Grid.Row="1"
+                    Padding="16"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="0,1,0,0"
+                    ColumnSpacing="10">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox PlaceholderText="给主持人补充约束…" />
+                    <Button Grid.Column="1" Content="发送" />
+                </Grid>
+            </Grid>
+
+            <Border
+                Grid.Column="2"
+                Padding="22"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1,1,0,0">
+                <StackPanel Spacing="15">
+                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="会议状态" />
+                    <TextBlock FontWeight="SemiBold" Text="Runtime Owner" />
+                    <TextBlock Opacity="0.75" Text="Windows · 本机" />
+                    <TextBlock FontWeight="SemiBold" Text="代次 / 事件游标" />
+                    <TextBlock Opacity="0.75" Text="12 / 184" />
+                    <TextBlock FontWeight="SemiBold" Text="同步" />
+                    <TextBlock Opacity="0.75" Text="SSE 已连接" />
+                    <Rectangle Height="1" Margin="0,8" Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                    <TextBlock FontWeight="SemiBold" Text="工具与 SubAgent" />
+                    <TextBlock
+                        Opacity="0.75"
+                        Text="玩法策划正在调用 economy-simulator；1 个 SubAgent 在核验竞品数据。"
+                        TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

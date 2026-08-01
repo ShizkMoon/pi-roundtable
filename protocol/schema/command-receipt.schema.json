@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/v1/command-receipt.schema.json",
+  "title": "Pi Roundtable command receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocolVersion", "meetingId", "commandId", "status", "acknowledgedAt"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "meetingId": { "type": "string", "minLength": 1 },
+    "commandId": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["accepted", "rejected", "duplicate"] },
+    "acknowledgedAt": { "type": "string", "format": "date-time" },
+    "sequence": { "type": ["integer", "null"], "minimum": 1 },
+    "errorCode": { "type": ["string", "null"] },
+    "message": { "type": ["string", "null"] }
+  }
+}
