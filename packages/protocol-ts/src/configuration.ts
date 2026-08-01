@@ -62,12 +62,23 @@ export interface SkillProfile {
   description: string;
   source: SkillSource;
   risk?: "low" | "medium" | "high";
+  importStatus?: "registered" | "installed" | "review_required" | "blocked";
+  installDirectory?: string;
+  auditSummary?: string;
+  auditedAt?: string;
   enabled: boolean;
 }
 
 export interface McpServerProfile {
   mcpServerId: string;
   displayName: string;
+  source?: SkillSource;
+  risk?: "low" | "medium" | "high";
+  importStatus?: "registered" | "installed" | "review_required" | "blocked";
+  installDirectory?: string;
+  contentDigest?: string;
+  auditSummary?: string;
+  auditedAt?: string;
   transport: "stdio" | "streamable_http" | "sse";
   command?: string;
   arguments?: string[];

@@ -20,6 +20,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private readonly RoundtableSessionStore _sessionStore = new();
     private readonly WindowsCredentialStore _credentialStore = new();
     private readonly ClientSettingsStore _clientSettingsStore = new();
+    private readonly ProviderModelDiscoveryService _providerModelDiscovery = new();
+    private readonly CatalogImportService _catalogImport = new();
+    private readonly LlmCatalogAnalysisService _llmCatalogAnalysis = new();
     private WorkspaceConfiguration _workspace = new();
     private ClientSettingsConfiguration _clientSettings = new();
     private RuntimeHostProcess? _runtime;
@@ -33,6 +36,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private ModelProfileConfiguration? _selectedModel;
     private ModelProfileConfiguration? _selectedRoleModel;
     private ModelProfileConfiguration? _selectedInvitationModel;
+    private ModelProfileConfiguration? _selectedImportModel;
     private string _meetingTitle = "新圆桌会议";
     private string _providerDisplayName = "OpenAI";
     private string _runtimeProviderId = "openai";
@@ -52,6 +56,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private string _skillDescription = string.Empty;
     private string _skillSourceLocator = string.Empty;
     private string _mcpDisplayName = string.Empty;
+    private string _mcpSourceLocator = string.Empty;
     private string _mcpTransport = "stdio";
     private string _mcpCommandOrEndpoint = string.Empty;
     private string _themeMode = "system";
@@ -118,6 +123,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public ObservableCollection<ProviderProfileConfiguration> Providers { get; } = [];
 
     public ObservableCollection<ModelProfileConfiguration> Models { get; } = [];
+
+    public ObservableCollection<ProviderModelCandidate> DiscoveredModels { get; } = [];
 
     public ObservableCollection<SkillProfileConfiguration> Skills { get; } = [];
 
@@ -397,6 +404,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
     }
 
+    public ModelProfileConfiguration? SelectedImportModel
+    {
+        get => _selectedImportModel;
+        set => SetField(ref _selectedImportModel, value);
+    }
+
     public RoleItem? SelectedRole
     {
         get => _selectedRole;
@@ -446,6 +459,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         get => _mcpDisplayName;
         set => SetField(ref _mcpDisplayName, value);
+    }
+
+    public string McpSourceLocator
+    {
+        get => _mcpSourceLocator;
+        set => SetField(ref _mcpSourceLocator, value);
     }
 
     public string McpTransport
@@ -564,6 +583,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public string GenerationSummary => _runtimeGeneration == 0
         ? "尚未启动"
         : $"{_runtimeGeneration} / {_sequence}";
+
+    public string DiscoveredModelSummary => DiscoveredModels.Count == 0
+        ? "尚未获取模型列表"
+        : $"已发现 {DiscoveredModels.Count} 个可用模型";
 
     public Visibility TranscriptEmptyVisibility => Transcript.Count == 0
         ? Visibility.Visible
@@ -731,6 +754,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             SelectedProvider = Providers.FirstOrDefault(provider => provider.Enabled);
             SelectedModel ??= Models.FirstOrDefault(model => model.Enabled);
             SelectedInvitationModel ??= Models.FirstOrDefault(model => model.Enabled);
+            SelectedImportModel ??= Models.FirstOrDefault(model => model.Enabled);
             SelectedRoleModel = SelectedRole is null
                 ? null
                 : Models.FirstOrDefault(model => model.ModelProfileId == SelectedRole.ModelProfileId);
@@ -758,6 +782,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         ProviderEndpoint = string.Empty;
         ModelDisplayName = string.Empty;
         ModelId = string.Empty;
+        DiscoveredModels.Clear();
+        OnPropertyChanged(nameof(DiscoveredModelSummary));
     }
 
     public async Task SaveProviderConfigurationAsync(
@@ -776,10 +802,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             try
             {
                 if (string.IsNullOrWhiteSpace(ProviderDisplayName) ||
-                    string.IsNullOrWhiteSpace(RuntimeProviderId) ||
-                    string.IsNullOrWhiteSpace(ModelId))
+                    string.IsNullOrWhiteSpace(RuntimeProviderId))
                 {
-                    ShowError("提供商名称、Runtime Provider ID 和模型 ID 都不能为空。");
+                    ShowError("提供商名称和 Runtime Provider ID 不能为空。");
                     return;
                 }
                 if (!TryNormalizeEndpoint(ProviderEndpoint, out var endpoint))
@@ -814,39 +839,238 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 {
                     Providers.Add(provider);
                 }
-                var modelProfileId = SelectedModel is not null &&
-                    SelectedModel.ProviderProfileId == provider.ProviderProfileId
-                        ? SelectedModel.ModelProfileId
-                        : $"model.{NormalizeId(provider.RuntimeProviderId)}.{NormalizeId(ModelId)}";
-                var model = SelectedModel is not null && SelectedModel.ProviderProfileId == provider.ProviderProfileId
-                    ? SelectedModel
-                    : Models.FirstOrDefault(item => item.ModelProfileId == modelProfileId)
-                        ?? new ModelProfileConfiguration
-                        {
-                            ModelProfileId = modelProfileId,
-                            ProviderProfileId = provider.ProviderProfileId,
-                        };
-                model.ModelId = ModelId.Trim();
-                model.DisplayName = string.IsNullOrWhiteSpace(ModelDisplayName)
-                    ? model.ModelId
-                    : ModelDisplayName.Trim();
-                model.Enabled = true;
-                if (!Models.Contains(model))
+                ModelProfileConfiguration? model = null;
+                if (!string.IsNullOrWhiteSpace(ModelId))
                 {
-                    Models.Add(model);
+                    var modelProfileId = SelectedModel is not null &&
+                        SelectedModel.ProviderProfileId == provider.ProviderProfileId
+                            ? SelectedModel.ModelProfileId
+                            : $"model.{NormalizeId(provider.RuntimeProviderId)}.{NormalizeId(ModelId)}";
+                    model = SelectedModel is not null && SelectedModel.ProviderProfileId == provider.ProviderProfileId
+                        ? SelectedModel
+                        : Models.FirstOrDefault(item => item.ModelProfileId == modelProfileId)
+                            ?? new ModelProfileConfiguration
+                            {
+                                ModelProfileId = modelProfileId,
+                                ProviderProfileId = provider.ProviderProfileId,
+                            };
+                    model.ModelId = ModelId.Trim();
+                    model.DisplayName = string.IsNullOrWhiteSpace(ModelDisplayName)
+                        ? model.ModelId
+                        : ModelDisplayName.Trim();
+                    model.Enabled = true;
+                    if (!Models.Contains(model))
+                    {
+                        Models.Add(model);
+                    }
                 }
-                foreach (var role in LongTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
+                if (model is not null)
                 {
-                    role.ModelProfileId = model.ModelProfileId;
+                    foreach (var role in LongTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
+                    {
+                        role.ModelProfileId = model.ModelProfileId;
+                    }
                 }
                 SelectedProvider = provider;
-                SelectedModel = model;
-                SelectedInvitationModel ??= model;
+                if (model is not null)
+                {
+                    SelectedModel = model;
+                    SelectedInvitationModel ??= model;
+                    SelectedImportModel ??= model;
+                }
                 SynchronizeWorkspaceConfiguration();
                 await _workspaceStore.SaveAsync(_workspace, cancellationToken);
                 await PersistSelectedSessionAsync(cancellationToken);
                 ErrorMessage = string.Empty;
-                StatusText = "长期配置已保存";
+                StatusText = model is null ? "提供商配置已保存" : "长期配置已保存";
+                OnPropertyChanged(nameof(CanStart));
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    public async Task DiscoverProviderModelsAsync(
+        string apiKey,
+        CancellationToken cancellationToken = default)
+    {
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_disposed || IsRunning || IsBusy)
+            {
+                ShowError("会议启动或运行期间不能获取模型列表。");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(RuntimeProviderId) ||
+                !TryNormalizeEndpoint(ProviderEndpoint, out var endpoint))
+            {
+                ShowError("请填写 Runtime Provider ID，并使用 HTTPS 或本机回环 HTTP 端点。");
+                return;
+            }
+            if (ApiFamily == "custom" && endpoint is null)
+            {
+                ShowError("自定义 API 家族需要填写模型列表所在的基础端点。");
+                return;
+            }
+
+            IsBusy = true;
+            try
+            {
+                var providerProfileId = SelectedProvider?.ProviderProfileId
+                    ?? $"provider.{NormalizeId(RuntimeProviderId)}";
+                var credentialReference = SelectedProvider?.CredentialRef
+                    ?? $"wincred://PiRoundtable/provider/{providerProfileId}";
+                var secret = apiKey;
+                if (string.IsNullOrWhiteSpace(secret))
+                {
+                    secret = await _credentialStore.ReadAsync(credentialReference, cancellationToken) ?? string.Empty;
+                }
+                if (string.IsNullOrWhiteSpace(secret))
+                {
+                    ShowError("获取模型列表需要填写 API Key，或先保存该提供商的凭据。");
+                    return;
+                }
+
+                var provider = new ProviderProfileConfiguration
+                {
+                    ProviderProfileId = providerProfileId,
+                    DisplayName = string.IsNullOrWhiteSpace(ProviderDisplayName) ? RuntimeProviderId.Trim() : ProviderDisplayName.Trim(),
+                    ApiFamily = ApiFamily,
+                    RuntimeProviderId = RuntimeProviderId.Trim(),
+                    Endpoint = endpoint,
+                    CredentialRef = credentialReference,
+                };
+                IReadOnlyList<ProviderModelCandidate> discovered;
+                try
+                {
+                    discovered = await _providerModelDiscovery.DiscoverAsync(provider, secret, cancellationToken);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    ShowError("获取模型列表超时，请检查端点和网络后重试。");
+                    return;
+                }
+                catch (HttpRequestException)
+                {
+                    ShowError("无法连接模型列表端点，请检查地址、代理和网络。");
+                    return;
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    ShowError("提供商返回的模型列表不是有效 JSON。");
+                    return;
+                }
+                catch (InvalidOperationException error)
+                {
+                    ShowError(error.Message);
+                    return;
+                }
+
+                DiscoveredModels.Clear();
+                foreach (var candidate in discovered)
+                {
+                    DiscoveredModels.Add(candidate);
+                }
+                OnPropertyChanged(nameof(DiscoveredModelSummary));
+                ErrorMessage = string.Empty;
+                StatusText = discovered.Count == 0 ? "未发现可导入模型" : $"已发现 {discovered.Count} 个模型";
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    public void SelectAllDiscoveredModels()
+    {
+        foreach (var candidate in DiscoveredModels)
+        {
+            candidate.IsSelected = true;
+        }
+        OnPropertyChanged(nameof(DiscoveredModels));
+    }
+
+    public async Task ImportSelectedProviderModelsAsync(CancellationToken cancellationToken = default)
+    {
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_disposed || IsRunning || IsBusy)
+            {
+                ShowError("会议启动或运行期间不能导入模型。");
+                return;
+            }
+            var provider = SelectedProvider;
+            if (provider is null)
+            {
+                ShowError("请先保存并选择提供商，再导入发现的模型。");
+                return;
+            }
+            var selected = DiscoveredModels.Where(candidate => candidate.IsSelected).ToArray();
+            if (selected.Length == 0)
+            {
+                ShowError("请至少勾选一个要导入的模型。");
+                return;
+            }
+
+            IsBusy = true;
+            try
+            {
+                ModelProfileConfiguration? firstImported = null;
+                foreach (var candidate in selected)
+                {
+                    var model = Models.FirstOrDefault(item =>
+                        item.ProviderProfileId == provider.ProviderProfileId &&
+                        item.ModelId == candidate.ModelId);
+                    if (model is null)
+                    {
+                        var baseProfileId = $"model.{NormalizeId(provider.RuntimeProviderId)}.{NormalizeId(candidate.ModelId)}";
+                        var profileId = baseProfileId;
+                        for (var suffix = 2; Models.Any(item => item.ModelProfileId == profileId); suffix++)
+                        {
+                            profileId = $"{baseProfileId}.{suffix}";
+                        }
+                        model = new ModelProfileConfiguration
+                        {
+                            ModelProfileId = profileId,
+                            ProviderProfileId = provider.ProviderProfileId,
+                            ModelId = candidate.ModelId,
+                        };
+                        Models.Add(model);
+                    }
+                    model.DisplayName = candidate.DisplayName;
+                    model.ContextWindow = candidate.ContextWindow;
+                    model.Capabilities = candidate.Capabilities.ToList();
+                    model.Enabled = true;
+                    firstImported ??= model;
+                }
+                if (firstImported is not null)
+                {
+                    SelectedModel = firstImported;
+                    SelectedInvitationModel ??= firstImported;
+                    SelectedImportModel ??= firstImported;
+                    foreach (var role in LongTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
+                    {
+                        role.ModelProfileId = firstImported.ModelProfileId;
+                    }
+                }
+                SynchronizeWorkspaceConfiguration();
+                await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+                await PersistSelectedSessionAsync(cancellationToken);
+                ErrorMessage = string.Empty;
+                StatusText = $"已导入 {selected.Length} 个模型";
                 OnPropertyChanged(nameof(CanStart));
             }
             finally
@@ -991,46 +1215,196 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public async Task SaveSkillCatalogEntryAsync(CancellationToken cancellationToken = default)
     {
-        if (_disposed || IsRunning || IsBusy)
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
         {
-            ShowError("请先结束当前会话，再修改公共 Skill 目录。");
-            return;
-        }
-        if (string.IsNullOrWhiteSpace(SkillDisplayName) ||
-            string.IsNullOrWhiteSpace(SkillDescription) ||
-            !Uri.TryCreate(SkillSourceLocator.Trim(), UriKind.Absolute, out var source) ||
-            source.Scheme != Uri.UriSchemeHttps)
-        {
-            ShowError("Skill 导入需要名称、说明和 HTTPS 来源地址。");
-            return;
-        }
-        var skill = new SkillProfileConfiguration
-        {
-            SkillId = $"skill.{NormalizeId(SkillDisplayName)}",
-            DisplayName = SkillDisplayName.Trim(),
-            Description = SkillDescription.Trim(),
-            Source = new SkillSourceConfiguration
+            if (_disposed || IsRunning || IsBusy)
             {
-                Kind = "git",
-                Locator = source.AbsoluteUri,
-            },
-            Risk = "medium",
-            Enabled = true,
-        };
-        var existing = Skills.FirstOrDefault(item => item.SkillId == skill.SkillId);
-        if (existing is not null)
-        {
-            Skills.Remove(existing);
+                ShowError("请先结束当前会话，再导入公共 Skill。");
+                return;
+            }
+            if (!Uri.TryCreate(SkillSourceLocator.Trim(), UriKind.Absolute, out var source))
+            {
+                ShowError("请填写受支持 Git 平台的 HTTPS Skill 地址。");
+                return;
+            }
+            var importRuntime = await ResolveImportRuntimeAsync(cancellationToken);
+            if (importRuntime is null)
+            {
+                return;
+            }
+
+            IsBusy = true;
+            try
+            {
+                await using var checkout = await _catalogImport.PrepareAsync(source, cancellationToken);
+                if (checkout.Snapshot.SkillRoots.Count == 0)
+                {
+                    ShowError("仓库导入范围内没有找到 SKILL.md。");
+                    return;
+                }
+                var analysis = await _llmCatalogAnalysis.AnalyzeAsync(
+                    "skill",
+                    checkout.Snapshot,
+                    importRuntime.Value.Provider,
+                    importRuntime.Value.Model,
+                    importRuntime.Value.ApiKey,
+                    cancellationToken);
+                var displayName = string.IsNullOrWhiteSpace(SkillDisplayName)
+                    ? analysis.DisplayName
+                    : SkillDisplayName.Trim();
+                var skillId = $"skill.{NormalizeId(displayName)}";
+                var install = await _catalogImport.InstallAsync(
+                    checkout,
+                    "skill",
+                    skillId,
+                    analysis.RelativeRoot,
+                    cancellationToken);
+                var enabled = analysis.Recommended && analysis.Risk != "high";
+                var skill = new SkillProfileConfiguration
+                {
+                    SkillId = skillId,
+                    DisplayName = displayName,
+                    Description = string.IsNullOrWhiteSpace(SkillDescription) ? analysis.Description : SkillDescription.Trim(),
+                    Source = new SkillSourceConfiguration
+                    {
+                        Kind = "git",
+                        Locator = source.AbsoluteUri,
+                        ContentDigest = install.ContentDigest,
+                    },
+                    Risk = analysis.Risk,
+                    ImportStatus = enabled ? "installed" : "review_required",
+                    InstallDirectory = install.InstallDirectory,
+                    AuditSummary = analysis.AuditSummary,
+                    AuditedAt = DateTimeOffset.UtcNow,
+                    Enabled = enabled,
+                };
+                ReplaceSkill(skill);
+                SynchronizeWorkspaceConfiguration();
+                await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+                RefreshCapabilityGrants();
+                RefreshInvitationCapabilities();
+                SkillDisplayName = string.Empty;
+                SkillDescription = string.Empty;
+                SkillSourceLocator = string.Empty;
+                ErrorMessage = string.Empty;
+                StatusText = enabled
+                    ? $"Skill {skill.DisplayName} 已审阅并安装"
+                    : $"Skill {skill.DisplayName} 已隔离安装，等待人工审核";
+            }
+            catch (Exception error) when (HandleCatalogImportError(error, cancellationToken))
+            {
+                // The exception filter reports a sanitized, actionable error.
+            }
+            finally
+            {
+                IsBusy = false;
+            }
         }
-        Skills.Add(skill);
-        SynchronizeWorkspaceConfiguration();
-        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
-        RefreshCapabilityGrants();
-        RefreshInvitationCapabilities();
-        SkillDisplayName = string.Empty;
-        SkillDescription = string.Empty;
-        SkillSourceLocator = string.Empty;
-        StatusText = "Skill 已登记；安装与 LLM 安全审计仍待 Runtime Host 执行";
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    public async Task ImportMcpCatalogEntryAsync(CancellationToken cancellationToken = default)
+    {
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_disposed || IsRunning || IsBusy)
+            {
+                ShowError("请先结束当前会话，再导入公共 MCP。");
+                return;
+            }
+            if (!Uri.TryCreate(McpSourceLocator.Trim(), UriKind.Absolute, out var source))
+            {
+                ShowError("请填写受支持 Git 平台的 HTTPS MCP 地址。");
+                return;
+            }
+            var importRuntime = await ResolveImportRuntimeAsync(cancellationToken);
+            if (importRuntime is null)
+            {
+                return;
+            }
+
+            IsBusy = true;
+            try
+            {
+                await using var checkout = await _catalogImport.PrepareAsync(source, cancellationToken);
+                var analysis = await _llmCatalogAnalysis.AnalyzeAsync(
+                    "mcp",
+                    checkout.Snapshot,
+                    importRuntime.Value.Provider,
+                    importRuntime.Value.Model,
+                    importRuntime.Value.ApiKey,
+                    cancellationToken);
+                if (analysis.Transport != "stdio" ||
+                    string.IsNullOrWhiteSpace(analysis.Command) ||
+                    !IsAllowedImportedMcpCommand(analysis.Command) ||
+                    analysis.Arguments.Any(ContainsPotentialSecret))
+                {
+                    ShowError("Git 导入只接受受限启动器、无敏感参数的 stdio MCP 配置。");
+                    return;
+                }
+                var displayName = string.IsNullOrWhiteSpace(McpDisplayName)
+                    ? analysis.DisplayName
+                    : McpDisplayName.Trim();
+                var mcpId = $"mcp.{NormalizeId(displayName)}";
+                var install = await _catalogImport.InstallAsync(
+                    checkout,
+                    "mcp",
+                    mcpId,
+                    analysis.RelativeRoot,
+                    cancellationToken);
+                var workingDirectory = ResolveInstalledSubpath(
+                    install.InstallDirectory,
+                    analysis.WorkingDirectory ?? ".");
+                var server = new McpServerProfileConfiguration
+                {
+                    McpServerId = mcpId,
+                    DisplayName = displayName,
+                    Source = new SkillSourceConfiguration
+                    {
+                        Kind = "git",
+                        Locator = source.AbsoluteUri,
+                        ContentDigest = install.ContentDigest,
+                    },
+                    Risk = analysis.Risk,
+                    ImportStatus = "review_required",
+                    InstallDirectory = install.InstallDirectory,
+                    ContentDigest = install.ContentDigest,
+                    AuditSummary = analysis.AuditSummary,
+                    AuditedAt = DateTimeOffset.UtcNow,
+                    Transport = "stdio",
+                    Command = analysis.Command,
+                    Arguments = analysis.Arguments,
+                    WorkingDirectory = workingDirectory,
+                    Enabled = false,
+                };
+                ReplaceMcpServer(server);
+                SynchronizeWorkspaceConfiguration();
+                await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+                RefreshCapabilityGrants();
+                RefreshInvitationCapabilities();
+                McpDisplayName = string.Empty;
+                McpSourceLocator = string.Empty;
+                ErrorMessage = string.Empty;
+                StatusText = $"MCP {server.DisplayName} 已隔离安装，等待人工审核启用";
+            }
+            catch (Exception error) when (HandleCatalogImportError(error, cancellationToken))
+            {
+                // The exception filter reports a sanitized, actionable error.
+            }
+            finally
+            {
+                IsBusy = false;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public async Task SaveMcpCatalogEntryAsync(CancellationToken cancellationToken = default)
@@ -1053,7 +1427,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             Command = McpTransport == "stdio" ? McpCommandOrEndpoint.Trim() : null,
             Endpoint = McpTransport == "stdio" ? null : McpCommandOrEndpoint.Trim(),
             Arguments = McpTransport == "stdio" ? [] : null,
-            Enabled = true,
+            Risk = "medium",
+            ImportStatus = "review_required",
+            AuditSummary = "手动登记，尚未经过 LLM 仓库审阅；必须由用户明确批准后才会进入角色能力列表。",
+            AuditedAt = DateTimeOffset.UtcNow,
+            Enabled = false,
         };
         string? normalizedEndpoint = null;
         if (server.Transport != "stdio" && !TryNormalizeEndpoint(server.Endpoint ?? string.Empty, out normalizedEndpoint))
@@ -1065,19 +1443,58 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         {
             server.Endpoint = normalizedEndpoint;
         }
-        var existing = McpServers.FirstOrDefault(item => item.McpServerId == server.McpServerId);
-        if (existing is not null)
-        {
-            McpServers.Remove(existing);
-        }
-        McpServers.Add(server);
+        ReplaceMcpServer(server);
         SynchronizeWorkspaceConfiguration();
         await _workspaceStore.SaveAsync(_workspace, cancellationToken);
         RefreshCapabilityGrants();
         RefreshInvitationCapabilities();
         McpDisplayName = string.Empty;
         McpCommandOrEndpoint = string.Empty;
-        StatusText = "MCP 已登记；LLM 配置解析和执行器接入仍为 planned";
+        StatusText = "MCP 已登记并保持禁用，等待人工审核";
+    }
+
+    public async Task ApproveSkillAsync(string skillId, CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再批准 Skill。");
+            return;
+        }
+        var skill = Skills.FirstOrDefault(item => item.SkillId == skillId);
+        if (skill is null || skill.InstallDirectory is null || skill.Source.ContentDigest is null)
+        {
+            ShowError("该 Skill 没有可验证的本地安装，无法批准。");
+            return;
+        }
+        skill.Enabled = true;
+        skill.ImportStatus = "installed";
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        RefreshCapabilityGrants();
+        RefreshInvitationCapabilities();
+        StatusText = $"已批准 Skill {skill.DisplayName}";
+    }
+
+    public async Task ApproveMcpAsync(string mcpServerId, CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再批准 MCP。");
+            return;
+        }
+        var server = McpServers.FirstOrDefault(item => item.McpServerId == mcpServerId);
+        if (server is null)
+        {
+            ShowError("找不到要批准的 MCP 条目。");
+            return;
+        }
+        server.Enabled = true;
+        server.ImportStatus = server.InstallDirectory is null ? "registered" : "installed";
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        RefreshCapabilityGrants();
+        RefreshInvitationCapabilities();
+        StatusText = $"已批准 MCP {server.DisplayName}";
     }
 
     public async Task SaveClientSettingsAsync(
@@ -1257,9 +1674,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
 
         ErrorMessage = string.Empty;
-        var mentions = MentionTargets
-            .Where(target => target.IsMentioned && !target.Role.IsArchived)
-            .Select(target => target.RoleId)
+        var normalizedMessage = message.Trim();
+        var mentions = Roles
+            .Where(role => !role.IsArchived &&
+                           normalizedMessage.Contains($"@{role.DisplayName}", StringComparison.OrdinalIgnoreCase))
+            .Select(role => role.RoleId)
+            .Distinct(StringComparer.Ordinal)
             .ToArray();
         var receipt = await runtime.SendCommandAsync(
             "speech.broadcast",
@@ -1267,7 +1687,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             null,
             new Dictionary<string, object?>
             {
-                ["message"] = message.Trim(),
+                ["message"] = normalizedMessage,
                 ["mentions"] = mentions,
             },
             cancellationToken);
@@ -1275,10 +1695,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         {
             ShowReceiptError(receipt);
             return false;
-        }
-        foreach (var target in MentionTargets)
-        {
-            target.IsMentioned = false;
         }
         NotifySummary();
         return true;
@@ -2023,7 +2439,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         {
                             McpServerId = id,
                             ToolAllowlist = [],
-                            ApprovalMode = "always",
+                            ApprovalMode = "never",
                             ExecutionMode = "subagent_preferred",
                         })
                         .ToList(),
@@ -2076,6 +2492,31 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 throw new InvalidOperationException($"提供商 {provider.DisplayName} 缺少凭据。");
             }
             credentials.Add(provider.CredentialRef, secret);
+        }
+        foreach (var server in roles
+                     .SelectMany(role => role.McpServerIds)
+                     .Distinct(StringComparer.Ordinal)
+                     .Select(serverId => McpServers.FirstOrDefault(server =>
+                         server.McpServerId == serverId && server.Enabled))
+                     .OfType<McpServerProfileConfiguration>())
+        {
+            var references = (server.EnvironmentCredentialRefs ?? [])
+                .Concat(server.HeaderCredentialRefs ?? [])
+                .Select(pair => pair.Value)
+                .Distinct(StringComparer.Ordinal);
+            foreach (var reference in references)
+            {
+                if (credentials.ContainsKey(reference))
+                {
+                    continue;
+                }
+                var secret = await _credentialStore.ReadAsync(reference, cancellationToken);
+                if (string.IsNullOrEmpty(secret))
+                {
+                    throw new InvalidOperationException($"MCP {server.DisplayName} 缺少安全存储凭据。");
+                }
+                credentials.Add(reference, secret);
+            }
         }
         return credentials;
     }
@@ -2185,7 +2626,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     {
                         McpServerId = id,
                         ToolAllowlist = [],
-                        ApprovalMode = "always",
+                        ApprovalMode = "never",
                         ExecutionMode = "subagent_preferred",
                     })
                     .ToList(),
@@ -2221,21 +2662,121 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         };
     }
 
-    private static bool TryNormalizeEndpoint(string value, out string? endpoint)
+    private async Task<(ProviderProfileConfiguration Provider, ModelProfileConfiguration Model, string ApiKey)?>
+        ResolveImportRuntimeAsync(CancellationToken cancellationToken)
     {
-        endpoint = null;
-        if (string.IsNullOrWhiteSpace(value))
+        var model = SelectedImportModel ?? Models.FirstOrDefault(item => item.Enabled);
+        if (model is null)
         {
-            return true;
+            ShowError("LLM 辅助导入需要先选择一个长期配置模型。");
+            return null;
         }
-        if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var uri) ||
-            !string.IsNullOrEmpty(uri.UserInfo) ||
-            (uri.Scheme != Uri.UriSchemeHttps && !(uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback)))
+        var provider = Providers.FirstOrDefault(item =>
+            item.ProviderProfileId == model.ProviderProfileId && item.Enabled);
+        if (provider is null)
+        {
+            ShowError("导入审阅模型的提供商不可用。");
+            return null;
+        }
+        var apiKey = await _credentialStore.ReadAsync(provider.CredentialRef, cancellationToken);
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            ShowError("Credential Manager 中缺少导入审阅模型的提供商凭据。");
+            return null;
+        }
+        return (provider, model, apiKey);
+    }
+
+    private bool HandleCatalogImportError(Exception error, CancellationToken cancellationToken)
+    {
+        if (error is OperationCanceledException && cancellationToken.IsCancellationRequested)
         {
             return false;
         }
-        endpoint = uri.AbsoluteUri.TrimEnd('/');
+        var message = error switch
+        {
+            OperationCanceledException => "导入下载或 LLM 审阅超时，临时目录已进入清理流程。",
+            System.ComponentModel.Win32Exception => "未找到 Git，或 Git 无法在当前 Windows 环境启动。",
+            HttpRequestException => "无法连接 LLM 端点，请检查提供商地址、代理和网络。",
+            System.Text.Json.JsonException => "LLM 返回的导入审阅不是有效 JSON。",
+            InvalidOperationException => error.Message,
+            _ => "导入失败，临时文件已进入清理流程；请检查来源仓库与提供商配置。",
+        };
+        ShowError(message);
         return true;
+    }
+
+    private void ReplaceSkill(SkillProfileConfiguration skill)
+    {
+        var existing = Skills.FirstOrDefault(item => item.SkillId == skill.SkillId);
+        if (existing is not null)
+        {
+            Skills.Remove(existing);
+        }
+        Skills.Add(skill);
+    }
+
+    private void ReplaceMcpServer(McpServerProfileConfiguration server)
+    {
+        var existing = McpServers.FirstOrDefault(item => item.McpServerId == server.McpServerId);
+        if (existing is not null)
+        {
+            McpServers.Remove(existing);
+        }
+        McpServers.Add(server);
+    }
+
+    private static string ResolveInstalledSubpath(string installDirectory, string relativePath)
+    {
+        if (Path.IsPathRooted(relativePath) ||
+            relativePath.Replace('/', Path.DirectorySeparatorChar)
+                .Split(Path.DirectorySeparatorChar)
+                .Any(part => part == ".."))
+        {
+            throw new InvalidOperationException("LLM 返回了越界的 MCP 工作目录。");
+        }
+        var root = Path.GetFullPath(installDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var candidate = Path.GetFullPath(Path.Combine(installDirectory, relativePath));
+        if ((!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase) &&
+             !candidate.Equals(root.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase)) ||
+            !Directory.Exists(candidate))
+        {
+            throw new InvalidOperationException("LLM 返回的 MCP 工作目录不存在或越界。");
+        }
+        return candidate;
+    }
+
+    private static bool IsAllowedImportedMcpCommand(string command)
+    {
+        if (Path.IsPathRooted(command) ||
+            command.Contains(Path.DirectorySeparatorChar) ||
+            command.Contains(Path.AltDirectorySeparatorChar))
+        {
+            return false;
+        }
+        return command.ToLowerInvariant() is
+            "node" or "node.exe" or
+            "python" or "python.exe" or "python3" or
+            "uv" or "uv.exe" or "uvx" or "uvx.exe" or
+            "npx" or "npx.cmd" or "npm" or "npm.cmd" or "pnpm" or "pnpm.cmd" or
+            "bun" or "bun.exe" or "deno" or "deno.exe" or
+            "dotnet" or "dotnet.exe" or "cargo" or "cargo.exe";
+    }
+
+    private static bool ContainsPotentialSecret(string argument)
+    {
+        var normalized = argument.ToLowerInvariant();
+        return normalized.Contains("token=") ||
+               normalized.Contains("api-key=") ||
+               normalized.Contains("apikey=") ||
+               normalized.Contains("secret=") ||
+               normalized.Contains("password=") ||
+               normalized.StartsWith("sk-", StringComparison.Ordinal);
+    }
+
+    private static bool TryNormalizeEndpoint(string value, out string? endpoint)
+    {
+        return NetworkEndpointPolicy.TryNormalize(value, out endpoint);
     }
 
     private static string ToStorageState(string state) => state switch

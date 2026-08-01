@@ -164,6 +164,10 @@
           }
         },
         "risk": { "enum": ["low", "medium", "high"] },
+        "importStatus": { "enum": ["registered", "installed", "review_required", "blocked"] },
+        "installDirectory": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "auditSummary": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "auditedAt": { "type": "string", "format": "date-time" },
         "enabled": { "type": "boolean" }
       }
     },
@@ -174,6 +178,23 @@
       "properties": {
         "mcpServerId": { "$ref": "#/$defs/id" },
         "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "locator"],
+          "properties": {
+            "kind": { "enum": ["builtin", "local", "git"] },
+            "locator": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "contentDigest": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "importStatus": { "enum": ["registered", "installed", "review_required", "blocked"] },
+        "installDirectory": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "contentDigest": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "auditSummary": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "auditedAt": { "type": "string", "format": "date-time" },
         "transport": { "enum": ["stdio", "streamable_http", "sse"] },
         "command": {
           "type": "string",

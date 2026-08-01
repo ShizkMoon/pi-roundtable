@@ -8,10 +8,10 @@ Pi Roundtable 是一个原生 GUI 优先的多角色圆桌会议平台脚手架�
 | --- | --- | --- |
 | `protocol` | 已实现契约基础 | 版本化 JSON Schema、TypeScript 类型与目录引用完整性校验；包含工作区、会话、冻结参与者清单及长短期角色生命周期 |
 | `core` | 已实现本地闭环基础 | C++20 状态机验证 Runtime Owner、租约代次、角色生命周期、发言、中断交接与完整会议闭环；提供稳定 C ABI |
-| `packages/runtime-host` | 已实现本地多角色 Host 基础 | 固定 Pi SDK；每角色一会话；按冻结清单解析模型、System Prompt 与 Skill；stdio JSONL v2；全局序号/代次、命令幂等与规范化事件；MCP/工具执行仍关闭 |
+| `packages/runtime-host` | 已实现本地多角色 Host 基础 | 固定 Pi SDK；每角色一会话；按冻结清单解析模型、System Prompt、Skill 与已批准 MCP；MCP SDK 工具发现/调用；stdio JSONL v2；全局序号/代次、命令幂等与规范化事件 |
 | `packages/sync-server` | 已实现基础 | 内存事件日志、单运行时租约、游标回放、HTTP/SSE 开发服务器 |
 | `apps/android` | 脚手架已验证 | Kotlin + Jetpack Compose Material 3，自适应手机/平板界面；Debug APK 与单元测试已在本机通过，尚未接入同步服务 |
-| `apps/windows` | 已实现会话式本地客户端基础 | .NET 10 + WinUI 3；会话轨道、会话定义落盘、参与者工作区、逐角色模型/System Prompt/Skill/MCP 附件、多提供商长期 JSON 配置、Windows Credential Manager、安全启动本地 Host 与 C++ Core 事件验证；转录/事件历史持久化与 MSI 仍为计划 |
+| `apps/windows` | 已实现会话式本地客户端基础 | .NET 10 + WinUI 3；自适应会话轨道与公开/私聊投影；逐角色模型/System Prompt/Skill/MCP；多提供商模型发现与长期配置；Windows Credential Manager；Git Skill/MCP 的 LLM 审阅、隔离安装与显式批准；安全启动本地 Host 与 C++ Core 事件验证；完整事件日志重放与 MSI 仍为计划 |
 
 “已搭建/已实现基础”不表示已经部署。真实提供商端到端推理尚未在仓库凭据外验证；身份认证、持久化数据库、端到端加密、推送通知和生产级重连仍是后续工作。
 

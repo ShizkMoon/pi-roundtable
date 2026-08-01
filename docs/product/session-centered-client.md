@@ -12,8 +12,8 @@ Pi Roundtable is a native Windows deliberation workspace for one human host who 
 │ + New session          │                                     │ or                           │
 │ grouped sessions       │ public role and host messages       │ role status / prompt /       │
 │                        │                                     │ safe activity summary        │
-│ Current roundtable     │ @ one or more roles                 │                              │
-│ Role management       │ host composer visible to all roles  │ back to private chat         │
+│ Role management        │ @ one or more roles                 │                              │
+│                        │ host composer visible to all roles  │ back to private chat         │
 │ Skill                  │                                     │                              │
 │ MCP                    │                                     │                              │
 │ Settings               │                                     │                              │
@@ -33,7 +33,7 @@ The role editor follows the useful part of the supplied reference image: one sta
 - **MCP / tools**: server grants, exact tool allowlists, approval mode, and execution mode.
 - **Memory**: session working set, long-term write policy, and visible retention decision.
 
-The current Windows milestone edits provider/model routes, prompts, Skill references, MCP server attachments, invitation provenance, delegation mode, and retention. MCP attachments persist a deny-all tool allowlist with approval-required, SubAgent-preferred defaults; per-tool allowlist/approval/execution editing and the executor remain planned.
+The current Windows milestone edits provider/model routes, prompts, Skill references, MCP server attachments, invitation provenance, delegation mode, and retention. Imported MCP servers remain disabled until explicit catalog approval, then a role attachment authorizes that server for the participant snapshot. The Runtime Host executes discovered MCP tools with bounded input/output and transport checks. Per-tool allowlist/interactive approval editing and SubAgent-isolated execution remain planned; an empty tool allowlist currently exposes all tools from the explicitly approved and attached server.
 
 Creating a temporary role uses the same editor as a required review sheet. “Invite to session” stays disabled until purpose, prompt, model route, and retention are complete. Skills/MCP may be empty, but absence must be explicit.
 
@@ -58,7 +58,7 @@ Segoe UI Variable carries interface text; Cascadia Mono is reserved for model ID
 - Provider/model changes are saved explicitly and reused; secrets are never displayed after storage.
 - Editing a long-term role affects future participant bindings, not frozen manifests in an active or closed session.
 - Grant changes during a live session are commands and normalized events, not silent local edits.
-- Network-heavy capabilities default to isolated SubAgent execution with summary-and-citation return.
+- Network-heavy capabilities carry a `subagent_preferred` policy marker; isolated SubAgent execution with summary-and-citation return remains the next execution-layer milestone.
 - Empty and error states name the missing configuration and link directly to the relevant editor.
 - A host message may mention one or more roles, but it remains public and is eventually available to every participant's public context.
 - A private host message is visible only to the host and its selected role. It is never injected into another role's context.
@@ -67,9 +67,9 @@ Segoe UI Variable carries interface text; Cascadia Mono is reserved for model ID
 
 ## Milestone status
 
-- **Implemented:** session groups; separate Role/Skill/MCP/Settings pages; per-session public and private message projections; public multi-mention commands; one-role private commands; safe role-detail/back flow; native adaptive side panes; durable provider/model/theme/sync settings (sync credential remains in Credential Manager).
-- **Scaffolded:** Git-based Skill/MCP catalog registration and remote synchronization configuration.
-- **Planned:** LLM-assisted repository inspection, installation and security review; MCP execution and per-tool approval UI; authenticated/E2EE remote synchronization; full event-log persistence and replay.
+- **Implemented:** session groups and session-click navigation; separate Role/Skill/MCP/Settings pages; compact public transcript with read-only participant list; public multi-mention and one-role private commands; safe role-detail/back flow; native adaptive side panes; durable provider/model/theme/sync settings; provider model-list discovery/import; Windows Credential Manager; bounded Git checkout, redacted LLM repository review, isolated atomic Skill/MCP install, catalog approval lifecycle; approved MCP tool discovery and execution.
+- **Scaffolded:** remote synchronization configuration and normalized local public/private projections.
+- **Planned:** per-tool interactive approval UI; SubAgent-isolated network/tool execution; authenticated/E2EE remote synchronization; durable long-term memory and prompt-revision execution; full normalized event-log persistence and replay; signed MSI packaging.
 
 ## Reference boundaries
 

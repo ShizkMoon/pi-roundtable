@@ -20,6 +20,10 @@ import type {
   RuntimeEventListener,
   RuntimeSessionInfo,
 } from "./runtime-adapter.js";
+import {
+  McpClientManager,
+  type ResolvedMcpServerRuntimeConfiguration,
+} from "./mcp-client-manager.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
@@ -34,7 +38,7 @@ export interface PiSessionHandle {
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
   abort(): Promise<void>;
-  dispose(): void;
+  dispose(): void | Promise<void>;
 }
 
 export interface PiSessionCreateOptions {
@@ -47,6 +51,7 @@ export interface PiSessionCreateOptions {
   apiKey: string;
   systemPrompt: string;
   skillPaths: readonly string[];
+  mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
 }
 
 export interface PiSessionFactory {
@@ -65,6 +70,7 @@ export interface PiRuntimeAdapterOptions {
   tools?: readonly string[];
   systemPrompt?: string;
   skillPaths?: readonly string[];
+  mcpServers?: readonly ResolvedMcpServerRuntimeConfiguration[];
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
 }
@@ -132,30 +138,57 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       );
     }
 
-    const createOptions: CreateAgentSessionOptions = {
-      cwd: options.cwd,
-      modelRuntime,
-      model,
-      sessionManager: SessionManager.inMemory(options.cwd, { id: options.sessionId }),
-      resourceLoader: new DefaultResourceLoader({
+    const mcpManager = new McpClientManager(options.mcpServers);
+    try {
+      const customTools = await mcpManager.connect();
+      const createOptions: CreateAgentSessionOptions = {
         cwd: options.cwd,
-        agentDir: options.agentDir ?? getAgentDir(),
-        noSkills: true,
-        additionalSkillPaths: [...options.skillPaths],
-        systemPromptOverride: () => options.systemPrompt,
-      }),
-    };
-    if (options.agentDir !== undefined) {
-      createOptions.agentDir = options.agentDir;
-    }
-    if (options.tools.length === 0) {
-      createOptions.noTools = "all";
-    } else {
-      createOptions.tools = [...options.tools];
-    }
+        modelRuntime,
+        model,
+        customTools,
+        sessionManager: SessionManager.inMemory(options.cwd, { id: options.sessionId }),
+        resourceLoader: new DefaultResourceLoader({
+          cwd: options.cwd,
+          agentDir: options.agentDir ?? getAgentDir(),
+          noSkills: true,
+          additionalSkillPaths: [...options.skillPaths],
+          systemPromptOverride: () => options.systemPrompt,
+        }),
+      };
+      if (options.agentDir !== undefined) {
+        createOptions.agentDir = options.agentDir;
+      }
+      const toolNames = [...options.tools, ...customTools.map((tool) => tool.name)];
+      if (toolNames.length === 0) {
+        createOptions.noTools = "all";
+      } else {
+        createOptions.tools = toolNames;
+      }
 
-    const { session } = await createAgentSession(createOptions);
-    return session;
+      const { session } = await createAgentSession(createOptions);
+      return {
+        sessionId: session.sessionId,
+        get isStreaming() {
+          return session.isStreaming;
+        },
+        getActiveToolNames: () => session.getActiveToolNames(),
+        subscribe: (listener) => session.subscribe(listener),
+        prompt: (text, promptOptions) => session.prompt(text, promptOptions),
+        steer: (text) => session.steer(text),
+        followUp: (text) => session.followUp(text),
+        abort: () => session.abort(),
+        dispose: async () => {
+          try {
+            session.dispose();
+          } finally {
+            await mcpManager.close();
+          }
+        },
+      };
+    } catch (error) {
+      await mcpManager.close();
+      throw error;
+    }
   },
 };
 
@@ -383,6 +416,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         apiKey,
         systemPrompt: this.#options.systemPrompt ?? "",
         skillPaths: [...(this.#options.skillPaths ?? [])],
+        mcpServers: [...(this.#options.mcpServers ?? [])],
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;
@@ -414,7 +448,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       return info;
     } catch (error) {
       unsubscribe?.();
-      session?.dispose();
+      await session?.dispose();
       const cancelled = this.#state === "stopping";
       if (this.#state === "starting") {
         this.#state = "stopped";
@@ -464,7 +498,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       }
     } finally {
       try {
-        session.dispose();
+        await session.dispose();
       } finally {
         this.#state = "stopped";
         this.#emit("runtime.stopped", {});

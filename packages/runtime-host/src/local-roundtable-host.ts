@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   PROTOCOL_VERSION,
@@ -18,6 +18,10 @@ import {
 } from "@pi-roundtable/protocol";
 
 import { PiRuntimeAdapter } from "./pi-runtime-adapter.js";
+import {
+  validateRemoteMcpEndpoint,
+  type ResolvedMcpServerRuntimeConfiguration,
+} from "./mcp-client-manager.js";
 import type {
   RuntimeAdapter,
   RuntimeCommandResult,
@@ -29,6 +33,8 @@ export interface LocalRoundtableHostOptions {
   runtimeId?: string;
   runtimeGeneration?: number;
   cwd?: string;
+  catalogSkillRoot?: string;
+  catalogMcpRoot?: string;
   now?: () => Date;
   adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
 }
@@ -40,6 +46,7 @@ export interface ResolvedRoleRuntimeConfiguration {
   apiKey: string;
   systemPrompt: string;
   skillPaths: string[];
+  mcpServers: ResolvedMcpServerRuntimeConfiguration[];
 }
 
 interface HostedRole {
@@ -872,6 +879,7 @@ export class LocalRoundtableHost {
       tools: [],
       systemPrompt: configuration.systemPrompt,
       skillPaths: configuration.skillPaths,
+      mcpServers: configuration.mcpServers,
       credentialProvider: {
         resolveApiKey: async (providerId: string) =>
           providerId === configuration.providerId ? configuration.apiKey : undefined,
@@ -982,9 +990,81 @@ export class LocalRoundtableHost {
         throw new Error("Participant skill grant cannot be resolved");
       }
       if (skill.source.kind === "git") {
-        throw new Error("Git Skill sources must be installed into an approved local root first");
+        if (
+          skill.importStatus !== "installed" ||
+          skill.installDirectory === undefined ||
+          skill.source.contentDigest === undefined
+        ) {
+          throw new Error("Git Skill source is not a verified local installation");
+        }
+        return this.#resolveApprovedSkillPath(skill.installDirectory);
       }
       return this.#resolveApprovedSkillPath(skill.source.locator);
+    });
+    const mcpGrants = participant.capabilitiesSnapshot.mcpGrants;
+    if (mcpGrants.length > 16) {
+      throw new Error("Participant MCP server grant limit exceeded");
+    }
+    const mcpServers = mcpGrants.map((grant): ResolvedMcpServerRuntimeConfiguration => {
+      if (grant.approvalMode !== "never") {
+        throw new Error("MCP grants requiring interactive approval cannot run headlessly");
+      }
+      const server = workspace.mcpServers.find(
+        (candidate) => candidate.mcpServerId === grant.mcpServerId && candidate.enabled,
+      );
+      if (server === undefined) {
+        throw new Error("Participant MCP grant cannot be resolved");
+      }
+      if (!["registered", "installed"].includes(server.importStatus ?? "registered")) {
+        throw new Error("Participant MCP server has not completed explicit catalog approval");
+      }
+      if (
+        server.transport === "stdio" &&
+        (server.command === undefined || !this.#isAllowedImportedMcpCommand(server.command))
+      ) {
+        throw new Error("MCP stdio command is outside the approved launcher allowlist");
+      }
+      if (server.transport !== "stdio") {
+        if (server.endpoint === undefined) {
+          throw new Error("Remote MCP server is missing an endpoint");
+        }
+        validateRemoteMcpEndpoint(server.endpoint);
+      }
+      let resolvedWorkingDirectory = server.workingDirectory;
+      if (server.source?.kind === "git") {
+        if (
+          server.importStatus !== "installed" ||
+          server.installDirectory === undefined ||
+          server.contentDigest === undefined ||
+          server.source.contentDigest !== server.contentDigest
+        ) {
+          throw new Error("Git MCP source is not a verified local installation");
+        }
+        resolvedWorkingDirectory = this.#resolveApprovedMcpWorkingDirectory(
+          server.installDirectory,
+          server.workingDirectory,
+        );
+      }
+      return {
+        serverId: server.mcpServerId,
+        displayName: server.displayName,
+        transport: server.transport,
+        ...(server.command === undefined ? {} : { command: server.command }),
+        ...(server.arguments === undefined ? {} : { arguments: server.arguments }),
+        ...(resolvedWorkingDirectory === undefined
+          ? {}
+          : { workingDirectory: resolvedWorkingDirectory }),
+        ...(server.endpoint === undefined ? {} : { endpoint: server.endpoint }),
+        ...this.#optionalCredentialField(
+          "environment",
+          this.#resolveCredentialReferences(server.environmentCredentialRefs),
+        ),
+        ...this.#optionalCredentialField(
+          "headers",
+          this.#resolveCredentialReferences(server.headerCredentialRefs),
+        ),
+        toolAllowlist: [...grant.toolAllowlist],
+      };
     });
     return {
       displayName,
@@ -993,6 +1073,7 @@ export class LocalRoundtableHost {
       apiKey,
       systemPrompt,
       skillPaths,
+      mcpServers,
     };
   }
 
@@ -1004,6 +1085,12 @@ export class LocalRoundtableHost {
       resolve(homedir(), ".codex", "skills"),
       resolve(homedir(), ".agents", "skills"),
       resolve(homedir(), ".pi", "agent", "skills"),
+      ...(this.#options.catalogSkillRoot === undefined
+        ? []
+        : [resolve(this.#options.catalogSkillRoot)]),
+      ...(process.env.LOCALAPPDATA === undefined
+        ? []
+        : [resolve(process.env.LOCALAPPDATA, "PiRoundtable", "catalog", "skills")]),
     ]
       .filter((root) => existsSync(root))
       .map((root) => realpathSync(root));
@@ -1016,11 +1103,75 @@ export class LocalRoundtableHost {
     const leaf = basename(candidate).toLowerCase();
     const candidateType = statSync(candidate);
     const isSkillManifest = leaf === "skill.md" && candidateType.isFile();
-    const isSkillDirectory = extname(candidate) === "" && candidateType.isDirectory();
+    const isSkillDirectory = candidateType.isDirectory();
     if (!isApproved || (!isSkillManifest && !isSkillDirectory)) {
       throw new Error("Skill locator is outside approved roots or is not a Skill directory/manifest");
     }
     return candidate;
+  }
+
+  #resolveApprovedMcpWorkingDirectory(
+    installDirectory: string,
+    workingDirectory: string | undefined,
+  ): string {
+    const approvedRoots = [
+      ...(this.#options.catalogMcpRoot === undefined
+        ? []
+        : [resolve(this.#options.catalogMcpRoot)]),
+      ...(process.env.LOCALAPPDATA === undefined
+        ? []
+        : [resolve(process.env.LOCALAPPDATA, "PiRoundtable", "catalog", "mcp")]),
+    ]
+      .filter((root) => existsSync(root))
+      .map((root) => realpathSync(root));
+    const installation = realpathSync(resolve(installDirectory));
+    const approved = approvedRoots.some((root) => {
+      const pathFromRoot = relative(root, installation);
+      return pathFromRoot === "" ||
+        (!pathFromRoot.startsWith(".." + sep) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
+    });
+    const working = realpathSync(resolve(workingDirectory ?? installDirectory));
+    const pathFromInstallation = relative(installation, working);
+    const contained = pathFromInstallation === "" ||
+      (!pathFromInstallation.startsWith(".." + sep) &&
+        pathFromInstallation !== ".." &&
+        !isAbsolute(pathFromInstallation));
+    if (!approved || !contained || !statSync(working).isDirectory()) {
+      throw new Error("Git MCP working directory is outside its approved installation");
+    }
+    return working;
+  }
+
+  #resolveCredentialReferences(
+    references: Record<string, string> | undefined,
+  ): Record<string, string> | undefined {
+    if (references === undefined) {
+      return undefined;
+    }
+    return Object.fromEntries(Object.entries(references).map(([name, reference]) => {
+      const credential = this.#credentials.get(reference);
+      if (credential === undefined || credential.length === 0) {
+        throw new Error("MCP credential is unavailable");
+      }
+      return [name, credential];
+    }));
+  }
+
+  #optionalCredentialField<K extends "environment" | "headers">(
+    name: K,
+    value: Record<string, string> | undefined,
+  ): { [P in K]?: Record<string, string> } {
+    return value === undefined ? {} : { [name]: value } as { [P in K]: Record<string, string> };
+  }
+
+  #isAllowedImportedMcpCommand(command: string): boolean {
+    return [
+      "node", "node.exe", "python", "python.exe", "python3",
+      "uv", "uv.exe", "uvx", "uvx.exe",
+      "npx", "npx.cmd", "npm", "npm.cmd", "pnpm", "pnpm.cmd",
+      "bun", "bun.exe", "deno", "deno.exe",
+      "dotnet", "dotnet.exe", "cargo", "cargo.exe",
+    ].includes(command.toLowerCase());
   }
 
   #isActiveTurnEvent(roleId: string, event: RuntimeEvent): boolean {
