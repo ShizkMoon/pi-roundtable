@@ -29,7 +29,7 @@ The currently implemented low-level OMP client:
 5. correlates command responses by ID;
 6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
 
-Cross-role scheduling, durable role sessions, host-tool callbacks, approval gates, prompt/memory policy, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
+The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. Durable role sessions, host-tool callbacks, approval gates, prompt/memory policy, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
 
 ### Sync server
 
@@ -37,7 +37,7 @@ Cross-role scheduling, durable role sessions, host-tool callbacks, approval gate
 
 ### Native clients
 
-Windows uses .NET 10 LTS with WinUI 3 and will own the first local runtime integration. A normal local meeting must work without a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
+Windows uses .NET 10 LTS with WinUI 3 and owns the implemented first local runtime integration. It supervises the stdio Host, sends normalized commands, applies every event to the C++ core, and projects accepted state into the UI. A normal local meeting does not require a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
 
 ## 3. Interruption model
 

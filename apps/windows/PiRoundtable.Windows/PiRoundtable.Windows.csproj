@@ -22,4 +22,12 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
   </ItemGroup>
+
+  <PropertyGroup>
+    <NativeCoreDevPath>$(MSBuildProjectDirectory)\..\..\..\out\build\dev\core\pi_roundtable_core.dll</NativeCoreDevPath>
+  </PropertyGroup>
+
+  <Target Name="CopyDevelopmentNativeCore" AfterTargets="Build" Condition="Exists('$(NativeCoreDevPath)') and '$(RuntimeIdentifier)' == 'win-x64'">
+    <Copy SourceFiles="$(NativeCoreDevPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

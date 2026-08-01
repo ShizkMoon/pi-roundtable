@@ -122,6 +122,11 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
         return reject(ApplyError::InvalidTransition);
     }
 
+    if ((event.kind == EventKind::MeetingOpened || event.kind == EventKind::MeetingClosed) &&
+        runtime_owner_id_ != event.actor_id) {
+        return reject(ApplyError::InvalidActor);
+    }
+
     switch (event.kind) {
         case EventKind::MeetingOpened:
             if (phase_ != MeetingPhase::Created) {

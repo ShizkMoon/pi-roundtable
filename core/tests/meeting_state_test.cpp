@@ -178,6 +178,69 @@ void c_api_exposes_role_lifecycle() {
     pr_meeting_destroy(meeting);
 }
 
+void runtime_owner_controls_meeting_phase() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    const auto forged_open = state.apply(
+        {2, 1, EventKind::MeetingOpened, "role.host", ""});
+    check(forged_open.error == ApplyError::InvalidActor,
+        "only the active runtime owner may open a meeting");
+    apply_ok(state, {2, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+    const auto forged_close = state.apply(
+        {3, 1, EventKind::MeetingClosed, "runtime.other", ""});
+    check(forged_close.error == ApplyError::InvalidActor,
+        "only the active runtime owner may close a meeting");
+    apply_ok(state, {3, 1, EventKind::MeetingClosed, "runtime.windows", ""});
+}
+
+void complete_local_roundtable_loop_is_deterministic() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.host", ""});
+    apply_ok(state, {3, 1, EventKind::RoleTemporaryRegistered, "role.critic", ""});
+    apply_ok(state, {4, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+    apply_ok(state, {5, 1, EventKind::SpeechStarted, "role.host", ""});
+    apply_ok(state, {6, 1, EventKind::SpeechDelta, "role.host", ""});
+    apply_ok(state, {7, 1, EventKind::InterruptionRequested, "role.critic", "role.host"});
+    check(state.pending_interrupt_target_id() == "role.host",
+        "core should retain the interruption target until cancellation");
+    apply_ok(state, {8, 1, EventKind::SpeechCancelled, "runtime.windows", "role.host"});
+    apply_ok(state, {9, 1, EventKind::SpeechStarted, "role.critic", ""});
+    apply_ok(state, {10, 1, EventKind::SpeechCompleted, "role.critic", ""});
+    apply_ok(state, {11, 1, EventKind::RolePromoted, "role.critic", ""});
+    apply_ok(state, {12, 1, EventKind::MeetingClosed, "runtime.windows", ""});
+    apply_ok(state, {13, 1, EventKind::RuntimeLeaseReleased, "runtime.windows", ""});
+
+    check(state.phase() == MeetingPhase::Closed, "meeting should finish closed");
+    check(!state.lease_active(), "closed local loop should release its runtime lease");
+    check(state.role_scope("role.critic") == RoleScope::LongTerm,
+        "retained temporary role should finish promoted");
+    check(state.last_sequence() == 13, "every accepted local event should be ordered");
+}
+
+void c_api_exposes_interruption_projection_and_errors() {
+    pr_meeting* meeting = pr_meeting_create();
+    check(meeting != nullptr, "C API should allocate a meeting");
+    const pr_event events[] = {
+        {1, 1, PR_EVENT_RUNTIME_LEASE_ACQUIRED, "runtime.windows", nullptr},
+        {2, 1, PR_EVENT_ROLE_REGISTERED, "role.host", nullptr},
+        {3, 1, PR_EVENT_ROLE_TEMPORARY_REGISTERED, "role.critic", nullptr},
+        {4, 1, PR_EVENT_MEETING_OPENED, "runtime.windows", nullptr},
+        {5, 1, PR_EVENT_SPEECH_STARTED, "role.host", nullptr},
+        {6, 1, PR_EVENT_INTERRUPTION_REQUESTED, "role.critic", "role.host"},
+    };
+    for (const auto& event : events) {
+        check(pr_meeting_apply(meeting, &event).error == PR_APPLY_OK,
+            "C API local-loop event should apply");
+    }
+    check(pr_meeting_role_count(meeting) == 2, "C API should expose active role count");
+    check(std::string{pr_meeting_pending_interrupt_target(meeting)} == "role.host",
+        "C API should expose interruption target");
+    check(std::string{pr_apply_error_message(PR_APPLY_FLOOR_BUSY)} == "floor_busy",
+        "C API should expose stable machine-readable error text");
+    pr_meeting_destroy(meeting);
+}
+
 }  // namespace
 
 int main() {
@@ -189,6 +252,9 @@ int main() {
         higher_generation_supersedes_an_expired_owner();
         role_lifecycle_is_deterministic();
         c_api_exposes_role_lifecycle();
+        runtime_owner_controls_meeting_phase();
+        complete_local_roundtable_loop_is_deterministic();
+        c_api_exposes_interruption_projection_and_errors();
         std::cout << "pi_roundtable_core_tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

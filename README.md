@@ -7,13 +7,13 @@ Pi Roundtable 是一个原生 GUI 优先的多角色圆桌会议平台脚手架�
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | `protocol` | 已搭建 | 版本化 JSON Schema 与 TypeScript 契约；已加入长短期角色生命周期事件 |
-| `core` | 已实现基础 | 无外部依赖的 C++20 会议状态机、租约代次 fencing、打断、角色晋升/归档状态转换、C ABI 与测试 |
-| `packages/runtime-host` | 已实现 Pi 直接适配基础 | 固定 Pi SDK 版本；每个角色一个会话；凭据运行时注入；工具默认关闭；事件归一化与命令幂等；OMP JSONL/v2 仍是可选低层兼容客户端 |
+| `core` | 已实现本地闭环基础 | C++20 状态机验证 Runtime Owner、租约代次、角色生命周期、发言、中断交接与完整会议闭环；提供稳定 C ABI |
+| `packages/runtime-host` | 已实现本地多角色 Host 基础 | 固定 Pi SDK；每角色一会话；stdio JSONL 入口；全局序号/代次、基础主持调度、命令幂等与规范化事件；工具默认关闭 |
 | `packages/sync-server` | 已实现基础 | 内存事件日志、单运行时租约、游标回放、HTTP/SSE 开发服务器 |
 | `apps/android` | 脚手架已验证 | Kotlin + Jetpack Compose Material 3，自适应手机/平板界面；Debug APK 与单元测试已在本机通过，尚未接入同步服务 |
-| `apps/windows` | 工程脚手架已验证 | .NET 10 LTS + WinUI 3 已本机构建；客户端接入、提供商配置、安全凭据存储与 MSI 仍为计划 |
+| `apps/windows` | 已实现本地客户端基础 | .NET 10 + WinUI 3；可配置提供商、启动本地 Host、管理长短期角色、发送/取消/打断发言，并用 C++ Core 验证事件；安全凭据持久化与 MSI 仍为计划 |
 
-“已搭建/已实现基础”不表示已经部署。身份认证、持久化数据库、端到端加密、推送通知和生产级重连仍是后续工作。
+“已搭建/已实现基础”不表示已经部署。真实提供商端到端推理尚未在仓库凭据外验证；身份认证、持久化数据库、端到端加密、推送通知和生产级重连仍是后续工作。
 
 ## 架构边界
 
@@ -37,7 +37,7 @@ flowchart LR
 - 移动端使用前台流式连接、游标回放与后续推送，不假设永久后台 WebSocket。
 - 角色打断是显式状态转换：请求打断 → 取消当前发言 → 新角色取得发言权。
 
-更完整的边界见 [架构说明](docs/architecture.md)、[运行时所有权 ADR](docs/adr/0001-runtime-ownership.md)、[Pi-first 运行时 ADR](docs/adr/0003-pi-first-runtime.md) 和 [现代 Agent/Windows 基线 ADR](docs/adr/0004-modern-agent-and-windows-baseline.md)。
+更完整的边界见 [架构说明](docs/architecture.md)、[运行时所有权 ADR](docs/adr/0001-runtime-ownership.md)、[Pi-first 运行时 ADR](docs/adr/0003-pi-first-runtime.md)、[现代 Agent/Windows 基线 ADR](docs/adr/0004-modern-agent-and-windows-baseline.md) 和 [本地纵向闭环 ADR](docs/adr/0005-local-roundtable-vertical-slice.md)。
 
 ## 快速开始
 
@@ -70,12 +70,18 @@ npm run dev:sync
 
 ### Windows
 
-安装仓库 `global.json` 所指定的 .NET 10 SDK 与 Visual Studio 的 WinUI 应用开发工作负载后：
+安装仓库 `global.json` 所指定的 .NET 10 SDK 与 Visual Studio 的 WinUI 应用开发工作负载后，先构建 Runtime Host 与本机 Core：
 
 ```powershell
+node --version
+npm run build
+cmake --preset dev
+cmake --build --preset dev
 dotnet restore apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 ```
+
+开发客户端会向上查找 `packages/runtime-host/dist/host-main.js`，并在 x64 构建时复制 `out/build/dev/core/pi_roundtable_core.dll`。也可分别用 `PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT` 与 `PI_ROUNDTABLE_NODE_PATH` 指定路径。API Key 目前通过一次性 stdin 初始化帧传给本次子进程，不进入子进程环境、事件或配置文件，也不会持久化。
 
 ## 版本基线
 

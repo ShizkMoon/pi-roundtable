@@ -63,6 +63,9 @@ public:
     [[nodiscard]] const std::optional<std::string>& pending_interruptor_id() const noexcept {
         return pending_interruptor_id_;
     }
+    [[nodiscard]] const std::optional<std::string>& pending_interrupt_target_id() const noexcept {
+        return pending_interrupt_target_id_;
+    }
     [[nodiscard]] bool has_role(const std::string& role_id) const;
     [[nodiscard]] std::size_t role_count() const noexcept;
     [[nodiscard]] std::optional<RoleScope> role_scope(const std::string& role_id) const;

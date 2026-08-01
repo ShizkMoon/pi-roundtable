@@ -2,147 +2,317 @@
     x:Class="PiRoundtable.Windows.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:models="using:PiRoundtable.Windows.Models"
     Title="Pi Roundtable">
 
     <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
         <Grid.RowDefinitions>
-            <RowDefinition Height="52" />
+            <RowDefinition Height="64" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <Grid
             x:Name="AppTitleBar"
-            Padding="16,0"
+            Padding="20,0"
             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
-            <StackPanel VerticalAlignment="Center">
-                <TextBlock FontSize="16" FontWeight="SemiBold" Text="通行证定价评审" />
+            <StackPanel VerticalAlignment="Center" Spacing="2">
                 <TextBlock
-                    FontSize="11"
+                    FontSize="18"
+                    FontWeight="SemiBold"
+                    Text="{Binding MeetingTitle}" />
+                <TextBlock
+                    FontSize="12"
                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                    Text="4 个角色 · Runtime 在线" />
+                    Text="{Binding MeetingSummary}" />
             </StackPanel>
-            <Border
+            <StackPanel
                 Grid.Column="1"
-                Padding="12,5"
                 VerticalAlignment="Center"
-                Background="{ThemeResource SystemFillColorSuccessBackgroundBrush}"
-                CornerRadius="12">
-                <TextBlock FontSize="11" FontWeight="SemiBold" Text="LIVE" />
-            </Border>
+                Orientation="Horizontal"
+                Spacing="12">
+                <ProgressRing
+                    Width="18"
+                    Height="18"
+                    IsActive="{Binding IsBusy}" />
+                <Border
+                    Padding="12,6"
+                    Background="{ThemeResource AccentFillColorSecondaryBrush}"
+                    CornerRadius="14">
+                    <TextBlock
+                        FontSize="12"
+                        FontWeight="SemiBold"
+                        Text="{Binding StatusText}" />
+                </Border>
+            </StackPanel>
         </Grid>
 
-        <Grid Grid.Row="1">
+        <InfoBar
+            Grid.Row="1"
+            Margin="16,12,16,0"
+            CloseButtonClick="ErrorInfoBar_CloseButtonClick"
+            IsClosable="True"
+            IsOpen="{Binding HasError, Mode=OneWay}"
+            Message="{Binding ErrorMessage}"
+            Severity="Error"
+            Title="需要处理" />
+
+        <Grid Grid.Row="2" Margin="16" ColumnSpacing="16">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="260" />
-                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="280" />
+                <ColumnDefinition Width="*" MinWidth="420" />
                 <ColumnDefinition Width="320" />
             </Grid.ColumnDefinitions>
 
             <Border
-                Padding="20"
+                Padding="18"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="0,1,1,0">
-                <StackPanel Spacing="12">
-                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="圆桌角色" />
-                    <Border Padding="12" Background="{ThemeResource AccentFillColorSecondaryBrush}" CornerRadius="8">
-                        <StackPanel>
-                            <TextBlock FontWeight="SemiBold" Text="系统策划" />
-                            <TextBlock Opacity="0.75" Text="发言中 · 规则与长期循环" />
-                        </StackPanel>
-                    </Border>
-                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
-                        <StackPanel>
-                            <TextBlock FontWeight="SemiBold" Text="数值策划" />
-                            <TextBlock Opacity="0.75" Text="思考中 · 经济与成长曲线" />
-                        </StackPanel>
-                    </Border>
-                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
-                        <StackPanel>
-                            <TextBlock FontWeight="SemiBold" Text="玩法策划" />
-                            <TextBlock Opacity="0.75" Text="使用工具 · 机制与手感" />
-                        </StackPanel>
-                    </Border>
-                    <Border Padding="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
-                        <StackPanel>
-                            <TextBlock FontWeight="SemiBold" Text="主持人" />
-                            <TextBlock Opacity="0.75" Text="等待 · 议程与共识" />
-                        </StackPanel>
-                    </Border>
-                </StackPanel>
+                BorderThickness="1"
+                CornerRadius="12">
+                <Grid RowSpacing="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Spacing="4">
+                        <TextBlock FontSize="18" FontWeight="SemiBold" Text="圆桌角色" />
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="长期角色固定加入；临时角色可在会中创建。"
+                            TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <ListView
+                        Grid.Row="1"
+                        ItemsSource="{Binding Roles}"
+                        SelectedItem="{Binding SelectedRole, Mode=TwoWay}"
+                        SelectionMode="Single">
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="models:RoleItem">
+                                <StackPanel Padding="4,8" Spacing="3">
+                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                    <TextBlock
+                                        FontSize="12"
+                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                        Text="{x:Bind Summary, Mode=OneWay}" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+
+                    <StackPanel Grid.Row="2" Spacing="8">
+                        <TextBox
+                            x:Name="TemporaryRoleNameBox"
+                            Header="新临时角色"
+                            PlaceholderText="例如：安全审查员"
+                            AutomationProperties.Name="新临时角色名称" />
+                        <Button
+                            MinHeight="44"
+                            HorizontalAlignment="Stretch"
+                            Click="AddTemporaryRole_Click"
+                            Content="创建临时角色"
+                            IsEnabled="{Binding CanAddTemporaryRole}" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Button
+                                MinHeight="44"
+                                HorizontalAlignment="Stretch"
+                                Click="PromoteRole_Click"
+                                Content="转为长期"
+                                IsEnabled="{Binding CanPromoteSelectedRole}" />
+                            <Button
+                                Grid.Column="1"
+                                MinHeight="44"
+                                HorizontalAlignment="Stretch"
+                                Click="ArchiveRole_Click"
+                                Content="归档角色"
+                                IsEnabled="{Binding CanArchiveSelectedRole}" />
+                        </Grid>
+                    </StackPanel>
+                </Grid>
             </Border>
 
-            <Grid Grid.Column="1">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-                <ScrollViewer Padding="24">
-                    <StackPanel MaxWidth="880" HorizontalAlignment="Stretch" Spacing="14">
-                        <TextBlock FontSize="24" FontWeight="SemiBold" Text="实时交流" />
-                        <Border Padding="18" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="12">
-                            <StackPanel Spacing="9">
-                                <TextBlock FontWeight="SemiBold" Text="数值策划 · 14:31" />
-                                <TextBlock
-                                    Text="第一阶奖励应同时解释免费价值和付费增量，否则玩家只会看到两个互相冲突的锚点。"
-                                    TextWrapping="Wrap" />
-                            </StackPanel>
-                        </Border>
-                        <Border Padding="18" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="12">
-                            <StackPanel Spacing="9">
-                                <TextBlock FontWeight="SemiBold" Text="系统策划 · 14:32" />
-                                <TextBlock
-                                    Text="打断一下。先冻结价格讨论：Lv1 必须让玩家在购买通行证之前就感到已经值回解锁成本，再谈额外奖励。"
-                                    TextWrapping="Wrap" />
-                                <TextBlock
-                                    Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
-                                    Text="已打断数值策划 · generation 12" />
-                                <Button
-                                    HorizontalAlignment="Left"
-                                    Content="打断当前角色"
-                                    Style="{StaticResource AccentButtonStyle}" />
-                            </StackPanel>
-                        </Border>
+            <Border
+                Grid.Column="1"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="12">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Padding="20,18,20,12" Spacing="4">
+                        <TextBlock FontSize="22" FontWeight="SemiBold" Text="实时交流" />
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="消息由规范化事件流驱动；取消与打断是权威状态转换。" />
                     </StackPanel>
-                </ScrollViewer>
-                <Grid
-                    Grid.Row="1"
-                    Padding="16"
-                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="0,1,0,0"
-                    ColumnSpacing="10">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBox PlaceholderText="给主持人补充约束…" />
-                    <Button Grid.Column="1" Content="发送" />
+
+                    <ListView
+                        x:Name="TranscriptList"
+                        Grid.Row="1"
+                        Padding="12,0"
+                        ItemsSource="{Binding Transcript}"
+                        SelectionMode="None">
+                        <ListView.ItemTemplate>
+                            <DataTemplate x:DataType="models:TranscriptItem">
+                                <Border
+                                    Margin="4,5"
+                                    Padding="16"
+                                    Background="{ThemeResource LayerFillColorDefaultBrush}"
+                                    CornerRadius="10">
+                                    <StackPanel Spacing="8">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock FontWeight="SemiBold" Text="{x:Bind Speaker}" />
+                                            <TextBlock
+                                                Grid.Column="1"
+                                                FontSize="12"
+                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                Text="{x:Bind TimeLabel}" />
+                                        </Grid>
+                                        <TextBlock
+                                            Text="{x:Bind Text, Mode=OneWay}"
+                                            TextWrapping="Wrap" />
+                                        <TextBlock
+                                            FontSize="12"
+                                            Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                            Text="{x:Bind State, Mode=OneWay}" />
+                                    </StackPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ListView.ItemTemplate>
+                    </ListView>
+
+                    <StackPanel
+                        Grid.Row="2"
+                        Padding="16"
+                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                        BorderThickness="0,1,0,0"
+                        Spacing="10">
+                        <TextBox
+                            x:Name="PromptBox"
+                            MinHeight="72"
+                            AcceptsReturn="True"
+                            Header="给所选角色的议题或约束"
+                            PlaceholderText="说明目标、上下文和期望输出……"
+                            TextWrapping="Wrap"
+                            AutomationProperties.Name="会议发言指令" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="先选择左侧角色" />
+                            <Button
+                                Grid.Column="1"
+                                MinHeight="44"
+                                Click="CancelGeneration_Click"
+                                Content="停止生成"
+                                IsEnabled="{Binding CanOperate}" />
+                            <Button
+                                Grid.Column="2"
+                                MinHeight="44"
+                                Click="Interrupt_Click"
+                                Content="打断并发言"
+                                IsEnabled="{Binding CanOperate}" />
+                            <Button
+                                Grid.Column="3"
+                                MinHeight="44"
+                                Click="SendPrompt_Click"
+                                Content="发送"
+                                IsEnabled="{Binding CanSend}"
+                                Style="{StaticResource AccentButtonStyle}" />
+                        </Grid>
+                    </StackPanel>
                 </Grid>
-            </Grid>
+            </Border>
 
             <Border
                 Grid.Column="2"
-                Padding="22"
+                Padding="18"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1,1,0,0">
-                <StackPanel Spacing="15">
-                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="会议状态" />
-                    <TextBlock FontWeight="SemiBold" Text="Runtime Owner" />
-                    <TextBlock Opacity="0.75" Text="Windows · 本机" />
-                    <TextBlock FontWeight="SemiBold" Text="代次 / 事件游标" />
-                    <TextBlock Opacity="0.75" Text="12 / 184" />
-                    <TextBlock FontWeight="SemiBold" Text="同步" />
-                    <TextBlock Opacity="0.75" Text="SSE 已连接" />
-                    <Rectangle Height="1" Margin="0,8" Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
-                    <TextBlock FontWeight="SemiBold" Text="工具与 SubAgent" />
-                    <TextBlock
-                        Opacity="0.75"
-                        Text="玩法策划正在调用 economy-simulator；1 个 SubAgent 在核验竞品数据。"
-                        TextWrapping="Wrap" />
-                </StackPanel>
+                BorderThickness="1"
+                CornerRadius="12">
+                <ScrollViewer>
+                    <StackPanel Spacing="14">
+                        <StackPanel Spacing="4">
+                            <TextBlock FontSize="18" FontWeight="SemiBold" Text="本地 Runtime" />
+                            <TextBlock
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                Text="密钥仅传给本次本地 Host 进程，不写入配置文件。"
+                                TextWrapping="Wrap" />
+                        </StackPanel>
+                        <TextBox
+                            Header="会议名称"
+                            Text="{Binding MeetingTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox
+                            Header="提供商 ID"
+                            PlaceholderText="例如 openai"
+                            Text="{Binding ProviderId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBox
+                            Header="模型 ID"
+                            PlaceholderText="填写提供商支持的精确模型 ID"
+                            Text="{Binding ModelId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <PasswordBox
+                            x:Name="ApiKeyBox"
+                            Header="API Key"
+                            PasswordRevealMode="Peek"
+                            AutomationProperties.Name="提供商 API Key" />
+                        <Button
+                            MinHeight="44"
+                            HorizontalAlignment="Stretch"
+                            Click="StartMeeting_Click"
+                            Content="启动本地会议"
+                            IsEnabled="{Binding CanStart}"
+                            Style="{StaticResource AccentButtonStyle}" />
+                        <Button
+                            MinHeight="44"
+                            HorizontalAlignment="Stretch"
+                            Click="CloseMeeting_Click"
+                            Content="结束会议"
+                            IsEnabled="{Binding CanOperate}" />
+                        <Rectangle
+                            Height="1"
+                            Margin="0,4"
+                            Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                        <TextBlock FontWeight="SemiBold" Text="Runtime Owner" />
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="Windows · 本机进程" />
+                        <TextBlock FontWeight="SemiBold" Text="代次 / 事件序号" />
+                        <TextBlock
+                            FontFamily="Consolas"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="{Binding GenerationSummary}" />
+                        <TextBlock FontWeight="SemiBold" Text="当前能力边界" />
+                        <TextBlock
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            Text="工具与 SubAgent 默认关闭；云同步、密钥持久化和提示词自优化仍未启用。"
+                            TextWrapping="Wrap" />
+                    </StackPanel>
+                </ScrollViewer>
             </Border>
         </Grid>
     </Grid>

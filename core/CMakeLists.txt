@@ -27,6 +27,9 @@ target_link_libraries(pi_roundtable_c PRIVATE pi_roundtable_core)
 target_include_directories(pi_roundtable_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(pi_roundtable_c PRIVATE PR_CORE_EXPORTS)
 set_target_properties(pi_roundtable_c PROPERTIES OUTPUT_NAME pi_roundtable_core)
+if(WIN32)
+    set_target_properties(pi_roundtable_c PROPERTIES PREFIX "")
+endif()
 
 if(PI_ROUNDTABLE_BUILD_TESTS)
     add_executable(pi_roundtable_core_tests

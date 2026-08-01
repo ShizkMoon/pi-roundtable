@@ -341,13 +341,39 @@ test("rejects concurrent prompts and suppresses late failures after stop", async
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(session.abortCount, 1);
   assert.equal(events.at(-1)?.kind, "runtime.stopped");
-  assert.equal(
-    events.some(
-      (event) =>
-        event.kind === "runtime.failed" && event.payload.message === "late provider failure",
-    ),
-    false,
-  );
+  assert.equal(events.some((event) => event.kind === "runtime.failed"), false);
+});
+
+test("redacts raw provider failure details from runtime events", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  await adapter.start();
+  const session = factory.session;
+  assert.ok(session !== undefined);
+
+  await adapter.execute({
+    kind: "turn.prompt",
+    commandId: "prompt-provider-error",
+    roleId: "role.researcher",
+    message: "private prompt",
+    delivery: "immediate",
+  });
+  session.emit({ type: "turn_start" });
+  session.emit({
+    type: "message_update",
+    message: {} as never,
+    assistantMessageEvent: {
+      type: "error",
+      reason: "error",
+      error: { errorMessage: "Authorization: Bearer secret-value" } as never,
+    },
+  } as never);
+
+  const failure = events.find((event) => event.kind === "runtime.failed");
+  assert.equal(failure?.payload.message, "Pi provider response failed");
+  assert.ok(!JSON.stringify(failure).includes("secret-value"));
+  await adapter.stop();
 });
 
 test("emits cancellation without a contradictory completion", async () => {
