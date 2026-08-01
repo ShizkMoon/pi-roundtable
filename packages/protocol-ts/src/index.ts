@@ -11,6 +11,9 @@ export type MeetingEventKind =
   | "meeting.opened"
   | "meeting.closed"
   | "role.registered"
+  | "role.temporary_registered"
+  | "role.promoted"
+  | "role.archived"
   | "role.left"
   | "speech.started"
   | "speech.delta"
@@ -31,6 +34,9 @@ export const MEETING_EVENT_KINDS = [
   "meeting.opened",
   "meeting.closed",
   "role.registered",
+  "role.temporary_registered",
+  "role.promoted",
+  "role.archived",
   "role.left",
   "speech.started",
   "speech.delta",
@@ -70,12 +76,36 @@ export type MeetingCommandKind =
   | "meeting.open"
   | "meeting.close"
   | "role.add"
+  | "role.create_temporary"
+  | "role.promote"
+  | "role.archive"
   | "role.remove"
   | "speech.prompt"
   | "speech.interrupt"
   | "generation.cancel"
   | "subagent.spawn"
   | "tool.invoke";
+
+export const MEETING_COMMAND_KINDS = [
+  "meeting.open",
+  "meeting.close",
+  "role.add",
+  "role.create_temporary",
+  "role.promote",
+  "role.archive",
+  "role.remove",
+  "speech.prompt",
+  "speech.interrupt",
+  "generation.cancel",
+  "subagent.spawn",
+  "tool.invoke",
+] as const satisfies readonly MeetingCommandKind[];
+
+const MEETING_COMMAND_KIND_SET: ReadonlySet<string> = new Set(MEETING_COMMAND_KINDS);
+
+export function isMeetingCommandKind(value: unknown): value is MeetingCommandKind {
+  return typeof value === "string" && MEETING_COMMAND_KIND_SET.has(value);
+}
 
 export interface MeetingCommand {
   protocolVersion: ProtocolVersion;
@@ -99,6 +129,17 @@ export interface CommandReceipt {
   sequence?: number | null;
   errorCode?: string | null;
   message?: string | null;
+}
+
+export type RoleScope = "long_term" | "temporary";
+export type RoleLifecycle = "active" | "archived";
+
+export const ROLE_SCOPES = ["long_term", "temporary"] as const satisfies readonly RoleScope[];
+
+const ROLE_SCOPE_SET: ReadonlySet<string> = new Set(ROLE_SCOPES);
+
+export function isRoleScope(value: unknown): value is RoleScope {
+  return typeof value === "string" && ROLE_SCOPE_SET.has(value);
 }
 
 export interface RoleSnapshot {

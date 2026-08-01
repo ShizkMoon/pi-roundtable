@@ -1,13 +1,82 @@
-import type { RpcReadyFrame, RpcRecord, RpcResponse, StreamingBehavior, SubagentSubscription } from "./rpc-types.js";
+import type { JsonObject } from "@pi-roundtable/protocol";
 
-export type RpcFrameListener = (frame: RpcRecord) => void;
+export type RuntimeEngine = "pi" | "omp" | "test";
+export type RuntimeDelivery = "immediate" | "steer" | "follow_up";
+
+export interface RuntimeCapabilities {
+  steering: boolean;
+  followUp: boolean;
+  cancellation: boolean;
+  tools: boolean;
+  subagents: boolean;
+}
+
+export interface RuntimeSessionInfo {
+  runtimeId: string;
+  sessionId: string;
+  engine: RuntimeEngine;
+  capabilities: RuntimeCapabilities;
+}
+
+export type RuntimeCommand =
+  | {
+      kind: "turn.prompt";
+      commandId: string;
+      roleId: string;
+      message: string;
+      delivery: RuntimeDelivery;
+    }
+  | {
+      kind: "turn.cancel";
+      commandId: string;
+      roleId: string;
+    }
+  | {
+      kind: "subagent.subscription";
+      commandId: string;
+      roleId: string;
+      level: "off" | "progress" | "events";
+    };
+
+export type RuntimeEventKind =
+  | "runtime.ready"
+  | "runtime.stopped"
+  | "runtime.failed"
+  | "turn.started"
+  | "turn.delta"
+  | "turn.completed"
+  | "turn.cancelled"
+  | "tool.started"
+  | "tool.progress"
+  | "tool.completed"
+  | "tool.failed"
+  | "subagent.started"
+  | "subagent.progress"
+  | "subagent.completed"
+  | "subagent.failed";
+
+export interface RuntimeEvent {
+  kind: RuntimeEventKind;
+  runtimeId: string;
+  sessionId: string;
+  occurredAt: string;
+  roleId?: string | null;
+  correlationId?: string | null;
+  payload: JsonObject;
+}
+
+export interface RuntimeCommandResult {
+  commandId: string;
+  accepted: boolean;
+  errorCode?: string | null;
+  message?: string | null;
+}
+
+export type RuntimeEventListener = (event: RuntimeEvent) => void;
 
 export interface RuntimeAdapter {
-  start(): Promise<RpcReadyFrame>;
+  start(): Promise<RuntimeSessionInfo>;
   stop(): Promise<void>;
-  subscribe(listener: RpcFrameListener): () => void;
-  prompt(message: string, streamingBehavior?: StreamingBehavior): Promise<RpcResponse>;
-  abort(): Promise<RpcResponse>;
-  abortAndPrompt(message: string): Promise<RpcResponse>;
-  setSubagentSubscription(level: SubagentSubscription): Promise<RpcResponse>;
+  subscribe(listener: RuntimeEventListener): () => void;
+  execute(command: RuntimeCommand): Promise<RuntimeCommandResult>;
 }

@@ -24,6 +24,9 @@ enum class EventKind : std::uint8_t {
     SubagentProgress,
     SubagentCompleted,
     SubagentFailed,
+    RoleTemporaryRegistered,
+    RolePromoted,
+    RoleArchived,
 };
 
 struct MeetingEvent {

@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace pi_roundtable::core {
 
@@ -13,6 +13,11 @@ enum class MeetingPhase : std::uint8_t {
     Created = 0,
     Live,
     Closed,
+};
+
+enum class RoleScope : std::uint8_t {
+    LongTerm = 0,
+    Temporary,
 };
 
 enum class ApplyError : std::uint8_t {
@@ -28,6 +33,8 @@ enum class ApplyError : std::uint8_t {
     FloorBusy,
     NoActiveSpeaker,
     InterruptionPending,
+    RoleNotTemporary,
+    RoleArchived,
 };
 
 struct ApplyResult {
@@ -57,19 +64,27 @@ public:
         return pending_interruptor_id_;
     }
     [[nodiscard]] bool has_role(const std::string& role_id) const;
-    [[nodiscard]] std::size_t role_count() const noexcept { return roles_.size(); }
+    [[nodiscard]] std::size_t role_count() const noexcept;
+    [[nodiscard]] std::optional<RoleScope> role_scope(const std::string& role_id) const;
+    [[nodiscard]] bool is_role_archived(const std::string& role_id) const;
 
 private:
+    struct RoleState {
+        RoleScope scope{RoleScope::LongTerm};
+        bool archived{false};
+    };
+
     [[nodiscard]] ApplyResult reject(ApplyError error) const noexcept;
     [[nodiscard]] ApplyResult accept(std::uint64_t sequence) noexcept;
     [[nodiscard]] bool is_known_role(const std::string& role_id) const;
+    void clear_role_activity(const std::string& role_id);
 
     std::uint64_t last_sequence_{0};
     std::uint64_t runtime_generation_{0};
     bool lease_active_{false};
     std::optional<std::string> runtime_owner_id_;
     MeetingPhase phase_{MeetingPhase::Created};
-    std::unordered_set<std::string> roles_;
+    std::unordered_map<std::string, RoleState> roles_;
     std::optional<std::string> active_speaker_id_;
     std::optional<std::string> pending_interruptor_id_;
     std::optional<std::string> pending_interrupt_target_id_;

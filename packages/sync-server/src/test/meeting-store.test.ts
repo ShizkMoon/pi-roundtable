@@ -106,3 +106,32 @@ test("an expired owner cannot append a release event", () => {
   );
   assert.equal(store.eventsAfter("meeting-expired", 0).length, 1);
 });
+
+test("role lifecycle events retain generation fencing and replay order", () => {
+  let id = 0;
+  const store = new InMemoryMeetingStore({ nextId: () => `role-event-${++id}` });
+  store.acquireLease({
+    meetingId: "meeting-roles",
+    ownerRuntimeId: "runtime-windows",
+    ttlMs: 10_000,
+  });
+
+  for (const kind of [
+    "role.temporary_registered",
+    "role.promoted",
+    "role.archived",
+  ] as const) {
+    store.append({
+      meetingId: "meeting-roles",
+      ownerRuntimeId: "runtime-windows",
+      runtimeGeneration: 1,
+      kind,
+      actorId: "role-researcher",
+    });
+  }
+
+  assert.deepEqual(
+    store.eventsAfter("meeting-roles", 1).map((event) => event.kind),
+    ["role.temporary_registered", "role.promoted", "role.archived"],
+  );
+});

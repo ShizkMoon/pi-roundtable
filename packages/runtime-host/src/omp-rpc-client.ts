@@ -2,11 +2,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
 
 import { RpcFrameDecoder } from "./rpc-frame-decoder.js";
-import type { RpcFrameListener, RuntimeAdapter } from "./runtime-adapter.js";
 import {
   isRpcReadyFrame,
   isRpcResponse,
   type InterruptMode,
+  type RpcFrameListener,
   type RpcReadyFrame,
   type RpcRecord,
   type RpcResponse,
@@ -41,7 +41,7 @@ export class OmpRpcError extends Error {
   }
 }
 
-export class OmpRpcClient implements RuntimeAdapter {
+export class OmpRpcClient {
   readonly #options: OmpRpcClientOptions;
   readonly #decoder = new RpcFrameDecoder();
   readonly #listeners = new Set<RpcFrameListener>();
