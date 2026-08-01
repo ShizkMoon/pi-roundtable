@@ -2,16 +2,20 @@ import type {
   CommandReceipt,
   MeetingCommand,
   MeetingEvent,
+  RoundtableSession,
+  WorkspaceProfile,
 } from "@pi-roundtable/protocol";
 import type { RuntimeCapabilities } from "./runtime-adapter.js";
 
-export const LOCAL_HOST_PROTOCOL_VERSION = 1 as const;
+export const LOCAL_HOST_PROTOCOL_VERSION = 2 as const;
 export const MAX_LOCAL_HOST_LINE_BYTES = 1_048_576;
 
 export interface LocalHostInitializeFrame {
   type: "initialize";
   requestId: string;
-  apiKey: string;
+  workspace: WorkspaceProfile;
+  session: RoundtableSession;
+  credentials: Record<string, string>;
 }
 
 export interface LocalHostCommandFrame {
@@ -119,14 +123,36 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
 
   if (value.type === "initialize") {
     const requestId = readRequestId(value);
-    if (requestId === null || typeof value.apiKey !== "string" || value.apiKey.length === 0) {
+    if (
+      requestId === null ||
+      !isRecord(value.workspace) ||
+      !isRecord(value.session) ||
+      !isRecord(value.credentials)
+    ) {
       throw new LocalHostProtocolError(
         "invalid_frame",
-        "Initialize frames require a non-empty requestId and API key",
+        "Initialize frames require requestId, workspace, session, and credentials",
         requestId,
       );
     }
-    return { type: "initialize", requestId, apiKey: value.apiKey };
+    const credentials: Record<string, string> = {};
+    for (const [reference, secret] of Object.entries(value.credentials)) {
+      if (typeof secret !== "string" || secret.length === 0) {
+        throw new LocalHostProtocolError(
+          "invalid_frame",
+          "Initialize credential values must be non-empty strings",
+          requestId,
+        );
+      }
+      credentials[reference] = secret;
+    }
+    return {
+      type: "initialize",
+      requestId,
+      workspace: value.workspace as unknown as WorkspaceProfile,
+      session: value.session as unknown as RoundtableSession,
+      credentials,
+    };
   }
 
   if (value.type !== "command" || !isRecord(value.command)) {

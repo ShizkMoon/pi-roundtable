@@ -1,13 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   PROTOCOL_VERSION,
+  validateRoundtableSession,
   type CommandReceipt,
   type JsonObject,
   type MeetingCommand,
   type MeetingEvent,
   type MeetingEventKind,
   type RoleScope,
+  type ParticipantManifest,
+  type RoundtableSession,
+  type WorkspaceProfile,
 } from "@pi-roundtable/protocol";
 
 import { PiRuntimeAdapter } from "./pi-runtime-adapter.js";
@@ -21,12 +28,18 @@ export interface LocalRoundtableHostOptions {
   meetingId: string;
   runtimeId?: string;
   runtimeGeneration?: number;
-  providerId: string;
-  modelId: string;
-  apiKey?: string;
   cwd?: string;
   now?: () => Date;
-  adapterFactory?: (roleId: string) => RuntimeAdapter;
+  adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
+}
+
+export interface ResolvedRoleRuntimeConfiguration {
+  displayName: string;
+  providerId: string;
+  modelId: string;
+  apiKey: string;
+  systemPrompt: string;
+  skillPaths: string[];
 }
 
 interface HostedRole {
@@ -52,7 +65,7 @@ export type MeetingEventListener = (event: MeetingEvent) => void;
 export type HostDiagnosticListener = (errorCode: string, message: string) => void;
 
 export class LocalRoundtableHost {
-  readonly #options: Omit<LocalRoundtableHostOptions, "apiKey">;
+  readonly #options: LocalRoundtableHostOptions;
   readonly #runtimeId: string;
   readonly #runtimeGeneration: number;
   readonly #now: () => Date;
@@ -71,24 +84,23 @@ export class LocalRoundtableHost {
     | { roleId: string; events: RuntimeEvent[] }
     | undefined;
   #operationTail: Promise<void> = Promise.resolve();
-  #apiKey: string | undefined;
+  #workspace: WorkspaceProfile | undefined;
+  #session: RoundtableSession | undefined;
+  #credentials = new Map<string, string>();
+  #runtimeConfigurationInitialized = false;
   #stopped = false;
 
   constructor(options: LocalRoundtableHostOptions) {
     if (options.meetingId.length === 0) {
       throw new Error("meetingId is required");
     }
-    if (options.providerId.length === 0 || options.modelId.length === 0) {
-      throw new Error("providerId and modelId are required");
-    }
-    if (options.apiKey !== undefined && options.apiKey.length === 0) {
-      throw new Error("apiKey is required");
-    }
-    const { apiKey, ...hostOptions } = options;
-    this.#options = hostOptions;
-    this.#apiKey = apiKey;
+    this.#options = options;
     this.#runtimeId = options.runtimeId ?? randomUUID();
-    this.#runtimeGeneration = options.runtimeGeneration ?? 1;
+    const runtimeGeneration = options.runtimeGeneration ?? 1;
+    if (!Number.isSafeInteger(runtimeGeneration) || runtimeGeneration < 1) {
+      throw new RangeError("runtimeGeneration must be a positive safe integer");
+    }
+    this.#runtimeGeneration = runtimeGeneration;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -118,22 +130,29 @@ export class LocalRoundtableHost {
     return () => this.#diagnosticListeners.delete(listener);
   }
 
-  initializeCredential(apiKey: string): void {
-    if (apiKey.length === 0) {
-      throw new Error("apiKey is required");
+  initializeRuntimeConfiguration(
+    workspace: WorkspaceProfile,
+    session: RoundtableSession,
+    credentials: Readonly<Record<string, string>>,
+  ): void {
+    if (this.#leaseActive || this.#stopped || this.#runtimeConfigurationInitialized) {
+      throw new Error("Runtime configuration is already initialized");
     }
-    if (this.#leaseActive || this.#stopped || this.#apiKey !== undefined) {
-      throw new Error("Runtime credential is already initialized");
+    if (session.sessionId !== this.meetingId || session.workspaceId !== workspace.workspaceId) {
+      throw new Error("Runtime session does not match the meeting or workspace");
     }
-    this.#apiKey = apiKey;
+    this.#workspace = structuredClone(workspace);
+    this.#session = structuredClone(session);
+    this.#credentials = new Map(Object.entries(credentials));
+    this.#runtimeConfigurationInitialized = true;
   }
 
   start(): void {
     if (this.#leaseActive || this.#stopped) {
       throw new Error("Local Roundtable Host cannot be started again");
     }
-    if (this.#apiKey === undefined) {
-      throw new Error("Runtime credential is not initialized");
+    if (this.#options.adapterFactory === undefined && !this.#runtimeConfigurationInitialized) {
+      throw new Error("Runtime configuration is not initialized");
     }
     this.#leaseActive = true;
     this.#emit("runtime.lease_acquired", this.#runtimeId, null, null, {});
@@ -210,7 +229,10 @@ export class LocalRoundtableHost {
       this.#leaseActive = false;
       this.#emit("runtime.lease_released", this.#runtimeId, null, null, {});
     }
-    this.#apiKey = undefined;
+    this.#credentials.clear();
+    this.#workspace = undefined;
+    this.#session = undefined;
+    this.#runtimeConfigurationInitialized = false;
   }
 
   #validateEnvelope(command: MeetingCommand): CommandReceipt | undefined {
@@ -324,8 +346,26 @@ export class LocalRoundtableHost {
     if (this.#roles.has(roleId)) {
       return this.#receipt(command, "rejected", "duplicate_role", "Role already exists");
     }
-    const displayName = this.#readString(command.payload, "displayName") ?? roleId;
-    const adapter = this.#createAdapter(roleId);
+    let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+    if (
+      this.#workspace !== undefined ||
+      this.#session !== undefined ||
+      this.#options.adapterFactory === undefined ||
+      this.#readObject(command.payload, "participantManifest") !== undefined
+    ) {
+      try {
+        configuration = this.#resolveRoleRuntimeConfiguration(command.payload, roleId, scope);
+      } catch {
+        return this.#receipt(
+          command,
+          "rejected",
+          "invalid_role_manifest",
+          "The participant manifest could not be resolved against the runtime workspace",
+        );
+      }
+    }
+    const displayName = configuration?.displayName ?? this.#readString(command.payload, "displayName") ?? roleId;
+    const adapter = this.#createAdapter(roleId, configuration);
     const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
     try {
       await adapter.start();
@@ -622,21 +662,173 @@ export class LocalRoundtableHost {
     }
   }
 
-  #createAdapter(roleId: string): RuntimeAdapter {
+  #createAdapter(
+    roleId: string,
+    configuration: ResolvedRoleRuntimeConfiguration | undefined,
+  ): RuntimeAdapter {
     if (this.#options.adapterFactory !== undefined) {
-      return this.#options.adapterFactory(roleId);
+      return this.#options.adapterFactory(roleId, configuration);
+    }
+    if (configuration === undefined) {
+      throw new Error("Resolved role runtime configuration is required");
     }
     const options = {
       runtimeId: `${this.#runtimeId}:${roleId}`,
       roleId,
-      providerId: this.#options.providerId,
-      modelId: this.#options.modelId,
+      providerId: configuration.providerId,
+      modelId: configuration.modelId,
       tools: [],
-      credentialProvider: { resolveApiKey: async () => this.#apiKey },
+      systemPrompt: configuration.systemPrompt,
+      skillPaths: configuration.skillPaths,
+      credentialProvider: {
+        resolveApiKey: async (providerId: string) =>
+          providerId === configuration.providerId ? configuration.apiKey : undefined,
+      },
     };
     return new PiRuntimeAdapter(
       this.#options.cwd === undefined ? options : { ...options, cwd: this.#options.cwd },
     );
+  }
+
+  #resolveRoleRuntimeConfiguration(
+    payload: JsonObject,
+    roleId: string,
+    scope: RoleScope,
+  ): ResolvedRoleRuntimeConfiguration {
+    const workspace = this.#workspace;
+    let session = this.#session;
+    if (workspace === undefined || session === undefined) {
+      throw new Error("Workspace and session are required");
+    }
+    let participant = session.participants.find(
+      (candidate) => candidate.participantId === roleId,
+    );
+    if (participant === undefined && scope === "temporary") {
+      if (this.#phase !== "live") {
+        throw new Error("Dynamic temporary roles can only be invited during a live meeting");
+      }
+      const manifest = this.#readObject(payload, "participantManifest");
+      if (manifest === undefined) {
+        throw new Error("Temporary participant manifest is required");
+      }
+      const candidate = manifest as unknown as ParticipantManifest;
+      if (candidate.scope !== "temporary" || candidate.invitation === undefined) {
+        throw new Error("Dynamic participant must contain a temporary-role invitation");
+      }
+      const nextSession: RoundtableSession = {
+        ...session,
+        updatedAt: this.#now().toISOString(),
+        participants: [...session.participants, candidate],
+      };
+      if (validateRoundtableSession(nextSession, workspace).length > 0) {
+        throw new Error("Temporary participant manifest failed validation");
+      }
+      const inviter = candidate.invitation;
+      if (inviter.inviterType === "role") {
+        if (this.#roles.get(inviter.inviterId)?.scope !== "long_term") {
+          throw new Error("Temporary roles require an active long-term role inviter");
+        }
+      } else if (inviter.inviterId !== "user.direct_host") {
+        throw new Error("User invitations must come from the direct meeting host");
+      }
+      this.#session = structuredClone(nextSession);
+      session = nextSession;
+      participant = candidate;
+    }
+    if (
+      participant === undefined ||
+      participant.participantId !== roleId ||
+      participant.scope !== scope
+    ) {
+      throw new Error("Participant identity or scope does not match the role command");
+    }
+    const displayName = participant.displayName;
+    const systemPrompt = participant.systemPromptSnapshot;
+    const modelProfileId = participant.modelRouteSnapshot.primaryModelProfileId;
+    const skillIds = participant.capabilitiesSnapshot.skillIds;
+    if (scope === "long_term") {
+      if (
+        participant.scope !== "long_term" ||
+        !workspace.roles.some((role) => role.roleProfileId === participant.roleProfileId) ||
+        participant.retentionPolicy !== "retain_profile"
+      ) {
+        throw new Error("Long-term role manifest is incomplete");
+      }
+    } else {
+      if (
+        participant.scope !== "temporary" ||
+        participant.invitation.status !== "accepted" ||
+        !["delete_after_session", "review_at_close", "promote_candidate"].includes(
+          participant.retentionPolicy,
+        )
+      ) {
+        throw new Error("Temporary role invitation is incomplete");
+      }
+    }
+
+    const model = workspace.models.find(
+      (candidate) => candidate.modelProfileId === modelProfileId && candidate.enabled,
+    );
+    const provider = model === undefined
+      ? undefined
+      : workspace.providers.find(
+          (candidate) =>
+            candidate.providerProfileId === model.providerProfileId && candidate.enabled,
+        );
+    if (model === undefined || provider === undefined) {
+      throw new Error("Participant model route cannot be resolved");
+    }
+    const apiKey = this.#credentials.get(provider.credentialRef);
+    if (apiKey === undefined || apiKey.length === 0) {
+      throw new Error("Provider credential is unavailable");
+    }
+    const skillPaths = skillIds.map((skillId) => {
+      const skill = workspace.skills.find(
+        (candidate) => candidate.skillId === skillId && candidate.enabled,
+      );
+      if (skill === undefined) {
+        throw new Error("Participant skill grant cannot be resolved");
+      }
+      if (skill.source.kind === "git") {
+        throw new Error("Git Skill sources must be installed into an approved local root first");
+      }
+      return this.#resolveApprovedSkillPath(skill.source.locator);
+    });
+    return {
+      displayName,
+      providerId: provider.runtimeProviderId,
+      modelId: model.modelId,
+      apiKey,
+      systemPrompt,
+      skillPaths,
+    };
+  }
+
+  #resolveApprovedSkillPath(locator: string): string {
+    const lexicalCwd = resolve(this.#options.cwd ?? process.cwd());
+    const lexicalCandidate = resolve(lexicalCwd, locator);
+    const approvedRoots = [
+      lexicalCwd,
+      resolve(homedir(), ".codex", "skills"),
+      resolve(homedir(), ".agents", "skills"),
+      resolve(homedir(), ".pi", "agent", "skills"),
+    ]
+      .filter((root) => existsSync(root))
+      .map((root) => realpathSync(root));
+    const candidate = realpathSync(lexicalCandidate);
+    const isApproved = approvedRoots.some((root) => {
+      const pathFromRoot = relative(root, candidate);
+      return pathFromRoot === "" ||
+        (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
+    });
+    const leaf = basename(candidate).toLowerCase();
+    const candidateType = statSync(candidate);
+    const isSkillManifest = leaf === "skill.md" && candidateType.isFile();
+    const isSkillDirectory = extname(candidate) === "" && candidateType.isDirectory();
+    if (!isApproved || (!isSkillManifest && !isSkillDirectory)) {
+      throw new Error("Skill locator is outside approved roots or is not a Skill directory/manifest");
+    }
+    return candidate;
   }
 
   #isActiveTurnEvent(roleId: string, event: RuntimeEvent): boolean {
@@ -787,6 +979,13 @@ export class LocalRoundtableHost {
   #readString(payload: JsonObject, key: string): string | undefined {
     const value = payload[key];
     return typeof value === "string" ? value : undefined;
+  }
+
+  #readObject(payload: JsonObject, key: string): JsonObject | undefined {
+    const value = payload[key];
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value
+      : undefined;
   }
 
   #safeRuntimeErrorCode(errorCode: string | null | undefined): string {

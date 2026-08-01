@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import {
   createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
   ModelRuntime,
   SessionManager,
   type AgentSessionEvent,
@@ -43,6 +45,8 @@ export interface PiSessionCreateOptions {
   sessionId: string;
   tools: readonly string[];
   apiKey: string;
+  systemPrompt: string;
+  skillPaths: readonly string[];
 }
 
 export interface PiSessionFactory {
@@ -59,6 +63,8 @@ export interface PiRuntimeAdapterOptions {
   cwd?: string;
   agentDir?: string;
   tools?: readonly string[];
+  systemPrompt?: string;
+  skillPaths?: readonly string[];
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
 }
@@ -131,6 +137,13 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       modelRuntime,
       model,
       sessionManager: SessionManager.inMemory(options.cwd, { id: options.sessionId }),
+      resourceLoader: new DefaultResourceLoader({
+        cwd: options.cwd,
+        agentDir: options.agentDir ?? getAgentDir(),
+        noSkills: true,
+        additionalSkillPaths: [...options.skillPaths],
+        systemPromptOverride: () => options.systemPrompt,
+      }),
     };
     if (options.agentDir !== undefined) {
       createOptions.agentDir = options.agentDir;
@@ -368,6 +381,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         sessionId: this.#sessionId,
         tools: [...(this.#options.tools ?? [])],
         apiKey,
+        systemPrompt: this.#options.systemPrompt ?? "",
+        skillPaths: [...(this.#options.skillPaths ?? [])],
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;

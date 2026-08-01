@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
@@ -6,6 +9,8 @@ import {
   PROTOCOL_VERSION,
   type JsonObject,
   type MeetingCommand,
+  type RoundtableSession,
+  type WorkspaceProfile,
 } from "@pi-roundtable/protocol";
 
 import {
@@ -102,7 +107,85 @@ function command(
   };
 }
 
-function createHost(apiKey: string | null = "not-persisted"): {
+const TEST_WORKSPACE: WorkspaceProfile = {
+  configurationVersion: 1,
+  workspaceId: "workspace.test",
+  displayName: "Test workspace",
+  updatedAt: "2026-08-01T00:00:00.000Z",
+  providers: [{
+    providerProfileId: "provider.test",
+    displayName: "Test provider",
+    apiFamily: "custom",
+    runtimeProviderId: "test",
+    credentialRef: "memory://provider.test",
+    enabled: true,
+  }],
+  models: [{
+    modelProfileId: "model.test",
+    providerProfileId: "provider.test",
+    modelId: "test-model",
+    displayName: "Test model",
+    capabilities: ["text"],
+    enabled: true,
+  }],
+  skills: [{
+    skillId: "skill.test",
+    displayName: "Test skill",
+    description: "A test-only skill",
+    source: { kind: "local", locator: "skills/test/SKILL.md" },
+    enabled: true,
+  }],
+  mcpServers: [],
+  roles: [{
+    roleProfileId: "role.secretary",
+    displayName: "Secretary",
+    description: "Test secretary",
+    systemPrompt: "Keep the meeting on track.",
+    responsibilities: ["Maintain agenda"],
+    autoJoin: true,
+    modelRoute: {
+      primaryModelProfileId: "model.test",
+      fallbackModelProfileIds: [],
+      thinkingLevel: "medium",
+    },
+    capabilities: { skillIds: ["skill.test"], mcpGrants: [], toolGrants: [] },
+    delegation: {
+      networkAccess: "subagent_required",
+      resultMode: "summary_with_citations",
+      maxConcurrentSubagents: 2,
+    },
+    memory: {
+      mode: "selective",
+      writeApproval: "meeting_close",
+      promptEvolution: "review_required",
+    },
+  }],
+};
+
+const TEST_SESSION: RoundtableSession = {
+  sessionVersion: 1,
+  sessionId: "meeting-local-test",
+  workspaceId: TEST_WORKSPACE.workspaceId,
+  title: "Test meeting",
+  phase: "draft",
+  createdAt: "2026-08-01T00:00:00.000Z",
+  updatedAt: "2026-08-01T00:00:00.000Z",
+  agenda: { subject: "Test", objectives: [], constraints: [] },
+  participants: [{
+    participantId: "participant.secretary",
+    scope: "long_term",
+    roleProfileId: "role.secretary",
+    displayName: "Secretary",
+    systemPromptSnapshot: "Keep the meeting on track.",
+    modelRouteSnapshot: TEST_WORKSPACE.roles[0]!.modelRoute,
+    capabilitiesSnapshot: TEST_WORKSPACE.roles[0]!.capabilities,
+    delegationSnapshot: TEST_WORKSPACE.roles[0]!.delegation,
+    memoryPolicySnapshot: TEST_WORKSPACE.roles[0]!.memory,
+    retentionPolicy: "retain_profile",
+  }],
+};
+
+function createHost(): {
   host: LocalRoundtableHost;
   adapters: Map<string, FakeRuntimeAdapter>;
 } {
@@ -111,9 +194,6 @@ function createHost(apiKey: string | null = "not-persisted"): {
     meetingId: "meeting-local-test",
     runtimeId: "runtime.windows",
     runtimeGeneration: 1,
-    providerId: "test",
-    modelId: "test-model",
-    ...(apiKey === null ? {} : { apiKey }),
     now: () => new Date("2026-08-01T00:00:00.000Z"),
     adapterFactory: (roleId) => {
       const adapter = new FakeRuntimeAdapter(roleId);
@@ -180,6 +260,148 @@ test("runs a local meeting with long-term and temporary roles", async () => {
   await host.stop();
   assert.equal(adapters.get("role.host")?.stopCount, 1);
   assert.equal(adapters.get("role.critic")?.stopCount, 1);
+});
+
+test("resolves a frozen participant manifest into private Pi runtime options", async () => {
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-runtime-"));
+  mkdirSync(join(runtimeDirectory, "skills", "test"), { recursive: true });
+  writeFileSync(join(runtimeDirectory, "skills", "test", "SKILL.md"), "# Test Skill\n");
+  let resolved: import("../local-roundtable-host.js").ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    cwd: runtimeDirectory,
+    adapterFactory: (roleId, configuration) => {
+      resolved = configuration;
+      return new FakeRuntimeAdapter(roleId);
+    },
+  });
+  try {
+    host.initializeRuntimeConfiguration(TEST_WORKSPACE, TEST_SESSION, {
+      "memory://provider.test": "runtime-secret",
+    });
+    host.start();
+    const receipt = await host.execute(command("role.add", "add-secretary", {
+      actorId: "participant.secretary",
+      payload: { displayName: "Untrusted override" },
+    }));
+
+    assert.equal(receipt.status, "accepted");
+    assert.equal(resolved?.providerId, "test");
+    assert.equal(resolved?.modelId, "test-model");
+    assert.equal(resolved?.apiKey, "runtime-secret");
+    assert.equal(resolved?.systemPrompt, "Keep the meeting on track.");
+    assert.equal(resolved?.skillPaths.length, 1);
+    assert.equal(resolved?.skillPaths[0]?.endsWith("skills\\test\\SKILL.md") || resolved?.skillPaths[0]?.endsWith("skills/test/SKILL.md"), true);
+  } finally {
+    await host.stop();
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a Skill locator whose symlink escapes approved roots", async () => {
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-root-"));
+  const outsideDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-outside-"));
+  mkdirSync(join(runtimeDirectory, "skills"), { recursive: true });
+  symlinkSync(
+    outsideDirectory,
+    join(runtimeDirectory, "skills", "escape"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const workspace = structuredClone(TEST_WORKSPACE);
+  workspace.skills[0]!.source.locator = "skills/escape";
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    cwd: runtimeDirectory,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  try {
+    host.initializeRuntimeConfiguration(workspace, TEST_SESSION, {
+      "memory://provider.test": "runtime-secret",
+    });
+    host.start();
+    const receipt = await host.execute(command("role.add", "add-secretary", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "rejected");
+    assert.equal(receipt.errorCode, "invalid_role_manifest");
+  } finally {
+    await host.stop();
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+    rmSync(outsideDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects runtime generations outside the public contract", () => {
+  for (const runtimeGeneration of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => new LocalRoundtableHost({ meetingId: "meeting-local-test", runtimeGeneration }),
+      /positive safe integer/,
+    );
+  }
+});
+
+test("accepts dynamic temporary invitations only from an active long-term inviter", async () => {
+  const workspace = structuredClone(TEST_WORKSPACE);
+  workspace.skills = [];
+  workspace.roles[0]!.capabilities = { skillIds: [], mcpGrants: [], toolGrants: [] };
+  const session = structuredClone(TEST_SESSION);
+  session.participants[0]!.capabilitiesSnapshot = { skillIds: [], mcpGrants: [], toolGrants: [] };
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const manifest = {
+    participantId: "participant.planner",
+    scope: "temporary" as const,
+    displayName: "Planner",
+    systemPromptSnapshot: "Plan only within this meeting.",
+    modelRouteSnapshot: workspace.roles[0]!.modelRoute,
+    capabilitiesSnapshot: { skillIds: [], mcpGrants: [], toolGrants: [] },
+    delegationSnapshot: workspace.roles[0]!.delegation,
+    memoryPolicySnapshot: {
+      mode: "disabled" as const,
+      writeApproval: "always" as const,
+      promptEvolution: "disabled" as const,
+    },
+    invitation: {
+      invitationId: "invite.planner",
+      inviterType: "role" as const,
+      inviterId: "participant.secretary",
+      purpose: "Plan the current meeting",
+      status: "accepted" as const,
+      createdAt: "2026-08-01T00:01:00.000Z",
+      acceptedAt: "2026-08-01T00:01:00.000Z",
+    },
+    retentionPolicy: "review_at_close" as const,
+  };
+  host.initializeRuntimeConfiguration(workspace, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  try {
+    const beforeLive = await host.execute(command("role.create_temporary", "invite-before-live", {
+      actorId: manifest.participantId,
+      payload: { participantManifest: manifest as unknown as JsonObject },
+    }));
+    assert.equal(beforeLive.status, "rejected");
+    assert.equal(beforeLive.errorCode, "invalid_role_manifest");
+
+    assert.equal((await host.execute(command("role.add", "add-secretary", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("meeting.open", "open"))).status, "accepted");
+
+    const duringLive = await host.execute(command("role.create_temporary", "invite-during-live", {
+      actorId: manifest.participantId,
+      payload: { participantManifest: manifest as unknown as JsonObject },
+    }));
+    assert.equal(duringLive.status, "accepted");
+  } finally {
+    await host.stop();
+  }
 });
 
 test("hands the floor to an interrupting role after cancellation", async () => {
@@ -386,7 +608,7 @@ test("rejects stale generation and expected-sequence mismatches", async () => {
 });
 
 test("stdio host frames ready, errors, events, and shutdown", async () => {
-  const { host } = createHost(null);
+  const { host } = createHost();
   const input = new PassThrough();
   const output = new PassThrough();
   let text = "";
@@ -395,8 +617,13 @@ test("stdio host frames ready, errors, events, and shutdown", async () => {
     text += chunk;
   });
   input.end(
-    '{"type":"initialize","requestId":"init-1","apiKey":"memory-only"}\n' +
-      '{bad json}\n{"type":"shutdown","requestId":"stop-1"}\n',
+    `${JSON.stringify({
+      type: "initialize",
+      requestId: "init-1",
+      workspace: TEST_WORKSPACE,
+      session: TEST_SESSION,
+      credentials: { "memory://provider.test": "memory-only" },
+    })}\n{bad json}\n{"type":"shutdown","requestId":"stop-1"}\n`,
   );
 
   await new StdioRuntimeHost(host).run(input, output);

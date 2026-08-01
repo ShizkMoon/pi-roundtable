@@ -1,12 +1,17 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Windowing;
 using PiRoundtable.Windows.ViewModels;
 
 namespace PiRoundtable.Windows;
 
 public sealed partial class MainWindow : Window
 {
+    private bool _initialized;
+    private bool _shutdownStarted;
+    private bool _shutdownComplete;
+
     public MainViewModel ViewModel { get; }
 
     public MainWindow()
@@ -17,7 +22,7 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
         SystemBackdrop = new MicaBackdrop();
-        Closed += MainWindow_Closed;
+        AppWindow.Closing += MainWindow_Closing;
     }
 
     private object RootDataContext
@@ -27,17 +32,7 @@ public sealed partial class MainWindow : Window
 
     private async void StartMeeting_Click(object sender, RoutedEventArgs e)
     {
-        await RunUiActionAsync(async () =>
-        {
-            try
-            {
-                await ViewModel.StartMeetingAsync(ApiKeyBox.Password);
-            }
-            finally
-            {
-                ApiKeyBox.Password = string.Empty;
-            }
-        });
+        await RunUiActionAsync(() => ViewModel.StartMeetingAsync());
     }
 
     private async void SendPrompt_Click(object sender, RoutedEventArgs e)
@@ -72,9 +67,68 @@ public sealed partial class MainWindow : Window
     {
         await RunUiActionAsync(async () =>
         {
-            await ViewModel.AddTemporaryRoleAsync(TemporaryRoleNameBox.Text);
-            TemporaryRoleNameBox.Text = string.Empty;
+            await ViewModel.AddTemporaryRoleAsync(
+                ViewModel.TemporaryRoleName,
+                ViewModel.TemporaryRolePurpose,
+                ViewModel.TemporaryRoleSystemPrompt);
+            if (!ViewModel.HasError)
+            {
+                ViewModel.TemporaryRoleName = string.Empty;
+                ViewModel.TemporaryRolePurpose = string.Empty;
+                ViewModel.TemporaryRoleSystemPrompt = string.Empty;
+            }
         });
+    }
+
+    private async void Root_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (_initialized)
+        {
+            return;
+        }
+        _initialized = true;
+        await RunUiActionAsync(() => ViewModel.InitializeAsync());
+    }
+
+    private async void NewSession_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.CreateSessionAsync());
+    }
+
+    private void BeginNewProvider_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.BeginNewProvider();
+        ProviderApiKeyBox.Password = string.Empty;
+    }
+
+    private void ShowRoleInspector_Click(object sender, RoutedEventArgs e)
+    {
+        ContextTabs.SelectedIndex = 0;
+    }
+
+    private void ShowProviderInspector_Click(object sender, RoutedEventArgs e)
+    {
+        ContextTabs.SelectedIndex = 1;
+    }
+
+    private async void SaveProvider_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(async () =>
+        {
+            try
+            {
+                await ViewModel.SaveProviderConfigurationAsync(ProviderApiKeyBox.Password);
+            }
+            finally
+            {
+                ProviderApiKeyBox.Password = string.Empty;
+            }
+        });
+    }
+
+    private async void SaveRole_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.SaveRoleConfigurationAsync());
     }
 
     private async void PromoteRole_Click(object sender, RoutedEventArgs e)
@@ -97,10 +151,28 @@ public sealed partial class MainWindow : Window
         ViewModel.ClearError();
     }
 
-    private void MainWindow_Closed(object sender, WindowEventArgs args)
+    private async void MainWindow_Closing(AppWindow sender, AppWindowClosingEventArgs args)
     {
-        ViewModel.TerminateRuntimeForAppExit();
-        _ = ViewModel.DisposeAsync().AsTask();
+        if (_shutdownComplete)
+        {
+            return;
+        }
+        args.Cancel = true;
+        if (_shutdownStarted)
+        {
+            return;
+        }
+        _shutdownStarted = true;
+        try
+        {
+            await ViewModel.DisposeAsync();
+        }
+        finally
+        {
+            ViewModel.TerminateRuntimeForAppExit();
+            _shutdownComplete = true;
+            Close();
+        }
     }
 
     private async Task RunUiActionAsync(Func<Task> action)

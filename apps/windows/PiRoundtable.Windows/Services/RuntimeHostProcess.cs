@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using PiRoundtable.Windows.Models;
 
 namespace PiRoundtable.Windows.Services;
 
@@ -8,9 +10,9 @@ internal sealed record RuntimeHostStartOptions(
     string MeetingId,
     string RuntimeId,
     ulong RuntimeGeneration,
-    string ProviderId,
-    string ModelId,
-    string ApiKey);
+    WorkspaceConfiguration Workspace,
+    RoundtableSessionConfiguration Session,
+    IReadOnlyDictionary<string, string> Credentials);
 
 internal sealed record RuntimeCommandReceipt(
     string CommandId,
@@ -36,6 +38,10 @@ internal sealed record RuntimeMeetingEvent(
 
 internal sealed class RuntimeHostProcess : IAsyncDisposable
 {
+    private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    };
     private readonly ConcurrentDictionary<string, TaskCompletionSource<RuntimeCommandReceipt>> _pending = new();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
@@ -84,8 +90,6 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         startInfo.Environment["PI_ROUNDTABLE_MEETING_ID"] = options.MeetingId;
         startInfo.Environment["PI_ROUNDTABLE_RUNTIME_ID"] = options.RuntimeId;
         startInfo.Environment["PI_ROUNDTABLE_RUNTIME_GENERATION"] = options.RuntimeGeneration.ToString();
-        startInfo.Environment["PI_ROUNDTABLE_PROVIDER_ID"] = options.ProviderId;
-        startInfo.Environment["PI_ROUNDTABLE_MODEL_ID"] = options.ModelId;
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         EventHandler exitedHandler = (_, _) => OnProcessExited(process);
@@ -112,7 +116,9 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         {
             type = "initialize",
             requestId = Guid.NewGuid().ToString("N"),
-            apiKey = options.ApiKey,
+            workspace = options.Workspace,
+            session = options.Session,
+            credentials = options.Credentials,
         }, cancellationToken);
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -278,7 +284,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
     private async Task WriteFrameAsync<T>(T frame, CancellationToken cancellationToken)
     {
         var stdin = _stdin ?? throw new InvalidOperationException("Runtime Host stdin is closed.");
-        var json = JsonSerializer.Serialize(frame);
+        var json = JsonSerializer.Serialize(frame, SerializerOptions);
         await _writeGate.WaitAsync(cancellationToken);
         try
         {
@@ -347,7 +353,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         {
             case "ready":
                 if (
-                    frame.GetProperty("protocolVersion").GetInt32() != 1 ||
+                    frame.GetProperty("protocolVersion").GetInt32() != 2 ||
                     frame.GetProperty("meetingId").GetString() != _meetingId ||
                     frame.GetProperty("runtimeId").GetString() != _runtimeId ||
                     frame.GetProperty("runtimeGeneration").GetUInt64() != _runtimeGeneration)

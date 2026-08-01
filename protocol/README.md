@@ -4,6 +4,8 @@ The JSON Schemas in `schema/` describe the client/server contract. Protocol vers
 
 The server assigns `eventId`, `sequence`, and `occurredAt`. Runtime Hosts supply `meetingId`, `runtimeGeneration`, event kind, actor/target IDs, and a normalized payload. Clients resume from the largest fully applied `sequence`.
 
+`workspace-profile.schema.json` and `roundtable-session.schema.json` are versioned configuration contracts, separate from wire protocol major version 1. They define reusable non-secret provider/model/Skill/MCP/long-term-role catalogs and frozen session participant manifests. `@pi-roundtable/protocol` implements their TypeScript types and cross-catalog integrity checks. Credential fields are opaque secure-store references; provider or MCP credential values are never valid profile data.
+
 ## Role lifecycle
 
 Protocol v1 distinguishes durable and meeting-scoped participation without exposing an agent runtime's internal session model:
@@ -16,4 +18,4 @@ Protocol v1 distinguishes durable and meeting-scoped participation without expos
 
 For these lifecycle events, `actorId` identifies the affected role. The causal command records who requested the transition. Snapshot projection of scope and lifecycle remains planned; it will be introduced with an explicitly compatible snapshot contract rather than silently extending a strict v1 role object.
 
-Long-term role profiles, durable memory contents, prompt revisions, authorization policy, and persistence are planned contracts; these lifecycle events do not claim those services are implemented.
+Workspace profile persistence, secure provider credential references, frozen participant prompts/model routes, and deny-by-default Skill/MCP grants are implemented in the Windows local-client path. Durable memory contents, prompt-revision history, capability-change events during a live meeting, MCP execution, and end-of-meeting promotion review remain planned; lifecycle events do not claim those services are implemented.
