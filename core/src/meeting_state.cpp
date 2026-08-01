@@ -31,11 +31,42 @@ ApplyResult MeetingState::accept(std::uint64_t sequence) noexcept {
 }
 
 bool MeetingState::is_known_role(const std::string& role_id) const {
-    return !role_id.empty() && roles_.contains(role_id);
+    const auto role = roles_.find(role_id);
+    return !role_id.empty() && role != roles_.end() && !role->second.archived;
 }
 
 bool MeetingState::has_role(const std::string& role_id) const {
     return is_known_role(role_id);
+}
+
+std::size_t MeetingState::role_count() const noexcept {
+    std::size_t count = 0;
+    for (const auto& entry : roles_) {
+        if (!entry.second.archived) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::optional<RoleScope> MeetingState::role_scope(const std::string& role_id) const {
+    const auto role = roles_.find(role_id);
+    return role == roles_.end() ? std::nullopt : std::optional{role->second.scope};
+}
+
+bool MeetingState::is_role_archived(const std::string& role_id) const {
+    const auto role = roles_.find(role_id);
+    return role != roles_.end() && role->second.archived;
+}
+
+void MeetingState::clear_role_activity(const std::string& role_id) {
+    if (active_speaker_id_ == role_id) {
+        active_speaker_id_.reset();
+    }
+    if (pending_interruptor_id_ == role_id || pending_interrupt_target_id_ == role_id) {
+        pending_interruptor_id_.reset();
+        pending_interrupt_target_id_.reset();
+    }
 }
 
 ApplyResult MeetingState::apply(const MeetingEvent& event) {
@@ -110,27 +141,56 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
             break;
 
         case EventKind::RoleRegistered:
+        case EventKind::RoleTemporaryRegistered:
             if (event.actor_id.empty()) {
                 return reject(ApplyError::InvalidActor);
             }
             if (roles_.contains(event.actor_id)) {
                 return reject(ApplyError::DuplicateRole);
             }
-            roles_.insert(event.actor_id);
+            roles_.emplace(
+                event.actor_id,
+                RoleState{
+                    event.kind == EventKind::RoleRegistered
+                        ? RoleScope::LongTerm
+                        : RoleScope::Temporary,
+                    false,
+                });
             break;
 
-        case EventKind::RoleLeft:
-            if (!is_known_role(event.actor_id)) {
+        case EventKind::RolePromoted: {
+            const auto role = roles_.find(event.actor_id);
+            if (role == roles_.end()) {
                 return reject(ApplyError::UnknownRole);
             }
-            if (active_speaker_id_ == event.actor_id) {
-                active_speaker_id_.reset();
+            if (role->second.archived) {
+                return reject(ApplyError::RoleArchived);
             }
-            if (pending_interruptor_id_ == event.actor_id ||
-                pending_interrupt_target_id_ == event.actor_id) {
-                pending_interruptor_id_.reset();
-                pending_interrupt_target_id_.reset();
+            if (role->second.scope != RoleScope::Temporary) {
+                return reject(ApplyError::RoleNotTemporary);
             }
+            role->second.scope = RoleScope::LongTerm;
+            break;
+        }
+
+        case EventKind::RoleArchived: {
+            const auto role = roles_.find(event.actor_id);
+            if (role == roles_.end()) {
+                return reject(ApplyError::UnknownRole);
+            }
+            if (role->second.archived) {
+                return reject(ApplyError::RoleArchived);
+            }
+            role->second.archived = true;
+            clear_role_activity(event.actor_id);
+            break;
+        }
+
+        case EventKind::RoleLeft:
+            if (!roles_.contains(event.actor_id)) {
+                return reject(ApplyError::UnknownRole);
+            }
+            clear_role_activity(event.actor_id);
             roles_.erase(event.actor_id);
             break;
 
@@ -139,7 +199,9 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
                 return reject(ApplyError::InvalidTransition);
             }
             if (!is_known_role(event.actor_id)) {
-                return reject(ApplyError::UnknownRole);
+                return reject(is_role_archived(event.actor_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
             }
             if (active_speaker_id_.has_value()) {
                 return reject(ApplyError::FloorBusy);
@@ -172,7 +234,9 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
                 return reject(ApplyError::InvalidTransition);
             }
             if (!is_known_role(event.actor_id) || !is_known_role(event.target_id)) {
-                return reject(ApplyError::UnknownRole);
+                return reject(is_role_archived(event.actor_id) || is_role_archived(event.target_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
             }
             if (event.actor_id == event.target_id) {
                 return reject(ApplyError::InvalidActor);
@@ -222,7 +286,9 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
                 return reject(ApplyError::InvalidTransition);
             }
             if (!is_runtime_activity(event.kind) || !is_known_role(event.actor_id)) {
-                return reject(ApplyError::UnknownRole);
+                return reject(is_role_archived(event.actor_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
             }
             break;
 

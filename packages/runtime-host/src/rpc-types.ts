@@ -1,6 +1,7 @@
 import type { JsonObject, JsonValue } from "@pi-roundtable/protocol";
 
 export type RpcRecord = Record<string, unknown>;
+export type RpcFrameListener = (frame: RpcRecord) => void;
 
 export interface RpcReadyFrame extends RpcRecord {
   type: "ready";

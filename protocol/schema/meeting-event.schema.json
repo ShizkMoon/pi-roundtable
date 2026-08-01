@@ -21,12 +21,19 @@
     "sequence": { "type": "integer", "minimum": 1 },
     "runtimeGeneration": { "type": "integer", "minimum": 1 },
     "kind": {
-      "enum": [
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "x-knownValues": [
         "runtime.lease_acquired",
         "runtime.lease_released",
         "meeting.opened",
         "meeting.closed",
         "role.registered",
+        "role.temporary_registered",
+        "role.promoted",
+        "role.archived",
         "role.left",
         "speech.started",
         "speech.delta",

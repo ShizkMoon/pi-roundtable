@@ -15,6 +15,7 @@ using pi_roundtable::core::ApplyError;
 using pi_roundtable::core::EventKind;
 using pi_roundtable::core::MeetingEvent;
 using pi_roundtable::core::MeetingPhase;
+using pi_roundtable::core::RoleScope;
 
 pr_apply_result invalid_result(const pr_meeting* meeting) {
     const auto expected = meeting == nullptr ? 1 : meeting->state.last_sequence() + 1;
@@ -34,7 +35,7 @@ void pr_meeting_destroy(pr_meeting* meeting) {
 pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
     if (meeting == nullptr || event == nullptr ||
         event->kind < PR_EVENT_RUNTIME_LEASE_ACQUIRED ||
-        event->kind > PR_EVENT_SUBAGENT_FAILED) {
+        event->kind > PR_EVENT_ROLE_ARCHIVED) {
         return invalid_result(meeting);
     }
 
@@ -66,6 +67,27 @@ pr_meeting_phase pr_meeting_get_phase(const pr_meeting* meeting) {
         return PR_PHASE_CREATED;
     }
     return static_cast<pr_meeting_phase>(meeting->state.phase());
+}
+
+int pr_meeting_has_role(const pr_meeting* meeting, const char* role_id) {
+    return meeting != nullptr && role_id != nullptr && meeting->state.has_role(role_id) ? 1 : 0;
+}
+
+pr_role_scope pr_meeting_role_scope(const pr_meeting* meeting, const char* role_id) {
+    if (meeting == nullptr || role_id == nullptr) {
+        return PR_ROLE_SCOPE_UNKNOWN;
+    }
+    const auto scope = meeting->state.role_scope(role_id);
+    if (!scope.has_value()) {
+        return PR_ROLE_SCOPE_UNKNOWN;
+    }
+    return *scope == RoleScope::LongTerm
+        ? PR_ROLE_SCOPE_LONG_TERM
+        : PR_ROLE_SCOPE_TEMPORARY;
+}
+
+int pr_meeting_role_is_archived(const pr_meeting* meeting, const char* role_id) {
+    return meeting != nullptr && role_id != nullptr && meeting->state.is_role_archived(role_id) ? 1 : 0;
 }
 
 const char* pr_meeting_runtime_owner(const pr_meeting* meeting) {

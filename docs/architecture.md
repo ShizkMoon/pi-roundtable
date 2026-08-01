@@ -2,7 +2,7 @@
 
 ## 1. Deployment model
 
-A meeting is controlled by one Runtime Host. In the first implementation cycle that host runs beside the Windows application and starts Oh My Pi as an `omp --mode rpc` subprocess. Linux hosts the synchronization plane: normalized event storage, lease fencing, replay cursors, authentication, and later push notifications. Android is a presentation and control client and never launches Pi locally.
+A meeting is controlled by one Runtime Host. In the first implementation cycle that host will run beside the Windows application and embed Pi through its supported SDK surface. Oh My Pi remains an optional compatibility runtime behind an adapter. Linux hosts the optional synchronization plane: normalized event storage, lease fencing, replay cursors, authentication, and later push notifications. Android is a presentation and control client and never launches Pi locally.
 
 This split avoids two conflicting sources of truth. If a runtime moves to another machine, the sync server increments `runtimeGeneration`; events from the old generation are rejected even if the old process reconnects late.
 
@@ -18,16 +18,16 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 
 ### Runtime Host
 
-`packages/runtime-host` owns all OMP compatibility. Its transport:
+`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The planned default adapter embeds Pi directly. The currently implemented OMP transport:
 
 1. starts `omp --mode rpc`;
 2. waits for the `ready` frame;
 3. negotiates protocol v2 when advertised;
 4. validates and reassembles `rpc_chunk` frames;
 5. correlates command responses by ID;
-6. converts OMP events into Pi Roundtable events before synchronization.
+6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
 
-Role scheduling, tool policy, host-tool callbacks, and OMP-to-domain event normalization are intentionally separate from the low-level adapter and remain planned.
+Role scheduling, tool policy, host-tool callbacks, direct Pi integration, and runtime-to-domain event normalization are intentionally separate from the low-level adapter and remain planned.
 
 ### Sync server
 
@@ -35,7 +35,7 @@ Role scheduling, tool policy, host-tool callbacks, and OMP-to-domain event norma
 
 ### Native clients
 
-Windows uses WinUI 3 and will own the first local runtime integration. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports OMP internals.
+Windows uses WinUI 3 and will own the first local runtime integration. A normal local meeting must work without a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
 
 ## 3. Interruption model
 
@@ -48,6 +48,12 @@ Interruption is not simulated by visually reordering chat messages. The authorit
 
 The core rejects a second interruption while one is pending, a cancellation targeting a non-speaker, and a new speaker that bypasses the pending handoff. Runtime-specific cancellation maps to OMP `abort`, `steer`, or `abort_and_prompt` according to the orchestration policy.
 
-## 4. Data ownership
+## 4. Role lifecycle
+
+The meeting core distinguishes a long-term role from a meeting-scoped temporary role. Registration adds an active participant. A temporary role may be promoted once to long-term. Archiving removes the role from the active roster while retaining its meeting record; leaving removes that record. All transitions remain ordered meeting events and carry the active `runtimeGeneration`.
+
+This implemented lifecycle is only the deterministic meeting foundation. Durable role profiles, auto-join policy, responsibilities, authorization, memory, prompt optimization, and end-of-meeting retention workflows remain planned.
+
+## 5. Data ownership
 
 The synchronization plane stores domain events and snapshots, not raw provider credentials, local tool output directories, or complete OMP session files. Large artifacts should be referenced by scoped object identifiers. Secrets stay with the Runtime Host or a future dedicated secrets service.
