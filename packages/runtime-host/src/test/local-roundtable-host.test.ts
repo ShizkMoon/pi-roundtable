@@ -349,6 +349,138 @@ test("resolves a frozen participant manifest into private Pi runtime options", a
   }
 });
 
+test("resolves only verified Git Skill installations from the catalog root", async () => {
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-git-skill-"));
+  const catalogRoot = join(runtimeDirectory, "catalog", "skills");
+  const installedSkill = join(catalogRoot, "skill.test");
+  mkdirSync(installedSkill, { recursive: true });
+  writeFileSync(join(installedSkill, "SKILL.md"), "# Installed Skill\n");
+  const workspace = structuredClone(TEST_WORKSPACE);
+  workspace.skills[0]!.source = {
+    kind: "git",
+    locator: "https://github.com/example/test-skill",
+    contentDigest: "sha256:test",
+  };
+  workspace.skills[0]!.importStatus = "installed";
+  workspace.skills[0]!.installDirectory = installedSkill;
+  let resolved: import("../local-roundtable-host.js").ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    cwd: runtimeDirectory,
+    catalogSkillRoot: catalogRoot,
+    adapterFactory: (roleId, configuration) => {
+      resolved = configuration;
+      return new FakeRuntimeAdapter(roleId);
+    },
+  });
+  try {
+    host.initializeRuntimeConfiguration(workspace, TEST_SESSION, {
+      "memory://provider.test": "runtime-secret",
+    });
+    host.start();
+    const receipt = await host.execute(command("role.add", "add-git-skill", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "accepted", receipt.message ?? receipt.errorCode ?? undefined);
+    assert.equal(resolved?.skillPaths[0], installedSkill);
+  } finally {
+    await host.stop();
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("rejects a registered Git Skill that lacks an installed digest", async () => {
+  const workspace = structuredClone(TEST_WORKSPACE);
+  workspace.skills[0]!.source = {
+    kind: "git",
+    locator: "https://github.com/example/test-skill",
+  };
+  workspace.skills[0]!.importStatus = "registered";
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  try {
+    host.initializeRuntimeConfiguration(workspace, TEST_SESSION, {
+      "memory://provider.test": "runtime-secret",
+    });
+    host.start();
+    const receipt = await host.execute(command("role.add", "add-uninstalled-git-skill", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "rejected");
+    assert.equal(receipt.errorCode, "invalid_role_manifest");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("resolves an approved Git MCP grant and its credential references", async () => {
+  const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-git-mcp-"));
+  const catalogRoot = join(runtimeDirectory, "catalog", "mcp");
+  const installation = join(catalogRoot, "mcp.test");
+  mkdirSync(installation, { recursive: true });
+  writeFileSync(join(installation, "server.js"), "export {};\n");
+  const workspace = structuredClone(TEST_WORKSPACE);
+  workspace.mcpServers = [{
+    mcpServerId: "mcp.test",
+    displayName: "Test MCP",
+    source: {
+      kind: "git",
+      locator: "https://github.com/example/test-mcp",
+      contentDigest: "sha256:test-mcp",
+    },
+    risk: "low",
+    importStatus: "installed",
+    installDirectory: installation,
+    contentDigest: "sha256:test-mcp",
+    transport: "stdio",
+    command: "node",
+    arguments: ["server.js"],
+    workingDirectory: installation,
+    environmentCredentialRefs: { TEST_TOKEN: "memory://mcp.test/token" },
+    enabled: true,
+  }];
+  const session = structuredClone(TEST_SESSION);
+  session.participants[0]!.capabilitiesSnapshot.skillIds = [];
+  session.participants[0]!.capabilitiesSnapshot.mcpGrants = [{
+    mcpServerId: "mcp.test",
+    toolAllowlist: ["echo"],
+    approvalMode: "never",
+    executionMode: "subagent_preferred",
+  }];
+  let resolved: import("../local-roundtable-host.js").ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    cwd: runtimeDirectory,
+    catalogMcpRoot: catalogRoot,
+    adapterFactory: (roleId, configuration) => {
+      resolved = configuration;
+      return new FakeRuntimeAdapter(roleId);
+    },
+  });
+  try {
+    host.initializeRuntimeConfiguration(workspace, session, {
+      "memory://provider.test": "runtime-secret",
+      "memory://mcp.test/token": "mcp-secret",
+    });
+    host.start();
+    const receipt = await host.execute(command("role.add", "add-mcp-role", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "accepted");
+    assert.equal(resolved?.mcpServers[0]?.serverId, "mcp.test");
+    assert.deepEqual(resolved?.mcpServers[0]?.toolAllowlist, ["echo"]);
+    assert.equal(resolved?.mcpServers[0]?.environment?.TEST_TOKEN, "mcp-secret");
+  } finally {
+    await host.stop();
+    rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
 test("rejects a Skill locator whose symlink escapes approved roots", async () => {
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-root-"));
   const outsideDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-outside-"));

@@ -43,6 +43,9 @@ internal static class ConfigurationNormalizer
             skill.Source ??= new SkillSourceConfiguration();
             skill.Source.Kind = NonEmpty(skill.Source.Kind, "local");
             skill.Source.Locator = Text(skill.Source.Locator);
+            skill.ImportStatus = ImportStatus(skill.ImportStatus);
+            skill.InstallDirectory = OptionalText(skill.InstallDirectory);
+            skill.AuditSummary = OptionalText(skill.AuditSummary);
         }
 
         configuration.McpServers = Items(configuration.McpServers);
@@ -50,6 +53,15 @@ internal static class ConfigurationNormalizer
         {
             server.McpServerId = Identifier(server.McpServerId);
             server.DisplayName = Text(server.DisplayName);
+            if (server.Source is not null)
+            {
+                server.Source.Kind = NonEmpty(server.Source.Kind, "git");
+                server.Source.Locator = Text(server.Source.Locator);
+            }
+            server.ImportStatus = ImportStatus(server.ImportStatus);
+            server.InstallDirectory = OptionalText(server.InstallDirectory);
+            server.ContentDigest = OptionalText(server.ContentDigest);
+            server.AuditSummary = OptionalText(server.AuditSummary);
             server.Transport = NonEmpty(server.Transport, "stdio");
             server.Arguments = server.Arguments is null ? null : Strings(server.Arguments);
             server.EnvironmentCredentialRefs = CredentialReferences(server.EnvironmentCredentialRefs);
@@ -226,6 +238,12 @@ internal static class ConfigurationNormalizer
                 StringComparer.Ordinal);
 
     private static string Text(string? value) => value ?? string.Empty;
+
+    private static string? OptionalText(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private static string ImportStatus(string? value) => value is "installed" or "review_required" or "blocked"
+        ? value
+        : "registered";
 
     private static string Identifier(string? value) => value?.Trim() ?? string.Empty;
 

@@ -11,11 +11,11 @@ The direct Pi adapter was implemented as a library, while the Windows applicatio
 
 Windows launches one supervised local Runtime Host process per meeting. The host owns the meeting generation, global event sequence, role-to-Pi-session map, and the basic interruption handoff. It consumes public `MeetingCommand` values and emits public normalized `MeetingEvent` and `CommandReceipt` values inside a versioned stdio JSONL frame.
 
-Provider ID, model ID, meeting identity, runtime identity, and generation are injected into the child environment at startup. The API key is delivered in a required one-time stdin initialization frame and is not written to application configuration, meeting events, logs, or the child environment. This in-memory handoff is an implemented interim boundary; Windows Credential Manager integration remains planned.
+Meeting identity, runtime identity, generation, and non-secret process overrides are injected into the child environment at startup. Provider and MCP credentials are stored by reference in Windows Credential Manager, selected for the active participant manifests, and delivered in a required one-time stdin initialization frame. Credential values are not written to application JSON, meeting events, logs, or the child environment by the Windows supervisor; the Runtime Host materializes approved MCP header/environment values only at the consuming transport.
 
 The Windows projection applies every normalized event to the C++ meeting core before updating visible state. A rejected sequence, generation, phase, speaker, role, or interruption transition is therefore surfaced instead of silently becoming UI state.
 
-The local host starts with tools and subagents disabled. It supports meeting open/close, long-term and temporary role creation, temporary-role promotion, role archive/removal, prompting, cancellation, and explicit interrupt-then-handoff. Durable profiles, long-term memory, prompt optimization, approval-gated tools, recovery checkpoints, and remote failover remain planned.
+The local host starts with built-in tools and subagents disabled. It supports meeting open/close, long-term and temporary role creation, temporary-role promotion, role archive/removal, prompting, cancellation, explicit interrupt-then-handoff, explicitly granted Skill paths, and approved MCP tool discovery/execution. Durable long-term memory, prompt optimization, per-tool interactive approval, SubAgent-isolated execution, recovery checkpoints, and remote failover remain planned.
 
 ## Consequences
 

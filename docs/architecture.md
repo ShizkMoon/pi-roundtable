@@ -18,7 +18,7 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 
 ### Runtime Host
 
-`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The implemented `PiRuntimeAdapter` embeds the pinned Pi SDK directly. It creates one supervised session for one active role, injects provider credentials in memory, applies a frozen System Prompt, disables default Skill discovery and loads only the participant's explicit Skill paths, starts with no tools unless an allowlist is supplied, normalizes public events, and makes command acknowledgements idempotent. Raw Pi session records remain private.
+`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The implemented `PiRuntimeAdapter` embeds the pinned Pi SDK directly. It creates one supervised session for one active role, injects provider credentials in memory, applies a frozen System Prompt, disables default Skill discovery and loads only the participant's explicit Skill paths, and registers only tools resolved from approved MCP grants. The MCP client boundary supports stdio, Streamable HTTP, and legacy SSE with bounded discovery/output, approved launchers, same-origin secure remote transport, and in-memory credential resolution. Raw Pi session records remain private.
 
 The currently implemented low-level OMP client:
 
@@ -29,7 +29,7 @@ The currently implemented low-level OMP client:
 5. correlates command responses by ID;
 6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
 
-The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. A public host broadcast may target one or more roles for the next response while remaining visible to all participants; responses are queued so only one role owns the public floor. A private host command runs in the selected role's isolated context and emits audience-scoped events without claiming the public floor. Durable role runtime sessions, MCP/tool callbacks, approval gates, prompt/memory execution, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
+The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill/MCP inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. A public host broadcast may target one or more roles for the next response while remaining visible to all participants; responses are queued so only one role owns the public floor. A private host command runs in the selected role's isolated context and emits audience-scoped events without claiming the public floor. Server-level MCP approval and tool callbacks are implemented; per-tool interactive approval, SubAgent-isolated execution, prompt/memory execution, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
 
 ### Sync server
 
@@ -54,7 +54,7 @@ The core rejects a second interruption while one is pending, a cancellation targ
 
 The meeting core distinguishes a long-term role from a meeting-scoped temporary role. Registration adds an active participant. A temporary role may be promoted once to long-term. Archiving removes the role from the active roster while retaining its meeting record; leaving removes that record. All transitions remain ordered meeting events and carry the active `runtimeGeneration`.
 
-This implemented lifecycle is the deterministic meeting foundation. The Windows path now persists long-term role prompts, model routes, default auto-join behavior, and explicit Skill/MCP attachments, then freezes them into participant manifests. Durable memory contents, prompt revision history, live grant mutation events, MCP execution, and end-of-meeting retention workflows remain planned.
+This implemented lifecycle is the deterministic meeting foundation. The Windows path now persists long-term role prompts, model routes, default auto-join behavior, and explicit Skill/MCP attachments, then freezes them into participant manifests. Approved MCP execution is implemented through the Runtime Host. Durable memory contents, prompt revision history, live grant mutation events, per-tool interactive approval, and end-of-meeting retention workflows remain planned.
 
 ## 5. Data ownership
 

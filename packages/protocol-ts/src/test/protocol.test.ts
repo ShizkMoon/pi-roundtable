@@ -176,6 +176,8 @@ test("configuration constants stay aligned with the JSON Schemas", () => {
     $defs: {
       providerProfile: { properties: { apiFamily: { enum: string[] } } };
       modelProfile: { properties: { capabilities: { items: { enum: string[] } } } };
+      skillProfile: { properties: { importStatus: { enum: string[] } } };
+      mcpServerProfile: { properties: { importStatus: { enum: string[] } } };
       modelRoute: { properties: { thinkingLevel: { enum: string[] } } };
     };
   };
@@ -190,11 +192,26 @@ test("configuration constants stay aligned with the JSON Schemas", () => {
   assert.equal(sessionSchema.properties.sessionVersion.const, ROUNDTABLE_SESSION_VERSION);
   assert.deepEqual(workspaceSchema.$defs.providerProfile.properties.apiFamily.enum, [...API_FAMILIES]);
   assert.deepEqual(workspaceSchema.$defs.modelProfile.properties.capabilities.items.enum, [...MODEL_CAPABILITIES]);
+  assert.deepEqual(workspaceSchema.$defs.skillProfile.properties.importStatus.enum, [
+    "registered", "installed", "review_required", "blocked",
+  ]);
+  assert.deepEqual(workspaceSchema.$defs.mcpServerProfile.properties.importStatus.enum, [
+    "registered", "installed", "review_required", "blocked",
+  ]);
   assert.deepEqual(workspaceSchema.$defs.modelRoute.properties.thinkingLevel.enum, [...THINKING_LEVELS]);
 });
 
 test("workspace validation resolves catalogs without exposing secret values", () => {
   const workspace = createWorkspace();
+  workspace.skills[0]!.source = {
+    kind: "git",
+    locator: "https://github.com/example/research-skill",
+    contentDigest: "sha256:test",
+  };
+  workspace.skills[0]!.importStatus = "installed";
+  workspace.skills[0]!.installDirectory = "C:\\Users\\Example\\AppData\\Local\\PiRoundtable\\catalog\\skills\\skill.research";
+  workspace.skills[0]!.auditSummary = "Reviewed bounded repository snapshot.";
+  workspace.skills[0]!.auditedAt = "2026-08-02T00:00:00.000Z";
   assert.deepEqual(validateWorkspaceProfile(workspace), []);
 
   workspace.providers[0]!.endpoint = "https://token@example.com/v1";

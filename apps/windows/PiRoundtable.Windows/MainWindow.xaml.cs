@@ -12,6 +12,8 @@ public sealed partial class MainWindow : Window
     private bool _initialized;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
+    private bool _contextPaneRequested = true;
+    private bool _secondaryPanesWereInline;
 
     public MainViewModel ViewModel { get; }
 
@@ -88,6 +90,11 @@ public sealed partial class MainWindow : Window
                 ViewModel.TemporaryRoleName = string.Empty;
                 ViewModel.TemporaryRolePurpose = string.Empty;
                 ViewModel.TemporaryRoleSystemPrompt = string.Empty;
+                ShowContextPanel(PrivateChatPanel);
+                if (ContextSplitView.DisplayMode == SplitViewDisplayMode.Overlay)
+                {
+                    ContextSplitView.IsPaneOpen = false;
+                }
             }
         });
     }
@@ -135,6 +142,21 @@ public sealed partial class MainWindow : Window
         });
     }
 
+    private async void FetchProviderModels_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.DiscoverProviderModelsAsync(ProviderApiKeyBox.Password));
+    }
+
+    private void SelectAllProviderModels_Click(object sender, RoutedEventArgs e)
+    {
+        ViewModel.SelectAllDiscoveredModels();
+    }
+
+    private async void ImportProviderModels_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.ImportSelectedProviderModelsAsync());
+    }
+
     private async void SaveRole_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(() => ViewModel.SaveRoleConfigurationAsync());
@@ -160,15 +182,56 @@ public sealed partial class MainWindow : Window
         ShellSplitView.IsPaneOpen = !ShellSplitView.IsPaneOpen;
     }
 
-    private void NavigateMeeting_Click(object sender, RoutedEventArgs e) => ShowPage(MeetingPage);
+    private void SessionList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SessionList.SelectedItem is null)
+        {
+            return;
+        }
 
-    private void NavigateRoles_Click(object sender, RoutedEventArgs e) => ShowPage(RoleManagementPage);
+        ActivateSessionPage();
+    }
 
-    private void NavigateSkills_Click(object sender, RoutedEventArgs e) => ShowPage(SkillPage);
+    private void SessionList_ItemClick(object sender, ItemClickEventArgs e)
+    {
+        if (e.ClickedItem is not SessionItem session)
+        {
+            return;
+        }
 
-    private void NavigateMcp_Click(object sender, RoutedEventArgs e) => ShowPage(McpPage);
+        if (!ReferenceEquals(ViewModel.SelectedSession, session) && !ViewModel.IsRunning)
+        {
+            ViewModel.SelectedSession = session;
+        }
+        SessionList.SelectedItem = ViewModel.SelectedSession;
+        ActivateSessionPage();
+    }
 
-    private void NavigateSettings_Click(object sender, RoutedEventArgs e) => ShowPage(SettingsPage);
+    private void ActivateSessionPage()
+    {
+        ShowPage(MeetingPage);
+        if (ShellSplitView.DisplayMode == SplitViewDisplayMode.Overlay)
+        {
+            ShellSplitView.IsPaneOpen = false;
+        }
+    }
+
+    private void NavigateRoles_Click(object sender, RoutedEventArgs e) => NavigateToPage(RoleManagementPage);
+
+    private void NavigateSkills_Click(object sender, RoutedEventArgs e) => NavigateToPage(SkillPage);
+
+    private void NavigateMcp_Click(object sender, RoutedEventArgs e) => NavigateToPage(McpPage);
+
+    private void NavigateSettings_Click(object sender, RoutedEventArgs e) => NavigateToPage(SettingsPage);
+
+    private void NavigateToPage(FrameworkElement page)
+    {
+        ShowPage(page);
+        if (ShellSplitView.DisplayMode == SplitViewDisplayMode.Overlay)
+        {
+            ShellSplitView.IsPaneOpen = false;
+        }
+    }
 
     private void ShowPage(FrameworkElement page)
     {
@@ -189,20 +252,23 @@ public sealed partial class MainWindow : Window
 
     private void OpenPrivatePane_Click(object sender, RoutedEventArgs e)
     {
-        PrivateChatPanel.Visibility = Visibility.Visible;
-        RoleDetailPanel.Visibility = Visibility.Collapsed;
-        ContextSplitView.IsPaneOpen = true;
+        ShowContextPanel(PrivateChatPanel);
+    }
+
+    private void OpenInvitationPane_Click(object sender, RoutedEventArgs e)
+    {
+        ShowContextPanel(InvitationPanel);
     }
 
     private void CloseContextPane_Click(object sender, RoutedEventArgs e)
     {
+        _contextPaneRequested = false;
         ContextSplitView.IsPaneOpen = false;
     }
 
     private void BackToPrivateChat_Click(object sender, RoutedEventArgs e)
     {
-        RoleDetailPanel.Visibility = Visibility.Collapsed;
-        PrivateChatPanel.Visibility = Visibility.Visible;
+        ShowContextPanel(PrivateChatPanel);
     }
 
     private void TranscriptSpeaker_Click(object sender, RoutedEventArgs e)
@@ -217,8 +283,15 @@ public sealed partial class MainWindow : Window
             return;
         }
         ViewModel.SelectedRole = role;
-        PrivateChatPanel.Visibility = Visibility.Collapsed;
-        RoleDetailPanel.Visibility = Visibility.Visible;
+        ShowContextPanel(RoleDetailPanel);
+    }
+
+    private void ShowContextPanel(FrameworkElement panel)
+    {
+        PrivateChatPanel.Visibility = panel == PrivateChatPanel ? Visibility.Visible : Visibility.Collapsed;
+        RoleDetailPanel.Visibility = panel == RoleDetailPanel ? Visibility.Visible : Visibility.Collapsed;
+        InvitationPanel.Visibility = panel == InvitationPanel ? Visibility.Visible : Visibility.Collapsed;
+        _contextPaneRequested = true;
         ContextSplitView.IsPaneOpen = true;
     }
 
@@ -284,6 +357,27 @@ public sealed partial class MainWindow : Window
         await RunUiActionAsync(() => ViewModel.SaveMcpCatalogEntryAsync());
     }
 
+    private async void ImportMcp_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.ImportMcpCatalogEntryAsync());
+    }
+
+    private async void ApproveSkill_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string skillId })
+        {
+            await RunUiActionAsync(() => ViewModel.ApproveSkillAsync(skillId));
+        }
+    }
+
+    private async void ApproveMcp_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string mcpServerId })
+        {
+            await RunUiActionAsync(() => ViewModel.ApproveMcpAsync(mcpServerId));
+        }
+    }
+
     private async void SaveClientSettings_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(async () =>
@@ -317,23 +411,45 @@ public sealed partial class MainWindow : Window
 
     private void ApplyAdaptiveLayout(double width)
     {
-        if (width >= 1120)
+        var shellPaneWidth = Math.Clamp(width - 48, 240, 288);
+        var contextPaneWidth = Math.Clamp(width - 48, 280, 392);
+        var rolePaneWidth = Math.Clamp(width - 48, 260, 300);
+        ShellSplitView.OpenPaneLength = shellPaneWidth;
+        ContextSplitView.OpenPaneLength = contextPaneWidth;
+        RoleManagementSplitView.OpenPaneLength = rolePaneWidth;
+
+        TitleSubtitle.Visibility = width >= 900 ? Visibility.Visible : Visibility.Collapsed;
+        StatusBadge.Visibility = width >= 780 ? Visibility.Visible : Visibility.Collapsed;
+        MeetingHeaderLabel.Visibility = width >= 700 ? Visibility.Visible : Visibility.Collapsed;
+        MeetingSummaryText.Visibility = width >= 1180 ? Visibility.Visible : Visibility.Collapsed;
+        MeetingCommandBar.DefaultLabelPosition = width >= 1180
+            ? CommandBarDefaultLabelPosition.Right
+            : CommandBarDefaultLabelPosition.Collapsed;
+
+        var secondaryPanesInline = width >= 1360;
+        if (secondaryPanesInline)
         {
             ShellSplitView.DisplayMode = SplitViewDisplayMode.Inline;
             ShellSplitView.IsPaneOpen = true;
             ContextSplitView.DisplayMode = SplitViewDisplayMode.Inline;
-            ContextSplitView.IsPaneOpen = MeetingPage.Visibility == Visibility.Visible;
+            ContextSplitView.IsPaneOpen = MeetingPage.Visibility == Visibility.Visible && _contextPaneRequested;
             RoleManagementSplitView.DisplayMode = SplitViewDisplayMode.Inline;
-            RoleManagementSplitView.IsPaneOpen = true;
+            RoleManagementSplitView.IsPaneOpen = RoleManagementPage.Visibility == Visibility.Visible;
         }
-        else if (width >= 720)
+        else if (width >= 900)
         {
             ShellSplitView.DisplayMode = SplitViewDisplayMode.Inline;
             ShellSplitView.IsPaneOpen = true;
             ContextSplitView.DisplayMode = SplitViewDisplayMode.Overlay;
-            ContextSplitView.IsPaneOpen = false;
-            RoleManagementSplitView.DisplayMode = SplitViewDisplayMode.Inline;
-            RoleManagementSplitView.IsPaneOpen = true;
+            RoleManagementSplitView.DisplayMode = SplitViewDisplayMode.Overlay;
+            if (_secondaryPanesWereInline || MeetingPage.Visibility != Visibility.Visible)
+            {
+                ContextSplitView.IsPaneOpen = false;
+            }
+            if (_secondaryPanesWereInline || RoleManagementPage.Visibility != Visibility.Visible)
+            {
+                RoleManagementSplitView.IsPaneOpen = false;
+            }
         }
         else
         {
@@ -344,6 +460,7 @@ public sealed partial class MainWindow : Window
             RoleManagementSplitView.DisplayMode = SplitViewDisplayMode.Overlay;
             RoleManagementSplitView.IsPaneOpen = false;
         }
+        _secondaryPanesWereInline = secondaryPanesInline;
     }
 
     private void ErrorInfoBar_CloseButtonClick(InfoBar sender, object args)

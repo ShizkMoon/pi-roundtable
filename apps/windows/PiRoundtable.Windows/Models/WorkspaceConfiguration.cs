@@ -56,6 +56,10 @@ public sealed class SkillProfileConfiguration
     public string Description { get; set; } = string.Empty;
     public SkillSourceConfiguration Source { get; set; } = new();
     public string? Risk { get; set; }
+    public string ImportStatus { get; set; } = "registered";
+    public string? InstallDirectory { get; set; }
+    public string? AuditSummary { get; set; }
+    public DateTimeOffset? AuditedAt { get; set; }
     public bool Enabled { get; set; } = true;
 }
 
@@ -71,6 +75,13 @@ public sealed class McpServerProfileConfiguration
 {
     public string McpServerId { get; set; } = string.Empty;
     public string DisplayName { get; set; } = string.Empty;
+    public SkillSourceConfiguration? Source { get; set; }
+    public string? Risk { get; set; }
+    public string ImportStatus { get; set; } = "registered";
+    public string? InstallDirectory { get; set; }
+    public string? ContentDigest { get; set; }
+    public string? AuditSummary { get; set; }
+    public DateTimeOffset? AuditedAt { get; set; }
     public string Transport { get; set; } = "stdio";
     public string? Command { get; set; }
     public List<string>? Arguments { get; set; }
