@@ -3,6 +3,10 @@ import type { Readable, Writable } from "node:stream";
 
 import type { RuntimeCapabilities } from "./runtime-adapter.js";
 import {
+  validateRoundtableSession,
+  validateWorkspaceProfile,
+} from "@pi-roundtable/protocol";
+import {
   LOCAL_HOST_PROTOCOL_VERSION,
   LocalHostProtocolError,
   parseLocalHostInput,
@@ -52,7 +56,13 @@ export class StdioRuntimeHost {
 
   async run(input: Readable, output: Writable): Promise<void> {
     const writer = new OrderedFrameWriter(output);
+    const pendingInitializationFrames: LocalHostOutputFrame[] = [];
+    let outboundReady = false;
     const queueEvent = (frame: LocalHostOutputFrame): void => {
+      if (!outboundReady) {
+        pendingInitializationFrames.push(frame);
+        return;
+      }
       void writer.write(frame).catch(() => {
         // The command loop observes the same poisoned writer and terminates.
       });
@@ -90,7 +100,28 @@ export class StdioRuntimeHost {
               };
             } else {
               try {
-                this.host.initializeCredential(frame.apiKey);
+                const issues = validateWorkspaceProfile(frame.workspace);
+                if (issues.length > 0) {
+                  throw new LocalHostProtocolError(
+                    "invalid_workspace",
+                    "Runtime workspace configuration failed integrity validation",
+                    frame.requestId,
+                  );
+                }
+                const sessionIssues = validateRoundtableSession(frame.session, frame.workspace);
+                if (sessionIssues.length > 0) {
+                  throw new LocalHostProtocolError(
+                    "invalid_session",
+                    "Roundtable session failed integrity validation",
+                    frame.requestId,
+                  );
+                }
+                this.host.initializeRuntimeConfiguration(
+                  frame.workspace,
+                  frame.session,
+                  frame.credentials,
+                );
+                this.host.start();
                 initialized = true;
                 await writer.write({
                   type: "ready",
@@ -100,8 +131,12 @@ export class StdioRuntimeHost {
                   runtimeGeneration: this.host.runtimeGeneration,
                   capabilities: HOST_CAPABILITIES,
                 });
-                this.host.start();
+                while (pendingInitializationFrames.length > 0) {
+                  await writer.write(pendingInitializationFrames.shift()!);
+                }
+                outboundReady = true;
               } catch {
+                pendingInitializationFrames.length = 0;
                 response = {
                   type: "error",
                   requestId: frame.requestId,

@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/config/v1/roundtable-session.schema.json",
+  "title": "Pi Roundtable session",
+  "description": "Durable session definition. It contains user-authored meeting content and frozen participant manifests, but never provider or MCP credential values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sessionVersion",
+    "sessionId",
+    "workspaceId",
+    "title",
+    "phase",
+    "createdAt",
+    "updatedAt",
+    "agenda",
+    "participants"
+  ],
+  "properties": {
+    "sessionVersion": { "const": 1 },
+    "sessionId": { "$ref": "#/$defs/id" },
+    "workspaceId": { "$ref": "#/$defs/id" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "phase": { "enum": ["draft", "live", "closed"] },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "agenda": { "$ref": "#/$defs/agenda" },
+    "participants": {
+      "type": "array",
+      "minItems": 0,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/participantManifest" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "phase": { "enum": ["live", "closed"] } } },
+      "then": { "properties": { "participants": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "agenda": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "objectives", "constraints"],
+      "properties": {
+        "subject": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "objectives": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        },
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+        }
+      }
+    },
+    "invitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invitationId",
+        "inviterType",
+        "inviterId",
+        "purpose",
+        "status",
+        "createdAt",
+        "acceptedAt"
+      ],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/id" },
+        "inviterType": { "enum": ["user", "role"] },
+        "inviterId": { "$ref": "#/$defs/id" },
+        "purpose": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "status": { "const": "accepted" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "acceptedAt": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "inviterType": { "const": "user" } } },
+          "then": { "properties": { "inviterId": { "const": "user.direct_host" } } }
+        }
+      ]
+    },
+    "participantManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "participantId",
+        "scope",
+        "displayName",
+        "systemPromptSnapshot",
+        "modelRouteSnapshot",
+        "capabilitiesSnapshot",
+        "delegationSnapshot",
+        "memoryPolicySnapshot",
+        "retentionPolicy"
+      ],
+      "properties": {
+        "participantId": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["long_term", "temporary"] },
+        "roleProfileId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "systemPromptSnapshot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Frozen role instructions. Prompt text is not an authorization boundary and must not contain credentials."
+        },
+        "modelRouteSnapshot": {
+          "$ref": "workspace-profile.schema.json#/$defs/modelRoute"
+        },
+        "capabilitiesSnapshot": {
+          "$ref": "workspace-profile.schema.json#/$defs/capabilityPolicy"
+        },
+        "delegationSnapshot": {
+          "$ref": "workspace-profile.schema.json#/$defs/delegationPolicy"
+        },
+        "memoryPolicySnapshot": {
+          "$ref": "workspace-profile.schema.json#/$defs/memoryPolicy"
+        },
+        "invitation": { "$ref": "#/$defs/invitation" },
+        "retentionPolicy": {
+          "enum": [
+            "retain_profile",
+            "delete_after_session",
+            "review_at_close",
+            "promote_candidate"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "long_term" } } },
+          "then": {
+            "required": ["roleProfileId"],
+            "not": { "required": ["invitation"] },
+            "properties": { "retentionPolicy": { "const": "retain_profile" } }
+          }
+        },
+        {
+          "if": { "properties": { "scope": { "const": "temporary" } } },
+          "then": {
+            "required": ["invitation"],
+            "not": { "required": ["roleProfileId"] },
+            "properties": {
+              "retentionPolicy": {
+                "enum": ["delete_after_session", "review_at_close", "promote_candidate"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

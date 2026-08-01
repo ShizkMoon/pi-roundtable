@@ -24,8 +24,6 @@ async function main(): Promise<void> {
   const options: LocalRoundtableHostOptions = {
     meetingId: requireEnvironment("PI_ROUNDTABLE_MEETING_ID"),
     runtimeGeneration,
-    providerId: requireEnvironment("PI_ROUNDTABLE_PROVIDER_ID"),
-    modelId: requireEnvironment("PI_ROUNDTABLE_MODEL_ID"),
   };
   if (process.env.PI_ROUNDTABLE_RUNTIME_ID !== undefined) {
     options.runtimeId = process.env.PI_ROUNDTABLE_RUNTIME_ID;

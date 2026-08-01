@@ -7,18 +7,77 @@ public sealed class RoleItem : INotifyPropertyChanged
 {
     private string _scope;
     private string _status = "未连接";
+    private string _systemPrompt;
+    private string _modelProfileId = string.Empty;
+    private string _retentionPolicy;
+    private string _networkAccess;
     private bool _isArchived;
 
-    public RoleItem(string roleId, string displayName, string scope)
+    public RoleItem(
+        string roleId,
+        string displayName,
+        string scope,
+        string? systemPrompt = null,
+        string? modelProfileId = null,
+        string? invitationPurpose = null,
+        string? inviterId = null,
+        string? retentionPolicy = null,
+        string? networkAccess = null,
+        string? invitationId = null,
+        DateTimeOffset? invitedAt = null)
     {
         RoleId = roleId;
         DisplayName = displayName;
         _scope = scope;
+        _systemPrompt = systemPrompt ?? $"你是圆桌会议中的{displayName}。只在职责范围内工作，并明确说明不确定性。";
+        _modelProfileId = modelProfileId ?? string.Empty;
+        _retentionPolicy = retentionPolicy ?? (scope == "long_term" ? "retain_profile" : "review_at_close");
+        _networkAccess = networkAccess ?? "subagent_required";
+        InvitationId = scope == "temporary" ? invitationId ?? $"invite.{Guid.NewGuid():N}" : null;
+        InvitationPurpose = invitationPurpose;
+        InviterId = inviterId;
+        InvitedAt = scope == "temporary" ? invitedAt ?? DateTimeOffset.UtcNow : null;
     }
 
     public string RoleId { get; }
 
     public string DisplayName { get; }
+
+    public string SystemPrompt
+    {
+        get => _systemPrompt;
+        set => SetField(ref _systemPrompt, value);
+    }
+
+    public string ModelProfileId
+    {
+        get => _modelProfileId;
+        set => SetField(ref _modelProfileId, value);
+    }
+
+    public string RetentionPolicy
+    {
+        get => _retentionPolicy;
+        set => SetField(ref _retentionPolicy, value);
+    }
+
+    public string NetworkAccess
+    {
+        get => _networkAccess;
+        set => SetField(ref _networkAccess, value);
+    }
+
+    public HashSet<string> SkillIds { get; } = new(StringComparer.Ordinal);
+
+    public HashSet<string> McpServerIds { get; } = new(StringComparer.Ordinal);
+
+    public string? InvitationId { get; }
+
+    public string? InvitationPurpose { get; }
+
+    public string? InviterId { get; }
+
+    public DateTimeOffset? InvitedAt { get; }
 
     public string Scope
     {
@@ -41,6 +100,13 @@ public sealed class RoleItem : INotifyPropertyChanged
     public string ScopeLabel => Scope == "long_term" ? "长期角色" : "临时角色";
 
     public string Summary => $"{ScopeLabel} · {Status}";
+
+    public string CapabilitiesSummary => $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP";
+
+    public void NotifyCapabilitiesChanged()
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilitiesSummary)));
+    }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 

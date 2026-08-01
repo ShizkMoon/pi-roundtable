@@ -102,6 +102,8 @@ function createAdapter(factory: FakePiSessionFactory, events: RuntimeEvent[]): P
     providerId: "openai",
     modelId: "gpt-test",
     tools: [],
+    systemPrompt: "You are the research role.",
+    skillPaths: ["skills/research/SKILL.md"],
     credentialProvider: {
       resolveApiKey: async () => "test-key-not-persisted",
     },
@@ -124,6 +126,8 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
   assert.equal(info.capabilities.subagents, false);
   assert.equal(factory.lastOptions?.apiKey.length, "test-key-not-persisted".length);
   assert.deepEqual(factory.lastOptions?.tools, []);
+  assert.equal(factory.lastOptions?.systemPrompt, "You are the research role.");
+  assert.deepEqual(factory.lastOptions?.skillPaths, ["skills/research/SKILL.md"]);
 
   const command = {
     kind: "turn.prompt" as const,

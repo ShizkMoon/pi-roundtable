@@ -1,0 +1,344 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/config/v1/workspace-profile.schema.json",
+  "title": "Pi Roundtable workspace profile",
+  "description": "Portable, non-secret configuration for one Pi Roundtable workspace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "configurationVersion",
+    "workspaceId",
+    "displayName",
+    "updatedAt",
+    "providers",
+    "models",
+    "skills",
+    "mcpServers",
+    "roles"
+  ],
+  "properties": {
+    "configurationVersion": { "const": 1 },
+    "workspaceId": { "$ref": "#/$defs/id" },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "providers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/providerProfile" }
+    },
+    "models": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/modelProfile" }
+    },
+    "skills": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/skillProfile" }
+    },
+    "mcpServers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/mcpServerProfile" }
+    },
+    "roles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/roleProfile" }
+    },
+    "defaults": { "$ref": "#/$defs/workspaceDefaults" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "credentialRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[a-z][a-z0-9+.-]*://[^\\s]+$",
+      "description": "Opaque URI-like reference to a platform secure store; never a credential value."
+    },
+    "httpEndpoint": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048,
+      "pattern": "^https?://[^/@\\s]+(?:[/?#].*)?$",
+      "description": "HTTP(S) endpoint without URI userinfo. Plain HTTP is accepted only for loopback by runtime validation."
+    },
+    "providerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerProfileId",
+        "displayName",
+        "apiFamily",
+        "runtimeProviderId",
+        "credentialRef",
+        "enabled"
+      ],
+      "properties": {
+        "providerProfileId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "apiFamily": {
+          "enum": [
+            "openai_responses",
+            "openai_chat_completions",
+            "anthropic_messages",
+            "google_generate_content",
+            "custom"
+          ]
+        },
+        "runtimeProviderId": {
+          "$ref": "#/$defs/id",
+          "description": "Provider identifier resolved by the private runtime adapter."
+        },
+        "endpoint": { "$ref": "#/$defs/httpEndpoint" },
+        "credentialRef": { "$ref": "#/$defs/credentialRef" },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "modelProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "modelProfileId",
+        "providerProfileId",
+        "modelId",
+        "displayName",
+        "capabilities",
+        "enabled"
+      ],
+      "properties": {
+        "modelProfileId": { "$ref": "#/$defs/id" },
+        "providerProfileId": { "$ref": "#/$defs/id" },
+        "modelId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["text", "vision", "reasoning", "tool_calling", "audio"]
+          }
+        },
+        "contextWindow": { "type": "integer", "minimum": 1 },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "skillProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["skillId", "displayName", "description", "source", "enabled"],
+      "properties": {
+        "skillId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "locator"],
+          "properties": {
+            "kind": { "enum": ["builtin", "local", "git"] },
+            "locator": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "contentDigest": { "type": "string", "minLength": 1, "maxLength": 256 }
+          }
+        },
+        "risk": { "enum": ["low", "medium", "high"] },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "mcpServerProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mcpServerId", "displayName", "transport", "enabled"],
+      "properties": {
+        "mcpServerId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "transport": { "enum": ["stdio", "streamable_http", "sse"] },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Executable locator only. Secrets belong in environmentCredentialRefs."
+        },
+        "arguments": {
+          "type": "array",
+          "description": "Non-secret arguments only. Secrets belong in secure-store references.",
+          "items": { "type": "string", "maxLength": 2048 }
+        },
+        "workingDirectory": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "endpoint": { "$ref": "#/$defs/httpEndpoint" },
+        "environmentCredentialRefs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/credentialRef" }
+        },
+        "headerCredentialRefs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/credentialRef" }
+        },
+        "enabled": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "transport": { "const": "stdio" } } },
+          "then": {
+            "required": ["command"],
+            "not": { "anyOf": [{ "required": ["endpoint"] }, { "required": ["headerCredentialRefs"] }] }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": { "enum": ["streamable_http", "sse"] }
+            }
+          },
+          "then": {
+            "required": ["endpoint"],
+            "not": {
+              "anyOf": [
+                { "required": ["command"] },
+                { "required": ["arguments"] },
+                { "required": ["workingDirectory"] },
+                { "required": ["environmentCredentialRefs"] }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "modelRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primaryModelProfileId", "fallbackModelProfileIds", "thinkingLevel"],
+      "properties": {
+        "primaryModelProfileId": { "$ref": "#/$defs/id" },
+        "fallbackModelProfileIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "thinkingLevel": { "enum": ["off", "minimal", "low", "medium", "high", "xhigh"] },
+        "maxOutputTokens": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "mcpGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mcpServerId", "toolAllowlist", "approvalMode", "executionMode"],
+      "properties": {
+        "mcpServerId": { "$ref": "#/$defs/id" },
+        "toolAllowlist": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "An empty list attaches the server but authorizes no tools until discovery and review.",
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "approvalMode": { "enum": ["always", "on_first_use", "never"] },
+        "executionMode": {
+          "enum": ["direct", "subagent_preferred", "subagent_required"]
+        }
+      }
+    },
+    "toolGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["toolId", "approvalMode", "executionMode"],
+      "properties": {
+        "toolId": { "$ref": "#/$defs/id" },
+        "approvalMode": { "enum": ["always", "on_first_use", "never"] },
+        "executionMode": {
+          "enum": ["direct", "subagent_preferred", "subagent_required"]
+        }
+      }
+    },
+    "capabilityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["skillIds", "mcpGrants", "toolGrants"],
+      "properties": {
+        "skillIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "mcpGrants": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/mcpGrant" }
+        },
+        "toolGrants": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/toolGrant" }
+        }
+      }
+    },
+    "delegationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["networkAccess", "resultMode", "maxConcurrentSubagents"],
+      "properties": {
+        "networkAccess": {
+          "enum": ["forbidden", "subagent_required", "subagent_preferred", "direct_allowed"]
+        },
+        "resultMode": { "enum": ["summary_with_citations", "summary", "full"] },
+        "maxConcurrentSubagents": { "type": "integer", "minimum": 0, "maximum": 16 }
+      }
+    },
+    "memoryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "writeApproval", "promptEvolution"],
+      "properties": {
+        "mode": { "enum": ["disabled", "selective", "continuous"] },
+        "writeApproval": { "enum": ["always", "meeting_close", "automatic"] },
+        "promptEvolution": { "enum": ["disabled", "propose", "review_required", "automatic"] }
+      }
+    },
+    "roleProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roleProfileId",
+        "displayName",
+        "description",
+        "systemPrompt",
+        "responsibilities",
+        "autoJoin",
+        "modelRoute",
+        "capabilities",
+        "delegation",
+        "memory"
+      ],
+      "properties": {
+        "roleProfileId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "systemPrompt": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "responsibilities": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        },
+        "autoJoin": { "type": "boolean" },
+        "modelRoute": { "$ref": "#/$defs/modelRoute" },
+        "capabilities": { "$ref": "#/$defs/capabilityPolicy" },
+        "delegation": { "$ref": "#/$defs/delegationPolicy" },
+        "memory": { "$ref": "#/$defs/memoryPolicy" }
+      }
+    },
+    "workspaceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "modelRoute": { "$ref": "#/$defs/modelRoute" },
+        "delegation": { "$ref": "#/$defs/delegationPolicy" }
+      }
+    }
+  }
+}
