@@ -2,7 +2,7 @@
 
 ## 1. Deployment model
 
-A meeting is controlled by one Runtime Host. In the first implementation cycle that host will run beside the Windows application and embed Pi through its supported SDK surface. Oh My Pi remains an optional compatibility runtime behind an adapter. Linux hosts the optional synchronization plane: normalized event storage, lease fencing, replay cursors, authentication, and later push notifications. Android is a presentation and control client and never launches Pi locally.
+A meeting is controlled by one Runtime Host. In the first implementation cycle that host will run beside the Windows application and embed Pi through its supported SDK surface. Oh My Pi remains an optional compatibility runtime behind an adapter. Linux hosts the optional synchronization plane: normalized event storage, lease fencing, and replay cursors; authentication and push notifications remain planned. Android is a presentation and control client and never launches Pi locally.
 
 This split avoids two conflicting sources of truth. If a runtime moves to another machine, the sync server increments `runtimeGeneration`; events from the old generation are rejected even if the old process reconnects late.
 
@@ -18,7 +18,9 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 
 ### Runtime Host
 
-`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The planned default adapter embeds Pi directly. The currently implemented OMP transport:
+`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The implemented `PiRuntimeAdapter` embeds the pinned Pi SDK directly. It creates one supervised session for one active role, injects provider credentials in memory, starts with no tools unless an allowlist is supplied, normalizes public events, and makes command acknowledgements idempotent. Raw Pi session records remain private.
+
+The currently implemented low-level OMP client:
 
 1. starts `omp --mode rpc`;
 2. waits for the `ready` frame;
@@ -27,7 +29,7 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 5. correlates command responses by ID;
 6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
 
-Role scheduling, tool policy, host-tool callbacks, direct Pi integration, and runtime-to-domain event normalization are intentionally separate from the low-level adapter and remain planned.
+Cross-role scheduling, durable role sessions, host-tool callbacks, approval gates, prompt/memory policy, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
 
 ### Sync server
 
@@ -35,7 +37,7 @@ Role scheduling, tool policy, host-tool callbacks, direct Pi integration, and ru
 
 ### Native clients
 
-Windows uses WinUI 3 and will own the first local runtime integration. A normal local meeting must work without a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
+Windows uses .NET 10 LTS with WinUI 3 and will own the first local runtime integration. A normal local meeting must work without a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
 
 ## 3. Interruption model
 
@@ -57,3 +59,9 @@ This implemented lifecycle is only the deterministic meeting foundation. Durable
 ## 5. Data ownership
 
 The synchronization plane stores domain events and snapshots, not raw provider credentials, local tool output directories, or complete OMP session files. Large artifacts should be referenced by scoped object identifiers. Secrets stay with the Runtime Host or a future dedicated secrets service.
+
+## 6. Agent execution model
+
+Each active role owns an isolated runtime session supervised by the meeting Runtime Host. The meeting orchestrator decides who may speak, create a temporary role, invoke a capability, or retain a role; the model runtime does not become the authorization layer. Tools start disabled and are exposed through explicit role- and meeting-scoped capabilities. Commands carry stable IDs so retries do not duplicate model or tool work.
+
+Normalized domain events are the authoritative meeting history. Provider transcripts, reasoning records, caches, and tool implementation details are private runtime state. Durable checkpoints, human approval before consequential tools, MCP consent boundaries, and OpenTelemetry GenAI spans are planned integration surfaces; their schemas must remain additive and must not weaken `runtimeGeneration` fencing.

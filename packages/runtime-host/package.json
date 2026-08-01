@@ -9,12 +9,16 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -b",
-    "test": "node --test dist/test/rpc-frame-decoder.test.js dist/test/omp-rpc-client.test.js"
+    "test": "node --test dist/test/*.test.js"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
     "@pi-roundtable/protocol": "0.1.0"
   }
 }
