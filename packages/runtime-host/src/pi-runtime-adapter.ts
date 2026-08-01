@@ -115,7 +115,9 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       credentials: new MemoryCredentialStore(),
       allowModelNetwork: false,
     });
-    await modelRuntime.setRuntimeApiKey(options.providerId, options.apiKey);
+    await modelRuntime.setRuntimeApiKey(options.providerId, options.apiKey, {
+      allowNetwork: false,
+    });
     const model = modelRuntime.getModel(options.providerId, options.modelId);
     if (model === undefined) {
       throw new PiRuntimeError(
@@ -160,6 +162,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnCancellationPending = false;
   #turnCancellationEmitted = false;
   #turnFailed = false;
+  #turnFailureTerminalEmitted = false;
+  #activeTurnCommandId: string | undefined;
 
   constructor(options: PiRuntimeAdapterOptions) {
     this.#options = options;
@@ -299,6 +303,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       if (!session.isStreaming || command.delivery === "immediate") {
         startsTurn = true;
         this.#clearCancellationOutcome();
+        this.#turnFailed = false;
+        this.#turnFailureTerminalEmitted = false;
+        this.#activeTurnCommandId = command.commandId;
         this.#promptDispatchPending = true;
         invocation = session.prompt(command.message);
       } else if (command.delivery === "steer") {
@@ -318,6 +325,11 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
             if (startsTurn) {
               this.#promptDispatchPending = false;
               this.#clearCancellationOutcome();
+              if (!this.#turnFailureTerminalEmitted) {
+                this.#turnFailureTerminalEmitted = true;
+                this.#emit("turn.cancelled", {}, command.commandId);
+              }
+              this.#activeTurnCommandId = undefined;
             }
             this.#emitFailure(error, command.commandId);
           }
@@ -327,6 +339,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     } catch (error) {
       if (startsTurn) {
         this.#promptDispatchPending = false;
+        this.#activeTurnCommandId = undefined;
       }
       return this.#rememberFailure(command.commandId, fingerprint, error);
     }
@@ -428,6 +441,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#promptDispatchPending = false;
     this.#clearCancellationOutcome();
     this.#turnFailed = false;
+    this.#turnFailureTerminalEmitted = false;
+    this.#activeTurnCommandId = undefined;
     try {
       if (shouldAbort) {
         await session.abort();
@@ -465,25 +480,26 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     switch (event.type) {
       case "turn_start":
         this.#turnFailed = false;
-        this.#emit("turn.started", {});
+        this.#turnFailureTerminalEmitted = false;
+        this.#emit("turn.started", {}, this.#activeTurnCommandId);
         break;
       case "message_update": {
         const update = event.assistantMessageEvent;
         if (update.type === "text_delta") {
-          this.#emit("turn.delta", { delta: update.delta });
+          this.#emit("turn.delta", { delta: update.delta }, this.#activeTurnCommandId);
         } else if (update.type === "error") {
           if (update.reason === "aborted") {
             this.#turnCancellationPending = true;
             if (!this.#turnCancellationEmitted) {
               this.#turnCancellationEmitted = true;
-              this.#emit("turn.cancelled", {});
+              this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
             }
           } else {
             this.#turnFailed = true;
             this.#emit("runtime.failed", {
               errorCode: "pi_response_error",
-              message: update.error.errorMessage ?? "Pi provider response failed",
-            });
+              message: "Pi provider response failed",
+            }, this.#activeTurnCommandId);
           }
         }
         break;
@@ -491,40 +507,47 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       case "turn_end":
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
-            this.#emit("turn.cancelled", {});
+            this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
+          }
+        } else if (this.#turnFailed) {
+          if (!this.#turnFailureTerminalEmitted) {
+            this.#turnFailureTerminalEmitted = true;
+            this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
           }
         } else if (!this.#turnFailed) {
-          this.#emit("turn.completed", {});
+          this.#emit("turn.completed", {}, this.#activeTurnCommandId);
         }
         this.#clearCancellationOutcome();
         this.#turnFailed = false;
+        this.#turnFailureTerminalEmitted = false;
+        this.#activeTurnCommandId = undefined;
         break;
       case "tool_execution_start":
         this.#emit("tool.started", {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
-        });
+        }, this.#activeTurnCommandId);
         break;
       case "tool_execution_update":
         this.#emit("tool.progress", {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
-        });
+        }, this.#activeTurnCommandId);
         break;
       case "tool_execution_end":
         this.#emit(event.isError ? "tool.failed" : "tool.completed", {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           isError: event.isError,
-        });
+        }, this.#activeTurnCommandId);
         break;
       case "auto_retry_end":
         if (!event.success) {
           this.#turnFailed = true;
           this.#emit("runtime.failed", {
             errorCode: "pi_retry_exhausted",
-            message: event.finalError ?? "Pi automatic retry was exhausted",
-          });
+            message: "Pi automatic retry was exhausted",
+          }, this.#activeTurnCommandId);
         }
         break;
       default:
@@ -587,12 +610,26 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
 
   #normalizeError(error: unknown): { code: string; message: string } {
     if (error instanceof PiRuntimeError) {
-      return { code: error.code, message: error.message };
+      return { code: error.code, message: this.#safeErrorMessage(error.code) };
     }
-    if (error instanceof Error) {
-      return { code: "pi_runtime_error", message: error.message };
+    return { code: "pi_runtime_error", message: "Pi runtime operation failed" };
+  }
+
+  #safeErrorMessage(code: string): string {
+    switch (code) {
+      case "model_not_found":
+        return "The requested Pi model is unavailable";
+      case "credential_unavailable":
+        return "No runtime credential is available";
+      case "session_mismatch":
+        return "Pi returned an unexpected session";
+      case "already_started":
+        return "Pi runtime adapter is already started";
+      case "start_cancelled":
+        return "Pi runtime adapter startup was cancelled";
+      default:
+        return "Pi runtime operation failed";
     }
-    return { code: "pi_runtime_error", message: String(error) };
   }
 
   #commandFingerprint(command: RuntimeCommand): string {

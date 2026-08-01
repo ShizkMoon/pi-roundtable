@@ -91,6 +91,7 @@ PR_API uint64_t pr_meeting_last_sequence(const pr_meeting* meeting);
 PR_API uint64_t pr_meeting_runtime_generation(const pr_meeting* meeting);
 PR_API int pr_meeting_has_active_lease(const pr_meeting* meeting);
 PR_API pr_meeting_phase pr_meeting_get_phase(const pr_meeting* meeting);
+PR_API uint64_t pr_meeting_role_count(const pr_meeting* meeting);
 PR_API int pr_meeting_has_role(const pr_meeting* meeting, const char* role_id);
 PR_API pr_role_scope pr_meeting_role_scope(const pr_meeting* meeting, const char* role_id);
 PR_API int pr_meeting_role_is_archived(const pr_meeting* meeting, const char* role_id);
@@ -99,6 +100,8 @@ PR_API int pr_meeting_role_is_archived(const pr_meeting* meeting, const char* ro
 PR_API const char* pr_meeting_runtime_owner(const pr_meeting* meeting);
 PR_API const char* pr_meeting_active_speaker(const pr_meeting* meeting);
 PR_API const char* pr_meeting_pending_interruptor(const pr_meeting* meeting);
+PR_API const char* pr_meeting_pending_interrupt_target(const pr_meeting* meeting);
+PR_API const char* pr_apply_error_message(pr_apply_error error);
 
 #ifdef __cplusplus
 }

@@ -69,6 +69,10 @@ pr_meeting_phase pr_meeting_get_phase(const pr_meeting* meeting) {
     return static_cast<pr_meeting_phase>(meeting->state.phase());
 }
 
+uint64_t pr_meeting_role_count(const pr_meeting* meeting) {
+    return meeting == nullptr ? 0 : static_cast<uint64_t>(meeting->state.role_count());
+}
+
 int pr_meeting_has_role(const pr_meeting* meeting, const char* role_id) {
     return meeting != nullptr && role_id != nullptr && meeting->state.has_role(role_id) ? 1 : 0;
 }
@@ -109,4 +113,31 @@ const char* pr_meeting_pending_interruptor(const pr_meeting* meeting) {
         return nullptr;
     }
     return meeting->state.pending_interruptor_id()->c_str();
+}
+
+const char* pr_meeting_pending_interrupt_target(const pr_meeting* meeting) {
+    if (meeting == nullptr || !meeting->state.pending_interrupt_target_id().has_value()) {
+        return nullptr;
+    }
+    return meeting->state.pending_interrupt_target_id()->c_str();
+}
+
+const char* pr_apply_error_message(pr_apply_error error) {
+    switch (error) {
+        case PR_APPLY_OK: return "ok";
+        case PR_APPLY_OUT_OF_ORDER_SEQUENCE: return "out_of_order_sequence";
+        case PR_APPLY_LEASE_REQUIRED: return "lease_required";
+        case PR_APPLY_STALE_RUNTIME_GENERATION: return "stale_runtime_generation";
+        case PR_APPLY_INVALID_RUNTIME_GENERATION: return "invalid_runtime_generation";
+        case PR_APPLY_INVALID_TRANSITION: return "invalid_transition";
+        case PR_APPLY_INVALID_ACTOR: return "invalid_actor";
+        case PR_APPLY_UNKNOWN_ROLE: return "unknown_role";
+        case PR_APPLY_DUPLICATE_ROLE: return "duplicate_role";
+        case PR_APPLY_FLOOR_BUSY: return "floor_busy";
+        case PR_APPLY_NO_ACTIVE_SPEAKER: return "no_active_speaker";
+        case PR_APPLY_INTERRUPTION_PENDING: return "interruption_pending";
+        case PR_APPLY_ROLE_NOT_TEMPORARY: return "role_not_temporary";
+        case PR_APPLY_ROLE_ARCHIVED: return "role_archived";
+        default: return "unknown_error";
+    }
 }

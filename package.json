@@ -14,6 +14,7 @@
     "build": "tsc -b packages/protocol-ts packages/runtime-host packages/sync-server",
     "clean": "tsc -b --clean packages/protocol-ts packages/runtime-host packages/sync-server",
     "test": "npm run build && npm run test --workspaces --if-present",
+    "dev:runtime": "npm run build --workspace @pi-roundtable/runtime-host && npm run start:stdio --workspace @pi-roundtable/runtime-host",
     "dev:sync": "npm run dev --workspace @pi-roundtable/sync-server"
   },
   "devDependencies": {
