@@ -21,6 +21,7 @@
     "sessionId": { "$ref": "#/$defs/id" },
     "workspaceId": { "$ref": "#/$defs/id" },
     "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "groupId": { "$ref": "#/$defs/id" },
     "phase": { "enum": ["draft", "live", "closed"] },
     "createdAt": { "type": "string", "format": "date-time" },
     "updatedAt": { "type": "string", "format": "date-time" },
@@ -30,6 +31,10 @@
       "minItems": 0,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/participantManifest" }
+    },
+    "messages": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sessionMessage" }
     }
   },
   "allOf": [
@@ -60,6 +65,46 @@
           "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
         }
       }
+    },
+    "sessionMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "kind",
+        "speakerId",
+        "speakerName",
+        "visibility",
+        "audienceRoleIds",
+        "text",
+        "state",
+        "occurredAt"
+      ],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["host", "role", "system"] },
+        "speakerId": { "$ref": "#/$defs/id" },
+        "speakerName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "visibility": { "enum": ["public", "private"] },
+        "audienceRoleIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "text": { "type": "string", "maxLength": 1048576 },
+        "state": { "enum": ["submitted", "streaming", "completed", "cancelled"] },
+        "occurredAt": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "visibility": { "const": "private" } } },
+          "then": { "properties": { "audienceRoleIds": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "visibility": { "const": "public" } } },
+          "then": { "properties": { "audienceRoleIds": { "maxItems": 0 } } }
+        }
+      ]
     },
     "invitation": {
       "type": "object",

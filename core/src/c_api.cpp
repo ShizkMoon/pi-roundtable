@@ -13,6 +13,7 @@ namespace {
 
 using pi_roundtable::core::ApplyError;
 using pi_roundtable::core::EventKind;
+using pi_roundtable::core::EventVisibility;
 using pi_roundtable::core::MeetingEvent;
 using pi_roundtable::core::MeetingPhase;
 using pi_roundtable::core::RoleScope;
@@ -35,7 +36,9 @@ void pr_meeting_destroy(pr_meeting* meeting) {
 pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
     if (meeting == nullptr || event == nullptr ||
         event->kind < PR_EVENT_RUNTIME_LEASE_ACQUIRED ||
-        event->kind > PR_EVENT_ROLE_ARCHIVED) {
+        event->kind > PR_EVENT_MESSAGE_DIRECT_SENT ||
+        event->visibility < PR_EVENT_VISIBILITY_PUBLIC ||
+        event->visibility > PR_EVENT_VISIBILITY_PRIVATE) {
         return invalid_result(meeting);
     }
 
@@ -45,6 +48,7 @@ pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
         static_cast<EventKind>(event->kind),
         event->actor_id == nullptr ? std::string{} : std::string{event->actor_id},
         event->target_id == nullptr ? std::string{} : std::string{event->target_id},
+        static_cast<EventVisibility>(event->visibility),
     };
     const auto result = meeting->state.apply(native_event);
     return {static_cast<pr_apply_error>(result.error), result.expected_sequence};

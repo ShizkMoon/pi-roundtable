@@ -21,7 +21,8 @@ export interface ConfigurationValidationIssue {
     | "disabled_reference"
     | "workspace_mismatch"
     | "invalid_invitation"
-    | "invalid_retention";
+    | "invalid_retention"
+    | "invalid_audience";
   message: string;
 }
 
@@ -188,6 +189,11 @@ export function validateWorkspaceProfile(profile: WorkspaceProfile): Configurati
   addDuplicateIssues(profile.skills, (value) => value.skillId, "skills", issues);
   addDuplicateIssues(profile.mcpServers, (value) => value.mcpServerId, "mcpServers", issues);
   addDuplicateIssues(profile.roles, (value) => value.roleProfileId, "roles", issues);
+  addDuplicateIssues(profile.sessionGroups ?? [], (value) => value.groupId, "sessionGroups", issues);
+
+  for (const [index, group] of (profile.sessionGroups ?? []).entries()) {
+    validateId(group.groupId, `sessionGroups[${index}].groupId`, issues);
+  }
 
   for (const [index, skill] of profile.skills.entries()) {
     validateId(skill.skillId, `skills[${index}].skillId`, issues);
@@ -284,6 +290,12 @@ export function validateRoundtableSession(
   const issues: ConfigurationValidationIssue[] = [];
   validateId(session.sessionId, "sessionId", issues);
   validateId(session.workspaceId, "workspaceId", issues);
+  if (session.groupId !== undefined) {
+    validateId(session.groupId, "groupId", issues);
+    if (!(workspace.sessionGroups ?? []).some((group) => group.groupId === session.groupId)) {
+      issues.push({ path: "groupId", code: "missing_reference", message: `Unknown session group '${session.groupId}'.` });
+    }
+  }
   const createdAt = Date.parse(session.createdAt);
   const updatedAt = Date.parse(session.updatedAt);
   if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
@@ -300,6 +312,31 @@ export function validateRoundtableSession(
     });
   }
   addDuplicateIssues(session.participants, (value) => value.participantId, "participants", issues);
+  addDuplicateIssues(session.messages ?? [], (value) => value.messageId, "messages", issues);
+  const participantIds = new Set(session.participants.map((participant) => participant.participantId));
+  for (const [index, message] of (session.messages ?? []).entries()) {
+    validateId(message.messageId, `messages[${index}].messageId`, issues);
+    validateId(message.speakerId, `messages[${index}].speakerId`, issues);
+    for (const [audienceIndex, roleId] of message.audienceRoleIds.entries()) {
+      validateId(roleId, `messages[${index}].audienceRoleIds[${audienceIndex}]`, issues);
+      if (!participantIds.has(roleId)) {
+        issues.push({
+          path: `messages[${index}].audienceRoleIds[${audienceIndex}]`,
+          code: "missing_reference",
+          message: `Unknown participant audience '${roleId}'.`,
+        });
+      }
+    }
+    if (!Number.isFinite(Date.parse(message.occurredAt))) {
+      issues.push({ path: `messages[${index}].occurredAt`, code: "invalid_timestamp", message: "Message occurredAt must be a valid timestamp." });
+    }
+    if (message.visibility === "private" && message.audienceRoleIds.length === 0) {
+      issues.push({ path: `messages[${index}].audienceRoleIds`, code: "missing_reference", message: "Private messages require at least one audience role." });
+    }
+    if (message.visibility === "public" && message.audienceRoleIds.length > 0) {
+      issues.push({ path: `messages[${index}].audienceRoleIds`, code: "invalid_audience", message: "Public messages must not carry a private audience." });
+    }
+  }
   for (const [index, participant] of session.participants.entries()) {
     validateParticipant(participant, index, session, workspace, issues);
   }

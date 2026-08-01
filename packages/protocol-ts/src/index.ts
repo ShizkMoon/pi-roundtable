@@ -13,6 +13,8 @@ export type MeetingEventKind =
   | "runtime.lease_released"
   | "meeting.opened"
   | "meeting.closed"
+  | "message.published"
+  | "message.direct_sent"
   | "role.registered"
   | "role.temporary_registered"
   | "role.promoted"
@@ -36,6 +38,8 @@ export const MEETING_EVENT_KINDS = [
   "runtime.lease_released",
   "meeting.opened",
   "meeting.closed",
+  "message.published",
+  "message.direct_sent",
   "role.registered",
   "role.temporary_registered",
   "role.promoted",
@@ -72,7 +76,13 @@ export interface MeetingEvent {
   actorId?: string | null;
   targetId?: string | null;
   causationId?: string | null;
+  visibility: "public" | "private";
+  audience?: string[];
   payload: JsonObject;
+}
+
+export function canObserveMeetingEvent(event: MeetingEvent, principalId: string): boolean {
+  return event.visibility !== "private" || event.audience?.includes(principalId) === true;
 }
 
 export type MeetingCommandKind =
@@ -83,6 +93,8 @@ export type MeetingCommandKind =
   | "role.promote"
   | "role.archive"
   | "role.remove"
+  | "speech.broadcast"
+  | "speech.direct"
   | "speech.prompt"
   | "speech.interrupt"
   | "generation.cancel"
@@ -97,6 +109,8 @@ export const MEETING_COMMAND_KINDS = [
   "role.promote",
   "role.archive",
   "role.remove",
+  "speech.broadcast",
+  "speech.direct",
   "speech.prompt",
   "speech.interrupt",
   "generation.cancel",

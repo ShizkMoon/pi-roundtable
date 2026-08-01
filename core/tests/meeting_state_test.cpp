@@ -7,6 +7,7 @@
 
 using pi_roundtable::core::ApplyError;
 using pi_roundtable::core::EventKind;
+using pi_roundtable::core::EventVisibility;
 using pi_roundtable::core::MeetingEvent;
 using pi_roundtable::core::MeetingPhase;
 using pi_roundtable::core::MeetingState;
@@ -241,6 +242,75 @@ void c_api_exposes_interruption_projection_and_errors() {
     pr_meeting_destroy(meeting);
 }
 
+void private_events_advance_sequence_without_taking_public_floor() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.secretary", ""});
+    apply_ok(state, {3, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+    apply_ok(state, {4, 1, EventKind::MessagePublished, "user.direct_host", ""});
+    apply_ok(state, {
+        5,
+        1,
+        EventKind::MessageDirectSent,
+        "user.direct_host",
+        "role.secretary",
+        EventVisibility::Private,
+    });
+    apply_ok(state, {
+        6,
+        1,
+        EventKind::SpeechStarted,
+        "role.secretary",
+        "user.direct_host",
+        EventVisibility::Private,
+    });
+    check(!state.active_speaker_id().has_value(),
+        "private speech must not claim the public meeting floor");
+    check(state.last_sequence() == 6, "private events must preserve authoritative sequence order");
+}
+
+void private_events_are_restricted_to_direct_conversation_kinds() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.secretary", ""});
+    apply_ok(state, {3, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+
+    const auto private_close = state.apply({
+        4,
+        1,
+        EventKind::MeetingClosed,
+        "runtime.windows",
+        "",
+        EventVisibility::Private,
+    });
+    check(private_close.error == ApplyError::InvalidTransition,
+        "private lifecycle events must not bypass the public meeting state machine");
+    check(state.last_sequence() == 3, "rejected private lifecycle events must not consume sequence");
+
+    const auto wrong_direct_actor = state.apply({
+        4,
+        1,
+        EventKind::MessageDirectSent,
+        "role.secretary",
+        "role.secretary",
+        EventVisibility::Private,
+    });
+    check(wrong_direct_actor.error == ApplyError::InvalidActor,
+        "only the direct host may initiate a private message");
+
+    const auto wrong_private_target = state.apply({
+        4,
+        1,
+        EventKind::SpeechStarted,
+        "role.secretary",
+        "role.unknown",
+        EventVisibility::Private,
+    });
+    check(wrong_private_target.error == ApplyError::InvalidActor,
+        "private role activity must target the direct host");
+    check(state.last_sequence() == 3, "rejected private events must preserve authoritative sequence");
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +325,8 @@ int main() {
         runtime_owner_controls_meeting_phase();
         complete_local_roundtable_loop_is_deterministic();
         c_api_exposes_interruption_projection_and_errors();
+        private_events_advance_sequence_without_taking_public_floor();
+        private_events_are_restricted_to_direct_conversation_kinds();
         std::cout << "pi_roundtable_core_tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

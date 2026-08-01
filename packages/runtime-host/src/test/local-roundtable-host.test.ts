@@ -262,6 +262,56 @@ test("runs a local meeting with long-term and temporary roles", async () => {
   assert.equal(adapters.get("role.critic")?.stopCount, 1);
 });
 
+test("broadcasts public host messages sequentially and isolates direct replies", async () => {
+  const { host, adapters } = createHost();
+  const events: import("@pi-roundtable/protocol").MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+  await host.execute(command("role.add", "add-a", { actorId: "role.a" }));
+  await host.execute(command("role.add", "add-b", { actorId: "role.b" }));
+  await host.execute(command("meeting.open", "open"));
+
+  const broadcast = await host.execute(command("speech.broadcast", "broadcast", {
+    actorId: "user.direct_host",
+    payload: { message: "Review the proposal", mentions: ["role.a", "role.b"] },
+  }));
+  assert.equal(broadcast.status, "accepted");
+  assert.equal(events.at(-1)?.kind, "message.published");
+  assert.equal(events.at(-1)?.visibility, "public");
+  const firstPrompt = adapters.get("role.a")?.commands.at(-1);
+  assert.equal(firstPrompt?.kind, "turn.prompt");
+  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /Review the proposal/);
+
+  adapters.get("role.a")?.emit("turn.started", {}, "broadcast:1");
+  adapters.get("role.a")?.emit("turn.completed", {}, "broadcast:1");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const secondPrompt = adapters.get("role.b")?.commands.at(-1);
+  assert.equal(secondPrompt?.kind, "turn.prompt");
+  assert.match(secondPrompt?.kind === "turn.prompt" ? secondPrompt.message : "", /Review the proposal/);
+  adapters.get("role.b")?.emit("turn.started", {}, "broadcast:2");
+  adapters.get("role.b")?.emit("turn.completed", {}, "broadcast:2");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const direct = await host.execute(command("speech.direct", "direct-b", {
+    actorId: "user.direct_host",
+    targetId: "role.b",
+    payload: { message: "Keep this risk private" },
+  }));
+  assert.equal(direct.status, "accepted");
+  const directSent = events.find((event) => event.kind === "message.direct_sent");
+  assert.equal(directSent?.visibility, "private");
+  assert.deepEqual(directSent?.audience, ["user.direct_host", "role.b"]);
+  adapters.get("role.b")?.emit("turn.started", {}, "direct-b");
+  adapters.get("role.b")?.emit("turn.delta", { delta: "Private answer" }, "direct-b");
+  adapters.get("role.b")?.emit("turn.completed", {}, "direct-b");
+  const privateSpeech = events.filter((event) =>
+    event.causationId === "direct-b" && event.kind.startsWith("speech."));
+  assert.equal(privateSpeech.length, 3);
+  assert.equal(privateSpeech.every((event) => event.visibility === "private"), true);
+  assert.equal(privateSpeech.every((event) => event.audience?.includes("role.a") !== true), true);
+  await host.stop();
+});
+
 test("resolves a frozen participant manifest into private Pi runtime options", async () => {
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-runtime-"));
   mkdirSync(join(runtimeDirectory, "skills", "test"), { recursive: true });

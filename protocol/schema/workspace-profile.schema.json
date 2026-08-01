@@ -46,6 +46,11 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/roleProfile" }
     },
+    "sessionGroups": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sessionGroupProfile" }
+    },
     "defaults": { "$ref": "#/$defs/workspaceDefaults" }
   },
   "$defs": {
@@ -54,6 +59,17 @@
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "sessionGroupProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["groupId", "displayName", "kind", "sortOrder"],
+      "properties": {
+        "groupId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "enum": ["project", "folder"] },
+        "sortOrder": { "type": "integer", "minimum": 0 }
+      }
     },
     "credentialRef": {
       "type": "string",

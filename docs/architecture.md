@@ -10,7 +10,7 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 
 ### Protocol
 
-`protocol/schema` is the wire contract. Every persisted event contains a protocol version, meeting ID, monotonic sequence, runtime generation, event kind, occurrence time, and an optional normalized payload. Platform clients must tolerate unknown payload keys but must reject unsupported protocol major versions.
+`protocol/schema` is the wire contract. Every persisted event contains a protocol version, meeting ID, monotonic sequence, runtime generation, event kind, occurrence time, an explicit public/private visibility lane, and a normalized payload. Private events require a non-empty audience; public events must not carry one. Platform clients must tolerate unknown payload keys but must reject unsupported protocol major versions. Public events are meeting context; private events may be observed only by their declared audience.
 
 ### C++ meeting core
 
@@ -29,15 +29,15 @@ The currently implemented low-level OMP client:
 5. correlates command responses by ID;
 6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
 
-The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. Durable role runtime sessions, MCP/tool callbacks, approval gates, prompt/memory execution, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
+The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. A public host broadcast may target one or more roles for the next response while remaining visible to all participants; responses are queued so only one role owns the public floor. A private host command runs in the selected role's isolated context and emits audience-scoped events without claiming the public floor. Durable role runtime sessions, MCP/tool callbacks, approval gates, prompt/memory execution, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
 
 ### Sync server
 
-`packages/sync-server` begins with an in-memory implementation so lease and replay semantics are executable. HTTP uploads events; SSE supplies foreground real-time updates and reconnect cursors. Production storage, authentication, E2EE, rate limits, and distributed lease coordination remain planned.
+`packages/sync-server` begins with an in-memory implementation so lease and replay semantics are executable. HTTP uploads events; SSE supplies foreground real-time updates and reconnect cursors. The unauthenticated development server rejects private-event uploads because it cannot prove audience identity, and defensively excludes private store events from HTTP replay and SSE delivery. Production storage, authentication, audience-filtered private replay, E2EE, rate limits, and distributed lease coordination remain planned.
 
 ### Native clients
 
-Windows uses .NET 10 LTS with WinUI 3 and owns the implemented first local runtime integration. Its session-first shell persists non-secret workspace profiles and frozen session definitions under Local AppData, stores provider secrets in Windows Credential Manager, supervises the stdio Host, sends normalized commands, applies every event to the C++ core, and projects accepted state into the UI. Normalized transcript/event replay is not persisted yet. A normal local meeting does not require a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
+Windows uses .NET 10 LTS with WinUI 3 and owns the implemented first local runtime integration. Its session-first shell persists non-secret workspace profiles, session groups, frozen session definitions, and normalized public/private message projections under Local AppData; stores provider and optional sync secrets in Windows Credential Manager; supervises the stdio Host; sends normalized commands; applies every event to the C++ core; and projects accepted state into the UI. Full normalized event-log replay is not persisted yet. A normal local meeting does not require a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
 
 ## 3. Interruption model
 

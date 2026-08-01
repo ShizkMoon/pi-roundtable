@@ -12,6 +12,7 @@
     "runtimeGeneration",
     "kind",
     "occurredAt",
+    "visibility",
     "payload"
   ],
   "properties": {
@@ -30,6 +31,8 @@
         "runtime.lease_released",
         "meeting.opened",
         "meeting.closed",
+        "message.published",
+        "message.direct_sent",
         "role.registered",
         "role.temporary_registered",
         "role.promoted",
@@ -53,8 +56,33 @@
     "actorId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
     "targetId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
     "causationId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "visibility": { "enum": ["public", "private"] },
+    "audience": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
     "payload": { "type": "object", "additionalProperties": true }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "visibility": { "const": "private" } },
+        "required": ["visibility"]
+      },
+      "then": {
+        "required": ["audience"],
+        "properties": { "audience": { "minItems": 1 } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "visibility": { "const": "public" } },
+        "required": ["visibility"]
+      },
+      "then": { "not": { "required": ["audience"] } }
+    }
+  ],
   "$defs": {
     "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$" }
   }

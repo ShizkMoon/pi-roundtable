@@ -34,6 +34,8 @@ internal sealed record RuntimeMeetingEvent(
     string? ActorId,
     string? TargetId,
     string? CausationId,
+    string Visibility,
+    IReadOnlyList<string> Audience,
     JsonElement Payload);
 
 internal sealed class RuntimeHostProcess : IAsyncDisposable
@@ -411,6 +413,12 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             eventElement.TryGetProperty("actorId", out var actorId) ? actorId.GetString() : null,
             eventElement.TryGetProperty("targetId", out var targetId) ? targetId.GetString() : null,
             eventElement.TryGetProperty("causationId", out var causationId) ? causationId.GetString() : null,
+            eventElement.TryGetProperty("visibility", out var visibility)
+                ? visibility.GetString() ?? "public"
+                : "public",
+            eventElement.TryGetProperty("audience", out var audience)
+                ? audience.EnumerateArray().Select(item => item.GetString() ?? string.Empty).Where(item => item.Length > 0).ToArray()
+                : [],
             eventElement.GetProperty("payload").Clone());
         if (
             meetingEvent.MeetingId != _meetingId ||

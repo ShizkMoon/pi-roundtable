@@ -19,6 +19,25 @@ bool is_runtime_activity(EventKind kind) {
     }
 }
 
+bool is_private_role_activity(EventKind kind) {
+    switch (kind) {
+        case EventKind::SpeechStarted:
+        case EventKind::SpeechDelta:
+        case EventKind::SpeechCompleted:
+        case EventKind::SpeechCancelled:
+        case EventKind::ToolStarted:
+        case EventKind::ToolCompleted:
+        case EventKind::ToolFailed:
+        case EventKind::SubagentSpawned:
+        case EventKind::SubagentProgress:
+        case EventKind::SubagentCompleted:
+        case EventKind::SubagentFailed:
+            return true;
+        default:
+            return false;
+    }
+}
+
 }  // namespace
 
 ApplyResult MeetingState::reject(ApplyError error) const noexcept {
@@ -118,6 +137,35 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
         return accept(event.sequence);
     }
 
+    if (event.visibility == EventVisibility::Private) {
+        if (phase_ != MeetingPhase::Live) {
+            return reject(ApplyError::InvalidTransition);
+        }
+        if (event.kind == EventKind::MessageDirectSent) {
+            if (event.actor_id != "user.direct_host") {
+                return reject(ApplyError::InvalidActor);
+            }
+            if (!is_known_role(event.target_id)) {
+                return reject(is_role_archived(event.target_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
+            }
+            return accept(event.sequence);
+        }
+        if (!is_private_role_activity(event.kind)) {
+            return reject(ApplyError::InvalidTransition);
+        }
+        if (!is_known_role(event.actor_id)) {
+            return reject(is_role_archived(event.actor_id)
+                ? ApplyError::RoleArchived
+                : ApplyError::UnknownRole);
+        }
+        if (event.target_id != "user.direct_host") {
+            return reject(ApplyError::InvalidActor);
+        }
+        return accept(event.sequence);
+    }
+
     if (phase_ == MeetingPhase::Closed) {
         return reject(ApplyError::InvalidTransition);
     }
@@ -144,6 +192,18 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
             pending_interruptor_id_.reset();
             pending_interrupt_target_id_.reset();
             break;
+
+        case EventKind::MessagePublished:
+            if (phase_ != MeetingPhase::Live) {
+                return reject(ApplyError::InvalidTransition);
+            }
+            if (event.actor_id != "user.direct_host") {
+                return reject(ApplyError::InvalidActor);
+            }
+            break;
+
+        case EventKind::MessageDirectSent:
+            return reject(ApplyError::InvalidTransition);
 
         case EventKind::RoleRegistered:
         case EventKind::RoleTemporaryRegistered:

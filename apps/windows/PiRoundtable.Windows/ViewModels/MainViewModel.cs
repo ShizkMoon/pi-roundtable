@@ -12,17 +12,23 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
     private readonly DispatcherQueue _dispatcher;
     private readonly Dictionary<string, TranscriptItem> _streamingMessages = [];
+    private readonly Dictionary<string, TranscriptItem> _privateStreamingMessages = [];
+    private readonly ObservableCollection<TranscriptItem> _emptyTranscript = [];
+    private readonly ObservableCollection<TranscriptItem> _emptyPrivateThread = [];
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly WorkspaceConfigurationStore _workspaceStore = new();
     private readonly RoundtableSessionStore _sessionStore = new();
     private readonly WindowsCredentialStore _credentialStore = new();
-    private readonly List<RoleItem> _longTermRoles = [];
+    private readonly ClientSettingsStore _clientSettingsStore = new();
     private WorkspaceConfiguration _workspace = new();
+    private ClientSettingsConfiguration _clientSettings = new();
     private RuntimeHostProcess? _runtime;
     private RuntimeHostProcess? _startingRuntime;
     private MeetingCoreSession? _meetingCore;
     private RoleItem? _selectedRole;
+    private RoleItem? _selectedPrivateRole;
     private SessionItem? _selectedSession;
+    private SessionGroupItem? _selectedSessionGroup;
     private ProviderProfileConfiguration? _selectedProvider;
     private ModelProfileConfiguration? _selectedModel;
     private ModelProfileConfiguration? _selectedRoleModel;
@@ -42,6 +48,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private string _invitationNetworkAccess = "subagent_required";
     private string _statusText = "等待配置";
     private string _errorMessage = string.Empty;
+    private string _skillDisplayName = string.Empty;
+    private string _skillDescription = string.Empty;
+    private string _skillSourceLocator = string.Empty;
+    private string _mcpDisplayName = string.Empty;
+    private string _mcpTransport = "stdio";
+    private string _mcpCommandOrEndpoint = string.Empty;
+    private string _themeMode = "system";
+    private string _remoteSyncEndpoint = string.Empty;
+    private bool _remoteSyncEnabled;
     private ulong _sequence;
     private ulong _runtimeGeneration;
     private bool _isRunning;
@@ -53,36 +68,60 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public MainViewModel(DispatcherQueue dispatcher)
     {
         _dispatcher = dispatcher;
-        _longTermRoles.Add(new RoleItem(
+        LongTermRoles.Add(new RoleItem(
             "role.host",
             "主持人",
             "long_term",
             "你是圆桌会议主持人。维护议程、分配发言权、澄清决策，并在需要时邀请临时角色。"));
-        _longTermRoles.Add(new RoleItem(
+        LongTermRoles.Add(new RoleItem(
             "role.secretary",
             "秘书",
             "long_term",
             "你是圆桌会议秘书。维护上下文、记录决定与未决问题，只提出可审核的长期记忆和提示词改进建议。"));
-        foreach (var role in _longTermRoles)
+        foreach (var role in LongTermRoles)
         {
             Roles.Add(role);
         }
         RefreshInvitationInviters();
-        var session = new SessionItem($"session-{Guid.NewGuid():N}", _meetingTitle);
+        var defaultGroup = new SessionGroupItem("group.general", "常规会话", "folder");
+        SessionGroups.Add(defaultGroup);
+        SelectedSessionGroup = defaultGroup;
+        var session = new SessionItem($"session-{Guid.NewGuid():N}", _meetingTitle)
+        {
+            GroupId = defaultGroup.GroupId,
+        };
         Sessions.Add(session);
+        RefreshVisibleSessions();
         SelectedSession = session;
         SelectedRole = Roles[0];
     }
 
     public ObservableCollection<RoleItem> Roles { get; } = [];
 
-    public ObservableCollection<TranscriptItem> Transcript { get; } = [];
+    public ObservableCollection<TranscriptItem> Transcript => SelectedSession?.Transcript ?? _emptyTranscript;
+
+    public ObservableCollection<TranscriptItem> PrivateMessages =>
+        SelectedSession is not null && SelectedPrivateRole is not null
+            ? SelectedSession.GetPrivateThread(SelectedPrivateRole.RoleId)
+            : _emptyPrivateThread;
 
     public ObservableCollection<SessionItem> Sessions { get; } = [];
+
+    public ObservableCollection<SessionItem> VisibleSessions { get; } = [];
+
+    public ObservableCollection<SessionGroupItem> SessionGroups { get; } = [];
+
+    public ObservableCollection<RoleItem> LongTermRoles { get; } = [];
+
+    public ObservableCollection<MentionTargetItem> MentionTargets { get; } = [];
 
     public ObservableCollection<ProviderProfileConfiguration> Providers { get; } = [];
 
     public ObservableCollection<ModelProfileConfiguration> Models { get; } = [];
+
+    public ObservableCollection<SkillProfileConfiguration> Skills { get; } = [];
+
+    public ObservableCollection<McpServerProfileConfiguration> McpServers { get; } = [];
 
     public ObservableCollection<CapabilityGrantItem> AvailableCapabilities { get; } = [];
 
@@ -92,6 +131,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public IReadOnlyList<string> ApiFamilies { get; } =
         ["openai_responses", "openai_chat_completions", "anthropic_messages", "google_generate_content", "custom"];
+
+    public IReadOnlyList<string> McpTransports { get; } = ["stdio", "streamable_http", "sse"];
+
+    public IReadOnlyList<SelectionOptionItem> ThemeOptions { get; } =
+    [
+        new("system", "跟随系统"),
+        new("light", "浅色"),
+        new("dark", "深色"),
+    ];
 
     public IReadOnlyList<SelectionOptionItem> RetentionOptions { get; } =
     [
@@ -234,14 +282,25 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         get => _selectedSession;
         set
         {
-            if (IsRunning || value is null || !SetField(ref _selectedSession, value))
+            if (IsRunning || !SetField(ref _selectedSession, value))
             {
+                return;
+            }
+            if (value is null)
+            {
+                Roles.Clear();
+                SelectedRole = null;
+                SelectedPrivateRole = null;
+                RefreshMentionTargets();
+                OnPropertyChanged(nameof(Transcript));
+                OnPropertyChanged(nameof(PrivateMessages));
+                NotifySummary();
                 return;
             }
             _meetingTitle = value.Title;
             OnPropertyChanged(nameof(MeetingTitle));
             Roles.Clear();
-            foreach (var role in _longTermRoles.Where(role => !role.IsArchived))
+            foreach (var role in LongTermRoles.Where(role => !role.IsArchived))
             {
                 Roles.Add(role);
             }
@@ -250,6 +309,36 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 Roles.Add(role);
             }
             SelectedRole = Roles.FirstOrDefault();
+            SelectedPrivateRole = Roles.FirstOrDefault();
+            RefreshMentionTargets();
+            OnPropertyChanged(nameof(Transcript));
+            OnPropertyChanged(nameof(PrivateMessages));
+            NotifySummary();
+        }
+    }
+
+    public SessionGroupItem? SelectedSessionGroup
+    {
+        get => _selectedSessionGroup;
+        set
+        {
+            if (SetField(ref _selectedSessionGroup, value))
+            {
+                RefreshVisibleSessions();
+            }
+        }
+    }
+
+    public RoleItem? SelectedPrivateRole
+    {
+        get => _selectedPrivateRole;
+        set
+        {
+            if (SetField(ref _selectedPrivateRole, value))
+            {
+                OnPropertyChanged(nameof(PrivateMessages));
+                OnPropertyChanged(nameof(CanSendPrivate));
+            }
         }
     }
 
@@ -318,6 +407,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 OnPropertyChanged(nameof(CanPromoteSelectedRole));
                 OnPropertyChanged(nameof(CanArchiveSelectedRole));
                 OnPropertyChanged(nameof(CanSend));
+                OnPropertyChanged(nameof(CanSendPrivate));
                 OnPropertyChanged(nameof(IsRoleConfigurationEditable));
                 SelectedRoleModel = value is null
                     ? null
@@ -332,6 +422,60 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         get => _statusText;
         private set => SetField(ref _statusText, value);
+    }
+
+    public string SkillDisplayName
+    {
+        get => _skillDisplayName;
+        set => SetField(ref _skillDisplayName, value);
+    }
+
+    public string SkillDescription
+    {
+        get => _skillDescription;
+        set => SetField(ref _skillDescription, value);
+    }
+
+    public string SkillSourceLocator
+    {
+        get => _skillSourceLocator;
+        set => SetField(ref _skillSourceLocator, value);
+    }
+
+    public string McpDisplayName
+    {
+        get => _mcpDisplayName;
+        set => SetField(ref _mcpDisplayName, value);
+    }
+
+    public string McpTransport
+    {
+        get => _mcpTransport;
+        set => SetField(ref _mcpTransport, value);
+    }
+
+    public string McpCommandOrEndpoint
+    {
+        get => _mcpCommandOrEndpoint;
+        set => SetField(ref _mcpCommandOrEndpoint, value);
+    }
+
+    public string ThemeMode
+    {
+        get => _themeMode;
+        set => SetField(ref _themeMode, value);
+    }
+
+    public string RemoteSyncEndpoint
+    {
+        get => _remoteSyncEndpoint;
+        set => SetField(ref _remoteSyncEndpoint, value);
+    }
+
+    public bool RemoteSyncEnabled
+    {
+        get => _remoteSyncEnabled;
+        set => SetField(ref _remoteSyncEnabled, value);
     }
 
     public string ErrorMessage
@@ -361,6 +505,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 OnPropertyChanged(nameof(CanAddTemporaryRole));
                 OnPropertyChanged(nameof(CanInviteTemporaryRole));
                 OnPropertyChanged(nameof(CanSend));
+                OnPropertyChanged(nameof(CanSendPrivate));
                 OnPropertyChanged(nameof(IsRoleConfigurationEditable));
             }
         }
@@ -376,6 +521,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             if (SetField(ref _isBusy, value))
             {
                 OnPropertyChanged(nameof(CanSend));
+                OnPropertyChanged(nameof(CanSendPrivate));
                 OnPropertyChanged(nameof(CanStart));
                 OnPropertyChanged(nameof(CanOperate));
                 OnPropertyChanged(nameof(CanAddTemporaryRole));
@@ -404,7 +550,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public bool IsRoleConfigurationEditable => !IsRunning && !IsBusy;
 
-    public bool CanSend => CanOperate && SelectedRole is { IsArchived: false };
+    public bool CanSend => CanOperate && Roles.Any(role => !role.IsArchived);
+
+    public bool CanSendPrivate => CanOperate && SelectedPrivateRole is { IsArchived: false };
 
     public bool CanPromoteSelectedRole =>
         !IsBusy && SelectedRole is { Scope: "temporary", IsArchived: false };
@@ -442,8 +590,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         try
         {
             _workspace = await _workspaceStore.LoadAsync(cancellationToken);
+            _clientSettings = await _clientSettingsStore.LoadAsync(cancellationToken);
+            ThemeMode = _clientSettings.ThemeMode;
+            RemoteSyncEnabled = _clientSettings.RemoteSyncEnabled;
+            RemoteSyncEndpoint = _clientSettings.RemoteSyncEndpoint ?? string.Empty;
             Providers.Clear();
             Models.Clear();
+            Skills.Clear();
+            McpServers.Clear();
+            SessionGroups.Clear();
             foreach (var provider in _workspace.Providers)
             {
                 Providers.Add(provider);
@@ -452,9 +607,35 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             {
                 Models.Add(model);
             }
+            foreach (var skill in _workspace.Skills)
+            {
+                Skills.Add(skill);
+            }
+            foreach (var server in _workspace.McpServers)
+            {
+                McpServers.Add(server);
+            }
+            var configuredGroups = _workspace.SessionGroups.Count > 0
+                ? _workspace.SessionGroups
+                : [new SessionGroupProfileConfiguration
+                {
+                    GroupId = "group.general",
+                    DisplayName = "常规会话",
+                    Kind = "folder",
+                    SortOrder = 0,
+                }];
+            foreach (var group in configuredGroups.OrderBy(group => group.SortOrder))
+            {
+                SessionGroups.Add(new SessionGroupItem(
+                    group.GroupId,
+                    group.DisplayName,
+                    group.Kind,
+                    group.SortOrder));
+            }
+            SelectedSessionGroup = SessionGroups.FirstOrDefault();
             if (_workspace.Roles.Count > 0)
             {
-                _longTermRoles.Clear();
+                LongTermRoles.Clear();
                 foreach (var profile in _workspace.Roles)
                 {
                     var role = new RoleItem(
@@ -466,17 +647,17 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     role.SkillIds.UnionWith(profile.Capabilities.SkillIds);
                     role.McpServerIds.UnionWith(
                         profile.Capabilities.McpGrants.Select(grant => grant.McpServerId));
-                    _longTermRoles.Add(role);
+                    LongTermRoles.Add(role);
                 }
                 Roles.Clear();
-                foreach (var role in _longTermRoles)
+                foreach (var role in LongTermRoles)
                 {
                     Roles.Add(role);
                 }
                 SelectedRole = Roles.FirstOrDefault();
             }
             var defaultModel = Models.FirstOrDefault(model => model.Enabled);
-            foreach (var role in _longTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
+            foreach (var role in LongTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
             {
                 role.ModelProfileId = defaultModel?.ModelProfileId ?? string.Empty;
             }
@@ -491,6 +672,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 {
                     var session = new SessionItem(definition.SessionId, definition.Title)
                     {
+                        GroupId = definition.GroupId ?? SessionGroups.First().GroupId,
                         Phase = definition.Phase == "live" ? "draft" : definition.Phase,
                         CreatedAt = definition.CreatedAt,
                         UpdatedAt = definition.UpdatedAt,
@@ -516,9 +698,35 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                             participant.CapabilitiesSnapshot.McpGrants.Select(grant => grant.McpServerId));
                         session.TemporaryRoles.Add(role);
                     }
+                    foreach (var message in definition.Messages)
+                    {
+                        var audienceRoleIds = message.Visibility == "private"
+                            ? message.AudienceRoleIds
+                            : [];
+                        var item = new TranscriptItem(
+                            message.SpeakerId,
+                            message.SpeakerName,
+                            message.Text,
+                            ToDisplayState(message.State),
+                            message.Kind,
+                            message.Visibility,
+                            audienceRoleIds,
+                            message.MessageId,
+                            message.OccurredAt);
+                        var privateRoleId = audienceRoleIds.FirstOrDefault(
+                            roleId => roleId != "user.direct_host");
+                        if (message.Visibility == "private" && privateRoleId is not null)
+                        {
+                            session.GetPrivateThread(privateRoleId).Add(item);
+                        }
+                        else if (message.Visibility == "public")
+                        {
+                            session.Transcript.Add(item);
+                        }
+                    }
                     Sessions.Add(session);
                 }
-                SelectedSession = Sessions.FirstOrDefault();
+                RefreshVisibleSessions();
             }
             SelectedProvider = Providers.FirstOrDefault(provider => provider.Enabled);
             SelectedModel ??= Models.FirstOrDefault(model => model.Enabled);
@@ -528,6 +736,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 : Models.FirstOrDefault(model => model.ModelProfileId == SelectedRole.ModelProfileId);
             RefreshInvitationInviters();
             RefreshInvitationCapabilities();
+            RefreshMentionTargets();
             StatusText = Providers.Count == 0 ? "等待提供商配置" : "配置已加载";
             _initialized = true;
             OnPropertyChanged(nameof(CanStart));
@@ -626,7 +835,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 {
                     Models.Add(model);
                 }
-                foreach (var role in _longTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
+                foreach (var role in LongTermRoles.Where(role => string.IsNullOrWhiteSpace(role.ModelProfileId)))
                 {
                     role.ModelProfileId = model.ModelProfileId;
                 }
@@ -700,12 +909,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             ShowError("请先结束当前会话。");
             return;
         }
-        var session = new SessionItem($"session-{Guid.NewGuid():N}", "新圆桌会议");
+        var session = new SessionItem($"session-{Guid.NewGuid():N}", "新圆桌会议")
+        {
+            GroupId = SelectedSessionGroup?.GroupId ?? SessionGroups.First().GroupId,
+        };
         Sessions.Insert(0, session);
+        RefreshVisibleSessions();
         SelectedSession = session;
-        Transcript.Clear();
         Roles.Clear();
-        foreach (var role in _longTermRoles.Where(role => !role.IsArchived))
+        foreach (var role in LongTermRoles.Where(role => !role.IsArchived))
         {
             Roles.Add(role);
         }
@@ -713,6 +925,198 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         StatusText = "新会话草稿";
         NotifySummary();
         await PersistSelectedSessionAsync(cancellationToken);
+    }
+
+    public async Task CreateSessionGroupAsync(
+        string displayName,
+        string kind,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再修改会话分组。");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(displayName) || kind is not ("project" or "folder"))
+        {
+            ShowError("会话分组需要名称，并且类型必须是项目或文件夹。");
+            return;
+        }
+        var baseId = $"group.{NormalizeId(displayName)}";
+        var groupId = baseId;
+        var suffix = 2;
+        while (SessionGroups.Any(group => group.GroupId == groupId))
+        {
+            groupId = $"{baseId}.{suffix++}";
+        }
+        var group = new SessionGroupItem(groupId, displayName.Trim(), kind, SessionGroups.Count);
+        SessionGroups.Add(group);
+        SelectedSessionGroup = group;
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        StatusText = $"已创建{group.KindLabel}分组";
+    }
+
+    public async Task CreateLongTermRoleAsync(string displayName, CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再创建长期角色。");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            ShowError("长期角色需要名称。");
+            return;
+        }
+        var roleId = $"role.{NormalizeId(displayName)}.{Guid.NewGuid():N}";
+        roleId = roleId[..Math.Min(roleId.Length, 120)];
+        var role = new RoleItem(
+            roleId,
+            displayName.Trim(),
+            "long_term",
+            $"你是圆桌会议中的{displayName.Trim()}。明确职责、权限边界、交付格式与禁止事项。",
+            Models.FirstOrDefault(model => model.Enabled)?.ModelProfileId);
+        LongTermRoles.Add(role);
+        Roles.Add(role);
+        SelectedRole = role;
+        SelectedPrivateRole ??= role;
+        RefreshInvitationInviters();
+        RefreshMentionTargets();
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        await PersistSelectedSessionAsync(cancellationToken);
+        StatusText = $"已创建长期角色 {role.DisplayName}";
+    }
+
+    public async Task SaveSkillCatalogEntryAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再修改公共 Skill 目录。");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(SkillDisplayName) ||
+            string.IsNullOrWhiteSpace(SkillDescription) ||
+            !Uri.TryCreate(SkillSourceLocator.Trim(), UriKind.Absolute, out var source) ||
+            source.Scheme != Uri.UriSchemeHttps)
+        {
+            ShowError("Skill 导入需要名称、说明和 HTTPS 来源地址。");
+            return;
+        }
+        var skill = new SkillProfileConfiguration
+        {
+            SkillId = $"skill.{NormalizeId(SkillDisplayName)}",
+            DisplayName = SkillDisplayName.Trim(),
+            Description = SkillDescription.Trim(),
+            Source = new SkillSourceConfiguration
+            {
+                Kind = "git",
+                Locator = source.AbsoluteUri,
+            },
+            Risk = "medium",
+            Enabled = true,
+        };
+        var existing = Skills.FirstOrDefault(item => item.SkillId == skill.SkillId);
+        if (existing is not null)
+        {
+            Skills.Remove(existing);
+        }
+        Skills.Add(skill);
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        RefreshCapabilityGrants();
+        RefreshInvitationCapabilities();
+        SkillDisplayName = string.Empty;
+        SkillDescription = string.Empty;
+        SkillSourceLocator = string.Empty;
+        StatusText = "Skill 已登记；安装与 LLM 安全审计仍待 Runtime Host 执行";
+    }
+
+    public async Task SaveMcpCatalogEntryAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再修改公共 MCP 目录。");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(McpDisplayName) || string.IsNullOrWhiteSpace(McpCommandOrEndpoint))
+        {
+            ShowError("MCP 导入需要名称以及命令或端点。");
+            return;
+        }
+        var server = new McpServerProfileConfiguration
+        {
+            McpServerId = $"mcp.{NormalizeId(McpDisplayName)}",
+            DisplayName = McpDisplayName.Trim(),
+            Transport = McpTransport,
+            Command = McpTransport == "stdio" ? McpCommandOrEndpoint.Trim() : null,
+            Endpoint = McpTransport == "stdio" ? null : McpCommandOrEndpoint.Trim(),
+            Arguments = McpTransport == "stdio" ? [] : null,
+            Enabled = true,
+        };
+        string? normalizedEndpoint = null;
+        if (server.Transport != "stdio" && !TryNormalizeEndpoint(server.Endpoint ?? string.Empty, out normalizedEndpoint))
+        {
+            ShowError("远端 MCP 端点必须使用 HTTPS 或本机回环 HTTP。");
+            return;
+        }
+        if (server.Transport != "stdio")
+        {
+            server.Endpoint = normalizedEndpoint;
+        }
+        var existing = McpServers.FirstOrDefault(item => item.McpServerId == server.McpServerId);
+        if (existing is not null)
+        {
+            McpServers.Remove(existing);
+        }
+        McpServers.Add(server);
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        RefreshCapabilityGrants();
+        RefreshInvitationCapabilities();
+        McpDisplayName = string.Empty;
+        McpCommandOrEndpoint = string.Empty;
+        StatusText = "MCP 已登记；LLM 配置解析和执行器接入仍为 planned";
+    }
+
+    public async Task SaveClientSettingsAsync(
+        string syncCredential,
+        CancellationToken cancellationToken = default)
+    {
+        if (IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再修改客户端与同步设置。");
+            return;
+        }
+        string? normalizedEndpoint = null;
+        if (!string.IsNullOrWhiteSpace(RemoteSyncEndpoint) &&
+            !TryNormalizeEndpoint(RemoteSyncEndpoint, out normalizedEndpoint))
+        {
+            ShowError("远端同步服务器必须使用 HTTPS 或本机回环 HTTP。");
+            return;
+        }
+        else
+        {
+            RemoteSyncEndpoint = normalizedEndpoint ?? string.Empty;
+        }
+        _clientSettings.ThemeMode = ThemeOptions.Any(option => option.Value == ThemeMode)
+            ? ThemeMode
+            : "system";
+        _clientSettings.RemoteSyncEnabled = RemoteSyncEnabled;
+        _clientSettings.RemoteSyncEndpoint = string.IsNullOrWhiteSpace(RemoteSyncEndpoint)
+            ? null
+            : RemoteSyncEndpoint;
+        if (!string.IsNullOrWhiteSpace(syncCredential))
+        {
+            await _credentialStore.SaveAsync(
+                _clientSettings.RemoteSyncCredentialRef,
+                syncCredential,
+                cancellationToken);
+        }
+        await _clientSettingsStore.SaveAsync(_clientSettings, cancellationToken);
+        StatusText = "客户端设置已保存；远端同步连接仍为 pending";
+        ErrorMessage = string.Empty;
     }
 
     public async Task StartMeetingAsync(CancellationToken cancellationToken = default)
@@ -841,10 +1245,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public async Task<bool> SendPromptAsync(string message, CancellationToken cancellationToken = default)
     {
         var runtime = _runtime;
-        var role = SelectedRole;
-        if (runtime is null || !IsRunning || role is null || role.IsArchived)
+        if (runtime is null || !IsRunning || Roles.All(role => role.IsArchived))
         {
-            ShowError("请先启动会议并选择一个活跃角色。");
+            ShowError("请先启动会议并保留至少一个活跃角色。");
             return false;
         }
         if (string.IsNullOrWhiteSpace(message))
@@ -854,10 +1257,54 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
 
         ErrorMessage = string.Empty;
+        var mentions = MentionTargets
+            .Where(target => target.IsMentioned && !target.Role.IsArchived)
+            .Select(target => target.RoleId)
+            .ToArray();
         var receipt = await runtime.SendCommandAsync(
-            "speech.prompt",
-            role.RoleId,
+            "speech.broadcast",
+            "user.direct_host",
             null,
+            new Dictionary<string, object?>
+            {
+                ["message"] = message.Trim(),
+                ["mentions"] = mentions,
+            },
+            cancellationToken);
+        if (!receipt.Accepted)
+        {
+            ShowReceiptError(receipt);
+            return false;
+        }
+        foreach (var target in MentionTargets)
+        {
+            target.IsMentioned = false;
+        }
+        NotifySummary();
+        return true;
+    }
+
+    public async Task<bool> SendPrivateMessageAsync(
+        string message,
+        CancellationToken cancellationToken = default)
+    {
+        var runtime = _runtime;
+        var role = SelectedPrivateRole;
+        if (runtime is null || !IsRunning || role is null || role.IsArchived)
+        {
+            ShowError("请先启动会议并选择一个私聊角色。");
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            ShowError("请输入私聊内容。");
+            return false;
+        }
+        ErrorMessage = string.Empty;
+        var receipt = await runtime.SendCommandAsync(
+            "speech.direct",
+            "user.direct_host",
+            role.RoleId,
             new Dictionary<string, object?> { ["message"] = message.Trim() },
             cancellationToken);
         if (!receipt.Accepted)
@@ -865,12 +1312,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             ShowReceiptError(receipt);
             return false;
         }
-        Transcript.Add(new TranscriptItem(
-            "user",
-            $"你 → {role.DisplayName}",
-            message.Trim(),
-            "已提交"));
-        role.Status = "等待回应";
+        role.Status = "私聊回应中";
+        role.ActivitySummary = "正在处理仅对你可见的私聊；未公开模型私有推理";
         NotifySummary();
         return true;
     }
@@ -971,6 +1414,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         Roles.Add(role);
         SelectedSession?.TemporaryRoles.Add(role);
         SelectedRole = role;
+        SelectedPrivateRole = role;
+        RefreshMentionTargets();
         if (_runtime is not null && IsRunning)
         {
             var receipt = await _runtime.SendCommandAsync(
@@ -986,6 +1431,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             {
                 Roles.Remove(role);
                 SelectedSession?.TemporaryRoles.Remove(role);
+                RefreshMentionTargets();
                 ShowReceiptError(receipt);
                 return;
             }
@@ -1011,9 +1457,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             role.Scope = "long_term";
             role.RetentionPolicy = "retain_profile";
             role.Status = "已预配置为长期角色";
-            if (!_longTermRoles.Contains(role))
+            if (!LongTermRoles.Contains(role))
             {
-                _longTermRoles.Add(role);
+                LongTermRoles.Add(role);
             }
             RefreshInvitationInviters();
             SelectedSession?.TemporaryRoles.Remove(role);
@@ -1036,9 +1482,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
         role.Scope = "long_term";
         role.RetentionPolicy = "retain_profile";
-        if (!_longTermRoles.Contains(role))
+        if (!LongTermRoles.Contains(role))
         {
-            _longTermRoles.Add(role);
+            LongTermRoles.Add(role);
         }
         RefreshInvitationInviters();
         SelectedSession?.TemporaryRoles.Remove(role);
@@ -1074,6 +1520,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             role.Status = "已归档";
         }
         OnPropertyChanged(nameof(CanArchiveSelectedRole));
+        RefreshMentionTargets();
         NotifySummary();
         if (role.Scope == "long_term")
         {
@@ -1143,6 +1590,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     _meetingCore?.Dispose();
                     _meetingCore = null;
                     _streamingMessages.Clear();
+                    _privateStreamingMessages.Clear();
                     IsBusy = false;
                     StatusText = "会议已结束";
                     if (SelectedSession is not null)
@@ -1241,6 +1689,43 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             case "meeting.closed":
                 StatusText = "会议已结束";
                 break;
+            case "message.published":
+                if (meetingEvent.Payload.TryGetProperty("message", out var publicMessage))
+                {
+                    Transcript.Add(new TranscriptItem(
+                        "user.direct_host",
+                        "我",
+                        publicMessage.GetString() ?? string.Empty,
+                        "已发送",
+                        "host",
+                        "public",
+                        [],
+                        $"message.{meetingEvent.EventId.Replace('-', '.')}",
+                        meetingEvent.OccurredAt));
+                }
+                break;
+            case "message.direct_sent":
+                var privateTarget = meetingEvent.TargetId is null
+                    ? null
+                    : Roles.FirstOrDefault(item => item.RoleId == meetingEvent.TargetId);
+                if (privateTarget is not null && meetingEvent.Payload.TryGetProperty("message", out var privateMessage))
+                {
+                    SelectedSession?.GetPrivateThread(privateTarget.RoleId).Add(new TranscriptItem(
+                        "user.direct_host",
+                        "我",
+                        privateMessage.GetString() ?? string.Empty,
+                        "已发送",
+                        "host",
+                        "private",
+                        [privateTarget.RoleId],
+                        $"message.{meetingEvent.EventId.Replace('-', '.')}",
+                        meetingEvent.OccurredAt));
+                    if (SelectedPrivateRole?.RoleId == privateTarget.RoleId)
+                    {
+                        OnPropertyChanged(nameof(PrivateMessages));
+                    }
+                }
+                break;
             case "role.registered":
             case "role.temporary_registered":
                 if (role is not null)
@@ -1253,9 +1738,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 {
                     role.Scope = "long_term";
                     role.RetentionPolicy = "retain_profile";
-                    if (!_longTermRoles.Contains(role))
+                    if (!LongTermRoles.Contains(role))
                     {
-                        _longTermRoles.Add(role);
+                        LongTermRoles.Add(role);
                     }
                     SelectedSession?.TemporaryRoles.Remove(role);
                     OnPropertyChanged(nameof(CanPromoteSelectedRole));
@@ -1272,19 +1757,54 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             case "speech.started":
                 if (role is not null)
                 {
+                    if (meetingEvent.Visibility == "private")
+                    {
+                        role.Status = "私聊中";
+                        role.ActivitySummary = "正在生成仅对你可见的答复；未公开模型私有推理";
+                        var privateTranscript = new TranscriptItem(
+                            role.RoleId,
+                            role.DisplayName,
+                            string.Empty,
+                            "生成中",
+                            "role",
+                            "private",
+                            [role.RoleId],
+                            $"message.{meetingEvent.EventId.Replace('-', '.')}",
+                            meetingEvent.OccurredAt);
+                        SelectedSession?.GetPrivateThread(role.RoleId).Add(privateTranscript);
+                        _privateStreamingMessages[role.RoleId] = privateTranscript;
+                        if (SelectedPrivateRole?.RoleId == role.RoleId)
+                        {
+                            OnPropertyChanged(nameof(PrivateMessages));
+                        }
+                        break;
+                    }
                     foreach (var item in Roles.Where(item => item.Status == "发言中"))
                     {
                         item.Status = "空闲";
                     }
                     role.Status = "发言中";
-                    var transcript = new TranscriptItem(role.RoleId, role.DisplayName, string.Empty, "生成中");
+                    role.ActivitySummary = "正在公开发言；未公开模型私有推理";
+                    var transcript = new TranscriptItem(
+                        role.RoleId,
+                        role.DisplayName,
+                        string.Empty,
+                        "生成中",
+                        "role",
+                        "public",
+                        null,
+                        $"message.{meetingEvent.EventId.Replace('-', '.')}",
+                        meetingEvent.OccurredAt);
                     Transcript.Add(transcript);
                     _streamingMessages[role.RoleId] = transcript;
                 }
                 break;
             case "speech.delta":
+                var streamingMessages = meetingEvent.Visibility == "private"
+                    ? _privateStreamingMessages
+                    : _streamingMessages;
                 if (role is not null &&
-                    _streamingMessages.TryGetValue(role.RoleId, out var streaming) &&
+                    streamingMessages.TryGetValue(role.RoleId, out var streaming) &&
                     meetingEvent.Payload.TryGetProperty("delta", out var delta))
                 {
                     streaming.Text += delta.GetString() ?? string.Empty;
@@ -1292,16 +1812,40 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 break;
             case "speech.completed":
             case "speech.cancelled":
-                var finishedRole = meetingEvent.Kind == "speech.cancelled" && meetingEvent.TargetId is not null
+                var finishedRole = meetingEvent.Visibility != "private" &&
+                    meetingEvent.Kind == "speech.cancelled" && meetingEvent.TargetId is not null
                     ? Roles.FirstOrDefault(item => item.RoleId == meetingEvent.TargetId)
                     : role;
                 if (finishedRole is not null)
                 {
                     finishedRole.Status = "空闲";
-                    if (_streamingMessages.Remove(finishedRole.RoleId, out var finished))
+                    finishedRole.ActivitySummary = "空闲；未公开模型私有推理";
+                    var completedMessages = meetingEvent.Visibility == "private"
+                        ? _privateStreamingMessages
+                        : _streamingMessages;
+                    if (completedMessages.Remove(finishedRole.RoleId, out var finished))
                     {
                         finished.State = meetingEvent.Kind == "speech.completed" ? "已完成" : "已取消";
                     }
+                }
+                PersistCurrentSessionInBackground();
+                break;
+            case "tool.started":
+                if (role is not null)
+                {
+                    var toolName = meetingEvent.Payload.TryGetProperty("toolName", out var tool)
+                        ? tool.GetString() ?? "工具"
+                        : "工具";
+                    role.ActivitySummary = $"正在调用 {toolName}；参数和结果不在角色状态页公开";
+                }
+                break;
+            case "tool.completed":
+            case "tool.failed":
+                if (role is not null)
+                {
+                    role.ActivitySummary = meetingEvent.Kind == "tool.completed"
+                        ? "工具调用已完成；未公开参数、结果或模型私有推理"
+                        : "工具调用失败；未公开参数、结果或模型私有推理";
                 }
                 break;
             case "interruption.requested":
@@ -1327,7 +1871,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         {
             return;
         }
-        foreach (var skill in _workspace.Skills.Where(item => item.Enabled))
+        foreach (var skill in Skills.Where(item => item.Enabled))
         {
             AddCapabilityGrant(new CapabilityGrantItem(
                 skill.SkillId,
@@ -1335,7 +1879,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 "Skill",
                 role.SkillIds.Contains(skill.SkillId)));
         }
-        foreach (var server in _workspace.McpServers.Where(item => item.Enabled))
+        foreach (var server in McpServers.Where(item => item.Enabled))
         {
             AddCapabilityGrant(new CapabilityGrantItem(
                 server.McpServerId,
@@ -1348,7 +1892,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private void RefreshInvitationCapabilities()
     {
         InvitationCapabilities.Clear();
-        foreach (var skill in _workspace.Skills.Where(item => item.Enabled))
+        foreach (var skill in Skills.Where(item => item.Enabled))
         {
             InvitationCapabilities.Add(new CapabilityGrantItem(
                 skill.SkillId,
@@ -1356,7 +1900,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 "Skill",
                 false));
         }
-        foreach (var server in _workspace.McpServers.Where(item => item.Enabled))
+        foreach (var server in McpServers.Where(item => item.Enabled))
         {
             InvitationCapabilities.Add(new CapabilityGrantItem(
                 server.McpServerId,
@@ -1370,7 +1914,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         InvitationInviterOptions.Clear();
         InvitationInviterOptions.Add(new SelectionOptionItem("user.direct_host", "我（会议主持）"));
-        foreach (var role in _longTermRoles.Where(role => !role.IsArchived))
+        foreach (var role in LongTermRoles.Where(role => !role.IsArchived))
         {
             InvitationInviterOptions.Add(new SelectionOptionItem(role.RoleId, role.DisplayName));
         }
@@ -1379,6 +1923,38 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             InvitationInviterId = "user.direct_host";
         }
         OnPropertyChanged(nameof(CanInviteTemporaryRole));
+    }
+
+    private void RefreshMentionTargets()
+    {
+        var selected = MentionTargets
+            .Where(target => target.IsMentioned)
+            .Select(target => target.RoleId)
+            .ToHashSet(StringComparer.Ordinal);
+        MentionTargets.Clear();
+        foreach (var role in Roles.Where(role => !role.IsArchived))
+        {
+            MentionTargets.Add(new MentionTargetItem(role)
+            {
+                IsMentioned = selected.Contains(role.RoleId),
+            });
+        }
+    }
+
+    private void RefreshVisibleSessions()
+    {
+        VisibleSessions.Clear();
+        var groupId = SelectedSessionGroup?.GroupId;
+        foreach (var session in Sessions
+            .Where(session => groupId is null || session.GroupId == groupId)
+            .OrderByDescending(session => session.UpdatedAt))
+        {
+            VisibleSessions.Add(session);
+        }
+        if (SelectedSession is null || !VisibleSessions.Contains(SelectedSession))
+        {
+            SelectedSession = VisibleSessions.FirstOrDefault();
+        }
     }
 
     private void AddCapabilityGrant(CapabilityGrantItem grant)
@@ -1411,7 +1987,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         _workspace.Providers = Providers.ToList();
         _workspace.Models = Models.ToList();
-        _workspace.Roles = _longTermRoles
+        _workspace.Skills = Skills.ToList();
+        _workspace.McpServers = McpServers.ToList();
+        _workspace.SessionGroups = SessionGroups
+            .Select(group => new SessionGroupProfileConfiguration
+            {
+                GroupId = group.GroupId,
+                DisplayName = group.DisplayName,
+                Kind = group.Kind,
+                SortOrder = group.SortOrder,
+            })
+            .ToList();
+        _workspace.Roles = LongTermRoles
             .Where(role => !role.IsArchived)
             .Select(role => new RoleProfileConfiguration
             {
@@ -1503,6 +2090,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             SessionId = session.SessionId,
             WorkspaceId = _workspace.WorkspaceId,
             Title = string.IsNullOrWhiteSpace(session.Title) ? "未命名圆桌会议" : session.Title.Trim(),
+            GroupId = session.GroupId,
             Phase = phaseOverride ?? session.Phase,
             CreatedAt = session.CreatedAt,
             UpdatedAt = session.UpdatedAt,
@@ -1515,6 +2103,22 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             Participants = roles
                 .Where(role => !role.IsArchived)
                 .Select(BuildParticipantManifest)
+                .ToList(),
+            Messages = session.Transcript
+                .Concat(session.PrivateThreads.Values.SelectMany(thread => thread))
+                .OrderBy(message => message.OccurredAt)
+                .Select(message => new SessionMessageConfiguration
+                {
+                    MessageId = message.MessageId,
+                    Kind = message.Kind,
+                    SpeakerId = message.RoleId,
+                    SpeakerName = message.Speaker,
+                    Visibility = message.Visibility,
+                    AudienceRoleIds = message.AudienceRoleIds.ToList(),
+                    Text = message.Text,
+                    State = ToStorageState(message.State),
+                    OccurredAt = message.OccurredAt,
+                })
                 .ToList(),
         };
     }
@@ -1535,6 +2139,23 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         var definition = BuildSessionConfiguration(session, participants);
         await _sessionStore.SaveAsync(definition, cancellationToken);
         session.UpdatedAt = definition.UpdatedAt;
+    }
+
+    private void PersistCurrentSessionInBackground()
+    {
+        _ = PersistCurrentSessionSafelyAsync();
+    }
+
+    private async Task PersistCurrentSessionSafelyAsync()
+    {
+        try
+        {
+            await PersistSelectedSessionAsync(CancellationToken.None);
+        }
+        catch
+        {
+            _dispatcher.TryEnqueue(() => ShowError("会议记录暂时无法写入本地会话文件。"));
+        }
     }
 
     private static ParticipantManifestConfiguration BuildParticipantManifest(RoleItem role)
@@ -1617,6 +2238,22 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         return true;
     }
 
+    private static string ToStorageState(string state) => state switch
+    {
+        "已发送" or "已提交" => "submitted",
+        "生成中" or "处理中" => "streaming",
+        "已取消" => "cancelled",
+        _ => "completed",
+    };
+
+    private static string ToDisplayState(string state) => state switch
+    {
+        "submitted" => "已发送",
+        "streaming" => "生成中",
+        "cancelled" => "已取消",
+        _ => "已完成",
+    };
+
     private static string NormalizeId(string value)
     {
         var normalized = new string(value.Trim().ToLowerInvariant()
@@ -1663,6 +2300,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         OnPropertyChanged(nameof(MeetingSummary));
         OnPropertyChanged(nameof(GenerationSummary));
         OnPropertyChanged(nameof(CanSend));
+        OnPropertyChanged(nameof(CanSendPrivate));
         OnPropertyChanged(nameof(CanArchiveSelectedRole));
         OnPropertyChanged(nameof(CanPromoteSelectedRole));
         OnPropertyChanged(nameof(TranscriptEmptyVisibility));

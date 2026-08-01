@@ -18,6 +18,8 @@
         "role.promote",
         "role.archive",
         "role.remove",
+        "speech.broadcast",
+        "speech.direct",
         "speech.prompt",
         "speech.interrupt",
         "generation.cancel",

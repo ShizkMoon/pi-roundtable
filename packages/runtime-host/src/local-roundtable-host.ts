@@ -56,6 +56,21 @@ interface PendingHandoff {
   commandId: string;
 }
 
+interface ExpectedTurn {
+  commandId: string;
+  visibility: "public" | "private";
+}
+
+interface PendingPublicTurn {
+  roleId: string;
+  commandId: string;
+}
+
+interface PublicHostMessage {
+  message: string;
+  mentions: string[];
+}
+
 interface RememberedReceipt {
   fingerprint: string;
   receipt: CommandReceipt;
@@ -73,12 +88,16 @@ export class LocalRoundtableHost {
   readonly #receipts = new Map<string, RememberedReceipt>();
   readonly #eventListeners = new Set<MeetingEventListener>();
   readonly #diagnosticListeners = new Set<HostDiagnosticListener>();
-  readonly #expectedTurnIds = new Map<string, string>();
+  readonly #expectedTurns = new Map<string, ExpectedTurn>();
+  readonly #pendingPublicTurns: PendingPublicTurn[] = [];
+  readonly #publicMessages: PublicHostMessage[] = [];
+  readonly #rolePublicCursors = new Map<string, number>();
   #phase: "created" | "live" | "closed" = "created";
   #sequence = 0;
   #leaseActive = false;
   #activeRoleId: string | undefined;
   #activeTurnCorrelationId: string | undefined;
+  #activeTurnVisibility: "public" | "private" = "public";
   #pendingHandoff: PendingHandoff | undefined;
   #deferredTerminalEvents:
     | { roleId: string; events: RuntimeEvent[] }
@@ -208,7 +227,8 @@ export class LocalRoundtableHost {
     this.#pendingHandoff = undefined;
     this.#activeRoleId = undefined;
     this.#activeTurnCorrelationId = undefined;
-    this.#expectedTurnIds.clear();
+    this.#expectedTurns.clear();
+    this.#pendingPublicTurns.length = 0;
     const roles = [...this.#roles.values()];
     this.#roles.clear();
     await Promise.all(
@@ -291,7 +311,8 @@ export class LocalRoundtableHost {
         this.#activeRoleId = undefined;
         this.#activeTurnCorrelationId = undefined;
         this.#pendingHandoff = undefined;
-        this.#expectedTurnIds.clear();
+        this.#expectedTurns.clear();
+        this.#pendingPublicTurns.length = 0;
         await this.#stopAllRoles();
         this.#emit("meeting.closed", this.#runtimeId, null, command.commandId, {});
         return this.#accepted(command);
@@ -310,6 +331,12 @@ export class LocalRoundtableHost {
 
       case "role.remove":
         return this.#removeRole(command, false);
+
+      case "speech.broadcast":
+        return this.#broadcast(command);
+
+      case "speech.direct":
+        return this.#direct(command);
 
       case "speech.prompt":
         return this.#promptRole(command);
@@ -384,6 +411,7 @@ export class LocalRoundtableHost {
       );
     }
     this.#roles.set(roleId, { displayName, scope, adapter, unsubscribe });
+    this.#rolePublicCursors.set(roleId, 0);
     this.#emit(eventKind, roleId, null, command.commandId, { displayName, scope });
     return this.#accepted(command);
   }
@@ -422,7 +450,8 @@ export class LocalRoundtableHost {
       this.#activeRoleId = undefined;
       this.#activeTurnCorrelationId = undefined;
     }
-    this.#expectedTurnIds.delete(roleId);
+    this.#expectedTurns.delete(roleId);
+    this.#rolePublicCursors.delete(roleId);
     role.unsubscribe();
     try {
       await role.adapter.stop();
@@ -453,18 +482,151 @@ export class LocalRoundtableHost {
     if (this.#activeRoleId !== undefined && this.#activeRoleId !== roleId) {
       return this.#receipt(command, "rejected", "floor_busy", "Another role is speaking");
     }
-    this.#expectedTurnIds.set(roleId, command.commandId);
+    this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "public" });
     const result = await role.adapter.execute({
       kind: "turn.prompt",
       commandId: command.commandId,
       roleId,
-      message,
+      message: this.#withUnseenPublicContext(roleId, message),
       delivery: "immediate",
     });
-    if (!result.accepted && this.#expectedTurnIds.get(roleId) === command.commandId) {
-      this.#expectedTurnIds.delete(roleId);
+    if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
+      this.#expectedTurns.delete(roleId);
     }
     return this.#fromRuntimeResult(command, result);
+  }
+
+  async #broadcast(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live") {
+      return this.#invalidTransition(command);
+    }
+    if (command.actorId !== "user.direct_host") {
+      return this.#receipt(command, "rejected", "invalid_actor", "Broadcasts require the direct meeting host");
+    }
+    if (this.#activeRoleId !== undefined || this.#pendingPublicTurns.length > 0) {
+      return this.#receipt(command, "rejected", "floor_busy", "The public floor is busy");
+    }
+    const message = this.#readString(command.payload, "message")?.trim();
+    if (!message) {
+      return this.#receipt(command, "rejected", "invalid_prompt", "Broadcast message is required");
+    }
+    const requestedMentions = this.#readStringArray(command.payload, "mentions");
+    if (requestedMentions === undefined) {
+      return this.#receipt(command, "rejected", "invalid_mentions", "Mentions must be an array of role identifiers");
+    }
+    const mentions = [...new Set(requestedMentions)];
+    if (mentions.some((roleId) => !this.#roles.has(roleId))) {
+      return this.#receipt(command, "rejected", "unknown_role", "A mentioned role does not exist");
+    }
+    const targets = mentions.length > 0 ? mentions : [...this.#roles.keys()];
+    this.#publicMessages.push({ message, mentions });
+    this.#emit(
+      "message.published",
+      "user.direct_host",
+      null,
+      command.commandId,
+      { message, mentions },
+    );
+    this.#pendingPublicTurns.push(
+      ...targets.map((roleId, index) => ({ roleId, commandId: `${command.commandId}:${index + 1}` })),
+    );
+    await this.#startNextPublicTurn();
+    return this.#accepted(command);
+  }
+
+  async #direct(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live") {
+      return this.#invalidTransition(command);
+    }
+    if (command.actorId !== "user.direct_host") {
+      return this.#receipt(command, "rejected", "invalid_actor", "Direct messages require the direct meeting host");
+    }
+    const roleId = command.targetId;
+    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const message = this.#readString(command.payload, "message")?.trim();
+    if (roleId === undefined || roleId === null || role === undefined) {
+      return this.#receipt(command, "rejected", "unknown_role", "Private target role does not exist");
+    }
+    if (!message) {
+      return this.#receipt(command, "rejected", "invalid_prompt", "Private message is required");
+    }
+    if (this.#activeRoleId !== undefined || this.#pendingPublicTurns.length > 0) {
+      return this.#receipt(command, "rejected", "floor_busy", "A role is already responding");
+    }
+    const audience = ["user.direct_host", roleId];
+    this.#emit(
+      "message.direct_sent",
+      "user.direct_host",
+      roleId,
+      command.commandId,
+      { message },
+      "private",
+      audience,
+    );
+    this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "private" });
+    const result = await role.adapter.execute({
+      kind: "turn.prompt",
+      commandId: command.commandId,
+      roleId,
+      message: this.#withUnseenPublicContext(
+        roleId,
+        `[Private message from the meeting host. Do not reveal it to other roles unless the host explicitly republishes it.]\n${message}`,
+      ),
+      delivery: "immediate",
+    });
+    if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
+      this.#expectedTurns.delete(roleId);
+      this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "The target role could not answer the private message");
+    }
+    return this.#accepted(command);
+  }
+
+  async #startNextPublicTurn(): Promise<void> {
+    if (this.#activeRoleId !== undefined || this.#phase !== "live") {
+      return;
+    }
+    while (this.#pendingPublicTurns.length > 0) {
+      const next = this.#pendingPublicTurns.shift();
+      if (next === undefined) {
+        return;
+      }
+      const role = this.#roles.get(next.roleId);
+      if (role === undefined) {
+        continue;
+      }
+      this.#expectedTurns.set(next.roleId, { commandId: next.commandId, visibility: "public" });
+      const result = await role.adapter.execute({
+        kind: "turn.prompt",
+        commandId: next.commandId,
+        roleId: next.roleId,
+        message: this.#withUnseenPublicContext(
+          next.roleId,
+          "Respond to the latest public roundtable message. Keep private conversations private.",
+        ),
+        delivery: "immediate",
+      });
+      if (result.accepted) {
+        return;
+      }
+      this.#expectedTurns.delete(next.roleId);
+      this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "A mentioned role could not take the public floor");
+    }
+  }
+
+  #withUnseenPublicContext(roleId: string, instruction: string): string {
+    const cursor = this.#rolePublicCursors.get(roleId) ?? 0;
+    const unseen = this.#publicMessages.slice(cursor);
+    this.#rolePublicCursors.set(roleId, this.#publicMessages.length);
+    if (unseen.length === 0) {
+      return instruction;
+    }
+    const context = unseen.map((entry) => {
+      const mentionLabel = entry.mentions.length === 0
+        ? "addressed to the full roundtable"
+        : `mentions: ${entry.mentions.join(", ")}`;
+      return `[Public host message; ${mentionLabel}]\n${entry.message}`;
+    }).join("\n\n");
+    return `${context}\n\n${instruction}`;
   }
 
   async #interrupt(command: MeetingCommand): Promise<CommandReceipt> {
@@ -495,6 +657,7 @@ export class LocalRoundtableHost {
         "An interruption requires the next prompt",
       );
     }
+    this.#pendingPublicTurns.length = 0;
     const target = this.#roles.get(targetId);
     if (target === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Target role does not exist");
@@ -550,7 +713,7 @@ export class LocalRoundtableHost {
       roleId,
     });
     if (result.accepted) {
-      this.#expectedTurnIds.delete(roleId);
+      this.#expectedTurns.delete(roleId);
     }
     return this.#fromRuntimeResult(command, result);
   }
@@ -565,17 +728,20 @@ export class LocalRoundtableHost {
     if (interruptor === undefined || this.#phase !== "live") {
       return;
     }
-    this.#expectedTurnIds.set(handoff.interruptorId, handoff.commandId);
+    this.#expectedTurns.set(handoff.interruptorId, {
+      commandId: handoff.commandId,
+      visibility: "public",
+    });
     const result = await interruptor.adapter.execute({
       kind: "turn.prompt",
       commandId: handoff.commandId,
       roleId: handoff.interruptorId,
-      message: handoff.message,
+      message: this.#withUnseenPublicContext(handoff.interruptorId, handoff.message),
       delivery: "immediate",
     });
     if (!result.accepted) {
-      if (this.#expectedTurnIds.get(handoff.interruptorId) === handoff.commandId) {
-        this.#expectedTurnIds.delete(handoff.interruptorId);
+      if (this.#expectedTurns.get(handoff.interruptorId)?.commandId === handoff.commandId) {
+        this.#expectedTurns.delete(handoff.interruptorId);
       }
       this.#diagnose(
         this.#safeRuntimeErrorCode(result.errorCode ?? "handoff_failed"),
@@ -595,7 +761,8 @@ export class LocalRoundtableHost {
 
     switch (event.kind) {
       case "turn.started": {
-        const expectedCorrelationId = this.#expectedTurnIds.get(roleId);
+        const expectedTurn = this.#expectedTurns.get(roleId);
+        const expectedCorrelationId = expectedTurn?.commandId;
         if (
           expectedCorrelationId === undefined ||
           this.#activeRoleId !== undefined ||
@@ -606,15 +773,16 @@ export class LocalRoundtableHost {
         ) {
           return;
         }
-        this.#expectedTurnIds.delete(roleId);
+        this.#expectedTurns.delete(roleId);
         this.#activeRoleId = roleId;
         this.#activeTurnCorrelationId = event.correlationId ?? expectedCorrelationId;
-        this.#emit("speech.started", roleId, null, event.correlationId ?? null, {});
+        this.#activeTurnVisibility = expectedTurn?.visibility ?? "public";
+        this.#emitActiveTurnEvent("speech.started", roleId, event, {});
         break;
       }
       case "turn.delta":
         if (this.#isActiveTurnEvent(roleId, event)) {
-          this.#emit("speech.delta", roleId, null, event.correlationId ?? null, event.payload);
+          this.#emitActiveTurnEvent("speech.delta", roleId, event, event.payload);
         }
         break;
       case "turn.completed":
@@ -624,28 +792,33 @@ export class LocalRoundtableHost {
         }
         const kind = event.kind === "turn.completed" ? "speech.completed" : "speech.cancelled";
         const handoff = this.#pendingHandoff;
-        this.#emit(
+        this.#emitActiveTurnEvent(
           kind,
           event.kind === "turn.cancelled" && handoff?.targetId === roleId
             ? handoff.interruptorId
             : roleId,
-          event.kind === "turn.cancelled" ? roleId : null,
-          event.correlationId ?? null,
+          event,
           {},
+          event.kind === "turn.cancelled" ? roleId : null,
         );
+        const completedVisibility = this.#activeTurnVisibility;
         this.#activeRoleId = undefined;
         this.#activeTurnCorrelationId = undefined;
+        this.#activeTurnVisibility = "public";
         this.#enqueueInternal(() => this.#continueHandoff(roleId));
+        if (completedVisibility === "public") {
+          this.#enqueueInternal(() => this.#startNextPublicTurn());
+        }
         break;
       }
       case "tool.started":
-        this.#emit("tool.started", roleId, null, event.correlationId ?? null, event.payload);
+        this.#emitActiveTurnEvent("tool.started", roleId, event, event.payload);
         break;
       case "tool.completed":
-        this.#emit("tool.completed", roleId, null, event.correlationId ?? null, event.payload);
+        this.#emitActiveTurnEvent("tool.completed", roleId, event, event.payload);
         break;
       case "tool.failed":
-        this.#emit("tool.failed", roleId, null, event.correlationId ?? null, event.payload);
+        this.#emitActiveTurnEvent("tool.failed", roleId, event, event.payload);
         break;
       case "runtime.failed":
         this.#diagnose(
@@ -660,6 +833,25 @@ export class LocalRoundtableHost {
       default:
         break;
     }
+  }
+
+  #emitActiveTurnEvent(
+    kind: MeetingEventKind,
+    actorId: string,
+    event: RuntimeEvent,
+    payload: JsonObject,
+    publicTargetId: string | null = null,
+  ): void {
+    const isPrivate = this.#activeTurnVisibility === "private";
+    this.#emit(
+      kind,
+      actorId,
+      isPrivate ? "user.direct_host" : publicTargetId,
+      event.correlationId ?? null,
+      payload,
+      isPrivate ? "private" : "public",
+      isPrivate ? ["user.direct_host", actorId] : undefined,
+    );
   }
 
   #createAdapter(
@@ -859,7 +1051,8 @@ export class LocalRoundtableHost {
   async #stopAllRoles(): Promise<void> {
     const roles = [...this.#roles.values()];
     this.#roles.clear();
-    this.#expectedTurnIds.clear();
+    this.#expectedTurns.clear();
+    this.#pendingPublicTurns.length = 0;
     await Promise.all(
       roles.map(async (role) => {
         role.unsubscribe();
@@ -878,6 +1071,8 @@ export class LocalRoundtableHost {
     targetId: string | null,
     causationId: string | null,
     payload: JsonObject,
+    visibility: "public" | "private" = "public",
+    audience?: string[],
   ): MeetingEvent {
     const event: MeetingEvent = {
       protocolVersion: PROTOCOL_VERSION,
@@ -887,6 +1082,7 @@ export class LocalRoundtableHost {
       runtimeGeneration: this.runtimeGeneration,
       kind,
       occurredAt: this.#now().toISOString(),
+      visibility,
       payload,
     };
     if (actorId !== null) {
@@ -897,6 +1093,9 @@ export class LocalRoundtableHost {
     }
     if (causationId !== null) {
       event.causationId = causationId;
+    }
+    if (audience !== undefined) {
+      event.audience = audience;
     }
     for (const listener of this.#eventListeners) {
       try {
@@ -986,6 +1185,17 @@ export class LocalRoundtableHost {
     return typeof value === "object" && value !== null && !Array.isArray(value)
       ? value
       : undefined;
+  }
+
+  #readStringArray(payload: JsonObject, key: string): string[] | undefined {
+    const value = payload[key];
+    if (value === undefined) {
+      return [];
+    }
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+      return undefined;
+    }
+    return value as string[];
   }
 
   #safeRuntimeErrorCode(errorCode: string | null | undefined): string {

@@ -39,8 +39,15 @@ typedef enum pr_event_kind {
     PR_EVENT_SUBAGENT_FAILED = 17,
     PR_EVENT_ROLE_TEMPORARY_REGISTERED = 18,
     PR_EVENT_ROLE_PROMOTED = 19,
-    PR_EVENT_ROLE_ARCHIVED = 20
+    PR_EVENT_ROLE_ARCHIVED = 20,
+    PR_EVENT_MESSAGE_PUBLISHED = 21,
+    PR_EVENT_MESSAGE_DIRECT_SENT = 22
 } pr_event_kind;
+
+typedef enum pr_event_visibility {
+    PR_EVENT_VISIBILITY_PUBLIC = 0,
+    PR_EVENT_VISIBILITY_PRIVATE = 1
+} pr_event_visibility;
 
 typedef enum pr_apply_error {
     PR_APPLY_OK = 0,
@@ -77,6 +84,7 @@ typedef struct pr_event {
     pr_event_kind kind;
     const char* actor_id;
     const char* target_id;
+    pr_event_visibility visibility;
 } pr_event;
 
 typedef struct pr_apply_result {

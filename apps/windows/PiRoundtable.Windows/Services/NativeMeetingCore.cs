@@ -26,6 +26,14 @@ internal enum NativeEventKind
     RoleTemporaryRegistered = 18,
     RolePromoted = 19,
     RoleArchived = 20,
+    MessagePublished = 21,
+    MessageDirectSent = 22,
+}
+
+internal enum NativeEventVisibility
+{
+    Public = 0,
+    Private = 1,
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -34,13 +42,15 @@ internal readonly struct NativeEvent(
     ulong runtimeGeneration,
     NativeEventKind kind,
     nint actorId,
-    nint targetId)
+    nint targetId,
+    NativeEventVisibility visibility)
 {
     public readonly ulong Sequence = sequence;
     public readonly ulong RuntimeGeneration = runtimeGeneration;
     public readonly NativeEventKind Kind = kind;
     public readonly nint ActorId = actorId;
     public readonly nint TargetId = targetId;
+    public readonly NativeEventVisibility Visibility = visibility;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -114,7 +124,10 @@ internal sealed class MeetingCoreSession : IDisposable
                 meetingEvent.RuntimeGeneration,
                 kind,
                 actor,
-                target);
+                target,
+                meetingEvent.Visibility == "private"
+                    ? NativeEventVisibility.Private
+                    : NativeEventVisibility.Public);
             var result = NativeMeetingCore.ApplyRaw(
                 _handle.DangerousGetHandle(),
                 in nativeEvent);
@@ -151,6 +164,8 @@ internal sealed class MeetingCoreSession : IDisposable
             "runtime.lease_released" => NativeEventKind.RuntimeLeaseReleased,
             "meeting.opened" => NativeEventKind.MeetingOpened,
             "meeting.closed" => NativeEventKind.MeetingClosed,
+            "message.published" => NativeEventKind.MessagePublished,
+            "message.direct_sent" => NativeEventKind.MessageDirectSent,
             "role.registered" => NativeEventKind.RoleRegistered,
             "role.temporary_registered" => NativeEventKind.RoleTemporaryRegistered,
             "role.promoted" => NativeEventKind.RolePromoted,

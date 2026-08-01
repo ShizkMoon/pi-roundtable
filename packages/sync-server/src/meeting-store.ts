@@ -54,6 +54,8 @@ export interface AppendMeetingEventInput {
   actorId?: string | null;
   targetId?: string | null;
   causationId?: string | null;
+  visibility?: "public" | "private";
+  audience?: string[];
   payload?: JsonObject;
 }
 
@@ -232,6 +234,20 @@ export class InMemoryMeetingStore {
     record: MeetingRecord,
     input: Omit<AppendMeetingEventInput, "ownerRuntimeId">,
   ): MeetingEvent {
+    const visibility = input.visibility ?? "public";
+    if (visibility === "private") {
+      if (input.audience === undefined || input.audience.length === 0) {
+        throw new MeetingStoreError("invalid_argument", "private events require a non-empty audience");
+      }
+      if (new Set(input.audience).size !== input.audience.length) {
+        throw new MeetingStoreError("invalid_argument", "private event audience entries must be unique");
+      }
+      for (const principalId of input.audience) {
+        this.#validateId(principalId, "audience principal");
+      }
+    } else if (input.audience !== undefined) {
+      throw new MeetingStoreError("invalid_argument", "public events must not carry a private audience");
+    }
     const event: MeetingEvent = {
       protocolVersion: PROTOCOL_VERSION,
       meetingId: input.meetingId,
@@ -240,10 +256,12 @@ export class InMemoryMeetingStore {
       runtimeGeneration: input.runtimeGeneration,
       kind: input.kind,
       occurredAt: this.#now().toISOString(),
+      visibility,
       payload: input.payload ?? {},
       ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
       ...(input.targetId !== undefined ? { targetId: input.targetId } : {}),
       ...(input.causationId !== undefined ? { causationId: input.causationId } : {}),
+      ...(input.audience !== undefined ? { audience: input.audience } : {}),
     };
 
     record.lastSequence = event.sequence;

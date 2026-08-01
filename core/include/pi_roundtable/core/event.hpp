@@ -27,6 +27,13 @@ enum class EventKind : std::uint8_t {
     RoleTemporaryRegistered,
     RolePromoted,
     RoleArchived,
+    MessagePublished,
+    MessageDirectSent,
+};
+
+enum class EventVisibility : std::uint8_t {
+    Public = 0,
+    Private,
 };
 
 struct MeetingEvent {
@@ -35,6 +42,7 @@ struct MeetingEvent {
     EventKind kind{};
     std::string actor_id;
     std::string target_id;
+    EventVisibility visibility{EventVisibility::Public};
 };
 
 }  // namespace pi_roundtable::core

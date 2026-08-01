@@ -12,6 +12,7 @@ public sealed class RoleItem : INotifyPropertyChanged
     private string _retentionPolicy;
     private string _networkAccess;
     private bool _isArchived;
+    private string _activitySummary = "空闲；未公开模型私有推理";
 
     public RoleItem(
         string roleId,
@@ -95,6 +96,12 @@ public sealed class RoleItem : INotifyPropertyChanged
     {
         get => _isArchived;
         set => SetField(ref _isArchived, value);
+    }
+
+    public string ActivitySummary
+    {
+        get => _activitySummary;
+        set => SetField(ref _activitySummary, value);
     }
 
     public string ScopeLabel => Scope == "long_term" ? "长期角色" : "临时角色";
