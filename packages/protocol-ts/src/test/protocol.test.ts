@@ -4,12 +4,14 @@ import test from "node:test";
 
 import {
   API_FAMILIES,
+  canObserveMeetingEvent,
   isMeetingCommandKind,
   isMeetingEventKind,
   isRoleScope,
   MEETING_COMMAND_KINDS,
   MEETING_EVENT_KINDS,
   MODEL_CAPABILITIES,
+  PROTOCOL_VERSION,
   ROUNDTABLE_SESSION_VERSION,
   THINKING_LEVELS,
   validateRoundtableSession,
@@ -105,6 +107,44 @@ test("role lifecycle commands and scopes are recognized", () => {
   assert.equal(isRoleScope("long_term"), true);
   assert.equal(isRoleScope("temporary"), true);
   assert.equal(isRoleScope("omp_subagent"), false);
+});
+
+test("conversation visibility and routing commands are explicit", () => {
+  for (const kind of ["speech.broadcast", "speech.direct"]) {
+    assert.equal(isMeetingCommandKind(kind), true);
+  }
+  for (const kind of ["message.published", "message.direct_sent"]) {
+    assert.equal(isMeetingEventKind(kind), true);
+  }
+  const privateEvent = {
+    protocolVersion: PROTOCOL_VERSION,
+    meetingId: "meeting.private",
+    eventId: "event.private",
+    sequence: 1,
+    runtimeGeneration: 1,
+    kind: "message.direct_sent" as const,
+    occurredAt: "2026-08-01T00:00:00.000Z",
+    visibility: "private" as const,
+    audience: ["user.direct_host", "role.secretary"],
+    payload: {},
+  };
+  assert.equal(canObserveMeetingEvent(privateEvent, "role.secretary"), true);
+  assert.equal(canObserveMeetingEvent(privateEvent, "role.host"), false);
+});
+
+test("meeting event schema requires explicit visibility and a private audience", () => {
+  const schema = JSON.parse(
+    readFileSync(
+      new URL("../../../../protocol/schema/meeting-event.schema.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    required: string[];
+    allOf: Array<{ then?: { required?: string[]; not?: { required?: string[] } } }>;
+  };
+  assert.equal(schema.required.includes("visibility"), true);
+  assert.equal(schema.allOf.some((rule) => rule.then?.required?.includes("audience")), true);
+  assert.equal(schema.allOf.some((rule) => rule.then?.not?.required?.includes("audience")), true);
 });
 
 test("TypeScript kind lists stay aligned with the JSON Schemas", () => {
@@ -222,6 +262,34 @@ test("session validation enforces frozen role references and invitation provenan
   };
 
   assert.deepEqual(validateRoundtableSession(session, workspace), []);
+  session.messages = [{
+    messageId: "message.private-planner",
+    kind: "host",
+    speakerId: "user.direct_host",
+    speakerName: "Host",
+    visibility: "private",
+    audienceRoleIds: ["participant.planner"],
+    text: "Keep this in the planner thread.",
+    state: "completed",
+    occurredAt: "2026-08-01T00:01:30.000Z",
+  }];
+  assert.deepEqual(validateRoundtableSession(session, workspace), []);
+  session.messages[0]!.audienceRoleIds = ["participant.unknown"];
+  assert.equal(
+    validateRoundtableSession(session, workspace).some(
+      (issue) => issue.path.includes("audienceRoleIds") && issue.code === "missing_reference",
+    ),
+    true,
+  );
+  session.messages[0]!.audienceRoleIds = ["participant.planner"];
+  session.messages[0]!.visibility = "public";
+  assert.equal(
+    validateRoundtableSession(session, workspace).some(
+      (issue) => issue.path.includes("audienceRoleIds") && issue.code === "invalid_audience",
+    ),
+    true,
+  );
+  session.messages[0]!.visibility = "private";
   session.participants[1]!.invitation!.inviterId = "participant.unknown";
   assert.equal(
     validateRoundtableSession(session, workspace).some((issue) => issue.code === "invalid_invitation"),

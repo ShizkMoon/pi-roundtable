@@ -11,7 +11,16 @@ public sealed class WorkspaceConfiguration
     public List<SkillProfileConfiguration> Skills { get; set; } = [];
     public List<McpServerProfileConfiguration> McpServers { get; set; } = [];
     public List<RoleProfileConfiguration> Roles { get; set; } = [];
+    public List<SessionGroupProfileConfiguration> SessionGroups { get; set; } = [];
     public WorkspaceDefaultsConfiguration? Defaults { get; set; }
+}
+
+public sealed class SessionGroupProfileConfiguration
+{
+    public string GroupId { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string Kind { get; set; } = "folder";
+    public int SortOrder { get; set; }
 }
 
 public sealed class ProviderProfileConfiguration
@@ -142,11 +151,26 @@ public sealed class RoundtableSessionConfiguration
     public string SessionId { get; set; } = string.Empty;
     public string WorkspaceId { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
+    public string? GroupId { get; set; }
     public string Phase { get; set; } = "draft";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public SessionAgendaConfiguration Agenda { get; set; } = new();
     public List<ParticipantManifestConfiguration> Participants { get; set; } = [];
+    public List<SessionMessageConfiguration> Messages { get; set; } = [];
+}
+
+public sealed class SessionMessageConfiguration
+{
+    public string MessageId { get; set; } = string.Empty;
+    public string Kind { get; set; } = "role";
+    public string SpeakerId { get; set; } = string.Empty;
+    public string SpeakerName { get; set; } = string.Empty;
+    public string Visibility { get; set; } = "public";
+    public List<string> AudienceRoleIds { get; set; } = [];
+    public string Text { get; set; } = string.Empty;
+    public string State { get; set; } = "completed";
+    public DateTimeOffset OccurredAt { get; set; }
 }
 
 public sealed class SessionAgendaConfiguration

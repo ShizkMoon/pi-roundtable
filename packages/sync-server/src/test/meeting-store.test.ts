@@ -135,3 +135,47 @@ test("role lifecycle events retain generation fencing and replay order", () => {
     ["role.temporary_registered", "role.promoted", "role.archived"],
   );
 });
+
+test("event visibility obeys the public and private audience contract", () => {
+  const store = new InMemoryMeetingStore();
+  const lease = store.acquireLease({
+    meetingId: "meeting-visibility",
+    ownerRuntimeId: "runtime-windows",
+    ttlMs: 10_000,
+  }).lease;
+
+  assert.throws(
+    () => store.append({
+      meetingId: lease.meetingId,
+      ownerRuntimeId: lease.ownerRuntimeId,
+      runtimeGeneration: lease.runtimeGeneration,
+      kind: "message.direct_sent",
+      visibility: "private",
+    }),
+    (error: unknown) =>
+      error instanceof MeetingStoreError && error.code === "invalid_argument",
+  );
+  assert.throws(
+    () => store.append({
+      meetingId: lease.meetingId,
+      ownerRuntimeId: lease.ownerRuntimeId,
+      runtimeGeneration: lease.runtimeGeneration,
+      kind: "message.published",
+      visibility: "public",
+      audience: ["role.secretary"],
+    }),
+    (error: unknown) =>
+      error instanceof MeetingStoreError && error.code === "invalid_argument",
+  );
+  const privateEvent = store.append({
+    meetingId: lease.meetingId,
+    ownerRuntimeId: lease.ownerRuntimeId,
+    runtimeGeneration: lease.runtimeGeneration,
+    kind: "message.direct_sent",
+    actorId: "user.direct_host",
+    targetId: "role.secretary",
+    visibility: "private",
+    audience: ["user.direct_host", "role.secretary"],
+  });
+  assert.equal(privateEvent.visibility, "private");
+});

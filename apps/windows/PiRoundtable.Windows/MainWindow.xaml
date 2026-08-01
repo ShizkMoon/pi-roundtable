@@ -8,7 +8,68 @@
     <Grid
         x:Name="Root"
         Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
-        Loaded="Root_Loaded">
+        Loaded="Root_Loaded"
+        SizeChanged="Root_SizeChanged">
+        <Grid.Resources>
+            <Style x:Key="RailButtonStyle" TargetType="Button">
+                <Setter Property="HorizontalAlignment" Value="Stretch" />
+                <Setter Property="HorizontalContentAlignment" Value="Left" />
+                <Setter Property="MinHeight" Value="40" />
+                <Setter Property="Padding" Value="12,8" />
+            </Style>
+            <Style x:Key="SectionCardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="12" />
+                <Setter Property="Padding" Value="18" />
+            </Style>
+        </Grid.Resources>
+
+        <VisualStateManager.VisualStateGroups>
+            <VisualStateGroup x:Name="WindowWidthStates">
+                <VisualState x:Name="Wide">
+                    <VisualState.StateTriggers>
+                        <AdaptiveTrigger MinWindowWidth="1280" />
+                    </VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="ShellSplitView.DisplayMode" Value="Inline" />
+                        <Setter Target="ShellSplitView.IsPaneOpen" Value="True" />
+                        <Setter Target="ContextSplitView.DisplayMode" Value="Inline" />
+                        <Setter Target="ContextSplitView.IsPaneOpen" Value="True" />
+                        <Setter Target="RoleManagementSplitView.DisplayMode" Value="Inline" />
+                        <Setter Target="RoleManagementSplitView.IsPaneOpen" Value="True" />
+                        <Setter Target="TitleSubtitle.Visibility" Value="Visible" />
+                    </VisualState.Setters>
+                </VisualState>
+                <VisualState x:Name="Medium">
+                    <VisualState.StateTriggers>
+                        <AdaptiveTrigger MinWindowWidth="800" />
+                    </VisualState.StateTriggers>
+                    <VisualState.Setters>
+                        <Setter Target="ShellSplitView.DisplayMode" Value="Inline" />
+                        <Setter Target="ShellSplitView.IsPaneOpen" Value="True" />
+                        <Setter Target="ContextSplitView.DisplayMode" Value="Overlay" />
+                        <Setter Target="ContextSplitView.IsPaneOpen" Value="False" />
+                        <Setter Target="RoleManagementSplitView.DisplayMode" Value="Inline" />
+                        <Setter Target="RoleManagementSplitView.IsPaneOpen" Value="True" />
+                        <Setter Target="TitleSubtitle.Visibility" Value="Visible" />
+                    </VisualState.Setters>
+                </VisualState>
+                <VisualState x:Name="Compact">
+                    <VisualState.Setters>
+                        <Setter Target="ShellSplitView.DisplayMode" Value="Overlay" />
+                        <Setter Target="ShellSplitView.IsPaneOpen" Value="False" />
+                        <Setter Target="ContextSplitView.DisplayMode" Value="Overlay" />
+                        <Setter Target="ContextSplitView.IsPaneOpen" Value="False" />
+                        <Setter Target="RoleManagementSplitView.DisplayMode" Value="Overlay" />
+                        <Setter Target="RoleManagementSplitView.IsPaneOpen" Value="False" />
+                        <Setter Target="TitleSubtitle.Visibility" Value="Collapsed" />
+                    </VisualState.Setters>
+                </VisualState>
+            </VisualStateGroup>
+        </VisualStateManager.VisualStateGroups>
+
         <Grid.RowDefinitions>
             <RowDefinition Height="56" />
             <RowDefinition Height="Auto" />
@@ -17,14 +78,24 @@
 
         <Grid
             x:Name="AppTitleBar"
-            Padding="18,0"
+            Padding="10,0,18,0"
             Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
+            <Button
+                Width="40"
+                Height="40"
+                Margin="0,0,8,0"
+                AutomationProperties.Name="切换会话导航"
+                Click="ToggleShellPane_Click"
+                Content="☰"
+                ToolTipService.ToolTip="会话与工作区导航" />
             <Border
+                Grid.Column="1"
                 Width="30"
                 Height="30"
                 VerticalAlignment="Center"
@@ -39,14 +110,15 @@
                     Foreground="White"
                     Text="π" />
             </Border>
-            <StackPanel Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center" Spacing="1">
+            <StackPanel Grid.Column="2" Margin="10,0,0,0" VerticalAlignment="Center" Spacing="1">
                 <TextBlock FontSize="16" FontWeight="SemiBold" Text="Pi Roundtable" />
                 <TextBlock
+                    x:Name="TitleSubtitle"
                     FontSize="11"
                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                     Text="Local-first agent session workspace" />
             </StackPanel>
-            <StackPanel Grid.Column="2" VerticalAlignment="Center" Orientation="Horizontal" Spacing="10">
+            <StackPanel Grid.Column="3" VerticalAlignment="Center" Orientation="Horizontal" Spacing="10">
                 <ProgressRing Width="18" Height="18" IsActive="{Binding IsBusy}" />
                 <Border Padding="10,5" Background="#160F6CBD" CornerRadius="12">
                     <TextBlock FontSize="12" FontWeight="SemiBold" Foreground="#0F6CBD" Text="{Binding StatusText}" />
@@ -56,7 +128,7 @@
 
         <InfoBar
             Grid.Row="1"
-            Margin="14,10,14,0"
+            Margin="12,8,12,0"
             CloseButtonClick="ErrorInfoBar_CloseButtonClick"
             IsClosable="True"
             IsOpen="{Binding HasError, Mode=OneWay}"
@@ -64,142 +136,78 @@
             Severity="Error"
             Title="需要处理" />
 
-        <Grid Grid.Row="2" Margin="14" ColumnSpacing="14">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="252" />
-                <ColumnDefinition Width="*" MinWidth="500" />
-                <ColumnDefinition Width="360" />
-            </Grid.ColumnDefinitions>
-
-            <!-- Session rail: sessions are the client's primary navigation object. -->
-            <Border
-                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1"
-                CornerRadius="14">
-                <Grid Padding="14" RowSpacing="12">
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <Grid ColumnSpacing="8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Spacing="2">
-                            <TextBlock FontSize="17" FontWeight="SemiBold" Text="会话" />
-                            <TextBlock
-                                FontSize="12"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="每个圆桌拥有独立参与者与上下文" />
-                        </StackPanel>
-                        <Button
-                            Grid.Column="1"
-                            Width="36"
-                            Height="36"
-                            AutomationProperties.Name="新建会话"
-                            Click="NewSession_Click"
-                            Content="＋"
-                            ToolTipService.ToolTip="新建会话" />
-                    </Grid>
-
-                    <ListView
-                        Grid.Row="1"
-                        ItemsSource="{Binding Sessions}"
-                        SelectedItem="{Binding SelectedSession, Mode=TwoWay}"
-                        SelectionMode="Single">
-                        <ListView.ItemTemplate>
-                            <DataTemplate x:DataType="models:SessionItem">
-                                <StackPanel Padding="4,9" Spacing="4">
-                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind Title, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock
-                                        FontSize="11"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                        Text="{x:Bind Summary, Mode=OneWay}" />
-                                </StackPanel>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
-
-                    <StackPanel Grid.Row="2" Spacing="4">
-                        <Rectangle Height="1" Margin="0,0,0,6" Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
-                        <Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Click="ShowRoleInspector_Click" Content="◫  长期角色" />
-                        <Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Click="ShowRoleInspector_Click" Content="◇  Skills 授权" />
-                        <Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Click="ShowRoleInspector_Click" Content="⌁  MCP 授权" />
-                        <Button HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Click="ShowProviderInspector_Click" Content="⚙  提供商与模型" />
-                    </StackPanel>
-                </Grid>
-            </Border>
-
-            <!-- Active session workspace. -->
-            <Border
-                Grid.Column="1"
-                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1"
-                CornerRadius="14">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                    <Grid Padding="20,17,20,12" ColumnSpacing="12">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Spacing="4">
-                            <TextBox
-                                FontSize="22"
-                                FontWeight="SemiBold"
-                                BorderThickness="0"
-                                Background="Transparent"
-                                Header="当前圆桌"
-                                Text="{Binding MeetingTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                            <TextBlock
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="{Binding MeetingSummary}" />
-                        </StackPanel>
-                        <StackPanel Grid.Column="1" VerticalAlignment="Bottom" Orientation="Horizontal" Spacing="8">
+        <SplitView
+            x:Name="ShellSplitView"
+            Grid.Row="2"
+            Margin="12"
+            CompactPaneLength="0"
+            DisplayMode="Overlay"
+            IsPaneOpen="False"
+            OpenPaneLength="264"
+            PanePlacement="Left">
+            <SplitView.Pane>
+                <Border
+                    Margin="0,0,12,0"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="14">
+                    <Grid Width="264" Padding="12" RowSpacing="10">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="2">
+                                <TextBlock FontSize="18" FontWeight="SemiBold" Text="会话" />
+                                <TextBlock
+                                    FontSize="11"
+                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                    Text="按项目或文件夹组织圆桌" />
+                            </StackPanel>
                             <Button
-                                MinHeight="40"
-                                Click="CloseMeeting_Click"
-                                Content="结束"
-                                IsEnabled="{Binding CanOperate}" />
-                            <Button
-                                MinHeight="40"
-                                Click="StartMeeting_Click"
-                                Content="启动本地圆桌"
-                                IsEnabled="{Binding CanStart}"
-                                Style="{StaticResource AccentButtonStyle}" />
-                        </StackPanel>
-                    </Grid>
+                                Grid.Column="1"
+                                Width="36"
+                                Height="36"
+                                AutomationProperties.Name="新建会话"
+                                Click="NewSession_Click"
+                                Content="＋"
+                                ToolTipService.ToolTip="在当前分组中新建会话" />
+                        </Grid>
 
-                    <Border
-                        Grid.Row="1"
-                        Padding="14,10"
-                        Background="{ThemeResource LayerFillColorDefaultBrush}"
-                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                        BorderThickness="0,1">
+                        <Grid Grid.Row="1" ColumnSpacing="6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <ComboBox
+                                IsEnabled="{Binding IsNotRunning}"
+                                ItemsSource="{Binding SessionGroups}"
+                                SelectedItem="{Binding SelectedSessionGroup, Mode=TwoWay}" />
+                            <Button
+                                Grid.Column="1"
+                                AutomationProperties.Name="新建会话分组"
+                                Click="NewSessionGroup_Click"
+                                Content="⌘"
+                                IsEnabled="{Binding IsRoleConfigurationEditable}"
+                                ToolTipService.ToolTip="新建项目或文件夹分组" />
+                        </Grid>
+
                         <ListView
-                            MaxHeight="64"
-                            ItemsSource="{Binding Roles}"
-                            SelectedItem="{Binding SelectedRole, Mode=TwoWay}"
+                            Grid.Row="2"
+                            ItemsSource="{Binding VisibleSessions}"
+                            SelectedItem="{Binding SelectedSession, Mode=TwoWay}"
                             SelectionMode="Single">
-                            <ListView.ItemsPanel>
-                                <ItemsPanelTemplate>
-                                    <ItemsStackPanel Orientation="Horizontal" />
-                                </ItemsPanelTemplate>
-                            </ListView.ItemsPanel>
                             <ListView.ItemTemplate>
-                                <DataTemplate x:DataType="models:RoleItem">
-                                    <StackPanel MinWidth="132" Padding="8,4" Spacing="2">
-                                        <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                <DataTemplate x:DataType="models:SessionItem">
+                                    <StackPanel Padding="4,8" Spacing="3">
+                                        <TextBlock FontWeight="SemiBold" Text="{x:Bind Title, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
                                         <TextBlock
                                             FontSize="11"
                                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
@@ -208,292 +216,584 @@
                                 </DataTemplate>
                             </ListView.ItemTemplate>
                         </ListView>
-                    </Border>
 
-                    <Grid Grid.Row="2">
-                        <StackPanel
-                            Canvas.ZIndex="1"
-                            HorizontalAlignment="Center"
-                            IsHitTestVisible="False"
-                            VerticalAlignment="Center"
-                            MaxWidth="340"
-                            Spacing="7"
-                            Visibility="{Binding TranscriptEmptyVisibility}">
-                            <TextBlock HorizontalAlignment="Center" FontSize="20" FontWeight="SemiBold" Text="这场圆桌还没有发言" />
-                            <TextBlock
-                                TextAlignment="Center"
-                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                Text="先完成提供商和角色模型配置，再从参与者条选择角色开始讨论。"
-                                TextWrapping="Wrap" />
+                        <StackPanel Grid.Row="3" Spacing="4">
+                            <Rectangle Height="1" Margin="0,0,0,6" Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
+                            <Button Style="{StaticResource RailButtonStyle}" Click="NavigateMeeting_Click" Content="◉  当前圆桌" />
+                            <Button Style="{StaticResource RailButtonStyle}" Click="NavigateRoles_Click" Content="◫  角色管理" />
+                            <Button Style="{StaticResource RailButtonStyle}" Click="NavigateSkills_Click" Content="◇  Skill" />
+                            <Button Style="{StaticResource RailButtonStyle}" Click="NavigateMcp_Click" Content="⌁  MCP" />
+                            <Button Style="{StaticResource RailButtonStyle}" Click="NavigateSettings_Click" Content="⚙  设置" />
                         </StackPanel>
-                        <ListView
-                            x:Name="TranscriptList"
-                            Padding="14,8"
-                            ItemsSource="{Binding Transcript}"
-                            SelectionMode="None">
-                            <ListView.ItemTemplate>
-                                <DataTemplate x:DataType="models:TranscriptItem">
-                                    <Border Margin="2,5" Padding="15" Background="{ThemeResource LayerFillColorDefaultBrush}" CornerRadius="10">
-                                        <StackPanel Spacing="7">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*" />
-                                                    <ColumnDefinition Width="Auto" />
-                                                </Grid.ColumnDefinitions>
-                                                <TextBlock FontWeight="SemiBold" Text="{x:Bind Speaker}" />
-                                                <TextBlock Grid.Column="1" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind TimeLabel}" />
-                                            </Grid>
-                                            <TextBlock Text="{x:Bind Text, Mode=OneWay}" TextWrapping="Wrap" />
-                                            <TextBlock FontSize="11" Foreground="#0F6CBD" Text="{x:Bind State, Mode=OneWay}" />
-                                        </StackPanel>
-                                    </Border>
-                                </DataTemplate>
-                            </ListView.ItemTemplate>
-                        </ListView>
                     </Grid>
+                </Border>
+            </SplitView.Pane>
 
-                    <StackPanel
-                        Grid.Row="3"
-                        Padding="16"
-                        BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                        BorderThickness="0,1,0,0"
-                        Spacing="10">
-                        <Expander Header="邀请临时角色（完整邀请清单）" HorizontalContentAlignment="Stretch">
-                            <ScrollViewer MaxHeight="180" VerticalScrollBarVisibility="Auto">
-                                <Grid Padding="0,22,0,4" ColumnSpacing="10" RowSpacing="8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="180" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
+            <Grid>
+                <Grid x:Name="MeetingPage">
+                    <SplitView
+                        x:Name="ContextSplitView"
+                        CompactPaneLength="0"
+                        DisplayMode="Overlay"
+                        IsPaneOpen="False"
+                        OpenPaneLength="380"
+                        PanePlacement="Right">
+                        <SplitView.Pane>
+                            <Border
+                                Margin="12,0,0,0"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1"
+                                CornerRadius="14">
+                                <Grid>
+                                    <Grid x:Name="PrivateChatPanel" Padding="16" RowSpacing="12">
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="*" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Spacing="2">
+                                                <TextBlock FontSize="19" FontWeight="SemiBold" Text="私聊" />
+                                                <TextBlock
+                                                    FontSize="11"
+                                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                    Text="只进入所选角色的上下文" />
+                                            </StackPanel>
+                                            <Button Grid.Column="1" Click="CloseContextPane_Click" Content="×" ToolTipService.ToolTip="关闭侧栏" />
+                                        </Grid>
+                                        <ComboBox
+                                            Grid.Row="1"
+                                            Header="当前角色"
+                                            ItemsSource="{Binding Roles}"
+                                            SelectedItem="{Binding SelectedPrivateRole, Mode=TwoWay}" />
+                                        <ListView Grid.Row="2" ItemsSource="{Binding PrivateMessages}" SelectionMode="None">
+                                            <ListView.ItemTemplate>
+                                                <DataTemplate x:DataType="models:TranscriptItem">
+                                                    <Border Margin="0,4" Padding="12" Background="{ThemeResource LayerFillColorDefaultBrush}" CornerRadius="10">
+                                                        <StackPanel Spacing="5">
+                                                            <Grid>
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="*" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                </Grid.ColumnDefinitions>
+                                                                <TextBlock FontWeight="SemiBold" Text="{x:Bind Speaker}" />
+                                                                <TextBlock Grid.Column="1" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind TimeLabel}" />
+                                                            </Grid>
+                                                            <TextBlock Text="{x:Bind Text, Mode=OneWay}" TextWrapping="Wrap" />
+                                                            <TextBlock FontSize="11" Foreground="#0F6CBD" Text="{x:Bind State, Mode=OneWay}" />
+                                                        </StackPanel>
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ListView.ItemTemplate>
+                                        </ListView>
+                                        <StackPanel Grid.Row="3" Spacing="8">
+                                            <TextBox
+                                                x:Name="PrivatePromptBox"
+                                                MinHeight="74"
+                                                AcceptsReturn="True"
+                                                PlaceholderText="只对该角色可见……"
+                                                TextWrapping="Wrap" />
+                                            <Button
+                                                HorizontalAlignment="Right"
+                                                Click="SendPrivate_Click"
+                                                Content="发送私聊"
+                                                IsEnabled="{Binding CanSendPrivate}"
+                                                Style="{StaticResource AccentButtonStyle}" />
+                                        </StackPanel>
+                                    </Grid>
+
+                                    <ScrollViewer x:Name="RoleDetailPanel" Padding="18" Visibility="Collapsed">
+                                        <StackPanel Spacing="14">
+                                            <Button HorizontalAlignment="Left" Click="BackToPrivateChat_Click" Content="← 返回私聊" />
+                                            <StackPanel Spacing="3">
+                                                <TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding SelectedRole.DisplayName}" />
+                                                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding SelectedRole.Summary}" />
+                                            </StackPanel>
+                                            <Border Padding="12" Background="#120F6CBD" CornerRadius="10">
+                                                <StackPanel Spacing="4">
+                                                    <TextBlock FontWeight="SemiBold" Text="运行活动" />
+                                                    <TextBlock Text="{Binding SelectedRole.ActivitySummary}" TextWrapping="Wrap" />
+                                                    <TextBlock
+                                                        FontSize="11"
+                                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                        Text="这里只显示生命周期与工具名称，不展示模型私有推理、工具参数或结果。"
+                                                        TextWrapping="Wrap" />
+                                                </StackPanel>
+                                            </Border>
+                                            <TextBox
+                                                MinHeight="220"
+                                                AcceptsReturn="True"
+                                                Header="System Prompt 快照"
+                                                IsReadOnly="True"
+                                                Text="{Binding SelectedRole.SystemPrompt}"
+                                                TextWrapping="Wrap" />
+                                            <TextBlock FontWeight="SemiBold" Text="能力范围" />
+                                            <TextBlock Text="{Binding SelectedRole.CapabilitiesSummary}" />
+                                            <TextBlock FontWeight="SemiBold" Text="模型路由" />
+                                            <TextBlock FontFamily="Cascadia Mono" Text="{Binding SelectedRole.ModelProfileId}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </ScrollViewer>
+                                </Grid>
+                            </Border>
+                        </SplitView.Pane>
+
+                        <Border
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1"
+                            CornerRadius="14">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Padding="20,14,12,8">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <TextBox
+                                        FontSize="22"
+                                        FontWeight="SemiBold"
+                                        BorderThickness="0"
+                                        Background="Transparent"
+                                        Header="当前圆桌"
+                                        Text="{Binding MeetingTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <CommandBar Grid.Row="1" Background="Transparent" DefaultLabelPosition="Right">
+                                        <AppBarButton Label="邀请角色" Icon="AddFriend">
+                                            <AppBarButton.Flyout>
+                                                <Flyout Placement="BottomEdgeAlignedRight">
+                                                    <ScrollViewer Width="520" MaxHeight="620" Padding="4" VerticalScrollBarVisibility="Auto">
+                                                        <StackPanel Spacing="10">
+                                                            <TextBlock FontSize="19" FontWeight="SemiBold" Text="邀请临时角色" />
+                                                            <TextBlock
+                                                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                                Text="邀请清单会冻结系统提示词、模型与本次会话能力。"
+                                                                TextWrapping="Wrap" />
+                                                            <TextBox Header="角色名称" PlaceholderText="系统策划" Text="{Binding TemporaryRoleName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                                            <TextBox Header="本次邀请目的" PlaceholderText="为本场会议制定可执行方案" Text="{Binding TemporaryRolePurpose, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                                            <TextBox
+                                                                MinHeight="100"
+                                                                AcceptsReturn="True"
+                                                                Header="完整 System Prompt"
+                                                                PlaceholderText="定义职责、边界、输出格式与禁止事项……"
+                                                                Text="{Binding TemporaryRoleSystemPrompt, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                                TextWrapping="Wrap" />
+                                                            <ComboBox Header="本会话模型路由" ItemsSource="{Binding Models}" SelectedItem="{Binding SelectedInvitationModel, Mode=TwoWay}" />
+                                                            <ComboBox Header="邀请者" ItemsSource="{Binding InvitationInviterOptions}" SelectedValue="{Binding InvitationInviterId, Mode=TwoWay}" SelectedValuePath="Value" />
+                                                            <ComboBox Header="闭会处置" ItemsSource="{Binding RetentionOptions}" SelectedValue="{Binding InvitationRetentionPolicy, Mode=TwoWay}" SelectedValuePath="Value" />
+                                                            <ComboBox Header="网络访问" ItemsSource="{Binding NetworkAccessOptions}" SelectedValue="{Binding InvitationNetworkAccess, Mode=TwoWay}" SelectedValuePath="Value" />
+                                                            <ListView Header="本会话 Skill / MCP 授权" ItemsSource="{Binding InvitationCapabilities}" SelectionMode="None">
+                                                                <ListView.ItemTemplate>
+                                                                    <DataTemplate x:DataType="models:CapabilityGrantItem">
+                                                                        <CheckBox Padding="2,4" Content="{x:Bind DisplayName}" IsChecked="{x:Bind IsGranted, Mode=TwoWay}" />
+                                                                    </DataTemplate>
+                                                                </ListView.ItemTemplate>
+                                                            </ListView>
+                                                            <Button
+                                                                HorizontalAlignment="Right"
+                                                                Click="AddTemporaryRole_Click"
+                                                                Content="发送邀请并创建"
+                                                                IsEnabled="{Binding CanInviteTemporaryRole}"
+                                                                Style="{StaticResource AccentButtonStyle}" />
+                                                        </StackPanel>
+                                                    </ScrollViewer>
+                                                </Flyout>
+                                            </AppBarButton.Flyout>
+                                        </AppBarButton>
+                                        <AppBarButton Click="OpenPrivatePane_Click" Icon="Message" Label="私聊" />
+                                        <AppBarButton Click="CancelGeneration_Click" Icon="Stop" Label="停止生成" />
+                                        <CommandBar.SecondaryCommands>
+                                            <AppBarButton Click="CloseMeeting_Click" Label="结束会议" />
+                                            <AppBarButton Click="StartMeeting_Click" Label="启动本地圆桌" />
+                                        </CommandBar.SecondaryCommands>
+                                    </CommandBar>
+                                </Grid>
+
+                                <Border
+                                    Grid.Row="1"
+                                    Padding="12,8"
+                                    Background="{ThemeResource LayerFillColorDefaultBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="0,1">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <ListView
+                                            MaxHeight="62"
+                                            ItemsSource="{Binding Roles}"
+                                            SelectedItem="{Binding SelectedRole, Mode=TwoWay}"
+                                            SelectionMode="Single">
+                                            <ListView.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <ItemsStackPanel Orientation="Horizontal" />
+                                                </ItemsPanelTemplate>
+                                            </ListView.ItemsPanel>
+                                            <ListView.ItemTemplate>
+                                                <DataTemplate x:DataType="models:RoleItem">
+                                                    <StackPanel MinWidth="128" Padding="8,3" Spacing="2">
+                                                        <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                                        <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Summary, Mode=OneWay}" />
+                                                    </StackPanel>
+                                                </DataTemplate>
+                                            </ListView.ItemTemplate>
+                                        </ListView>
+                                        <TextBlock
+                                            Grid.Column="1"
+                                            Margin="8,0,0,0"
+                                            VerticalAlignment="Center"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="{Binding MeetingSummary}" />
+                                    </Grid>
+                                </Border>
+
+                                <Grid Grid.Row="2">
+                                    <StackPanel
+                                        HorizontalAlignment="Center"
+                                        IsHitTestVisible="False"
+                                        MaxWidth="380"
+                                        VerticalAlignment="Center"
+                                        Spacing="7"
+                                        Visibility="{Binding TranscriptEmptyVisibility}">
+                                        <TextBlock HorizontalAlignment="Center" FontSize="20" FontWeight="SemiBold" Text="这场圆桌还没有公开发言" />
+                                        <TextBlock
+                                            TextAlignment="Center"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="启动会议后，在下方以“我”的身份发送公开消息；所有角色都能看到，@ 只决定谁需要回应。"
+                                            TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <ListView
+                                        x:Name="TranscriptList"
+                                        Padding="14,8,18,8"
+                                        ItemsSource="{Binding Transcript}"
+                                        SelectionMode="None">
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate x:DataType="models:TranscriptItem">
+                                                <Border Margin="2,5" Padding="15" Background="{ThemeResource LayerFillColorDefaultBrush}" CornerRadius="10">
+                                                    <StackPanel Spacing="7">
+                                                        <Grid>
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="*" />
+                                                                <ColumnDefinition Width="Auto" />
+                                                            </Grid.ColumnDefinitions>
+                                                            <Button
+                                                                Padding="0"
+                                                                HorizontalAlignment="Left"
+                                                                Background="Transparent"
+                                                                BorderThickness="0"
+                                                                Click="TranscriptSpeaker_Click"
+                                                                Content="{x:Bind Speaker}"
+                                                                FontWeight="SemiBold"
+                                                                Tag="{x:Bind RoleId}" />
+                                                            <TextBlock Grid.Column="1" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind TimeLabel}" />
+                                                        </Grid>
+                                                        <TextBlock Text="{x:Bind Text, Mode=OneWay}" TextWrapping="Wrap" />
+                                                        <TextBlock FontSize="11" Foreground="#0F6CBD" Text="{x:Bind State, Mode=OneWay}" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
+                                </Grid>
+
+                                <Grid
+                                    Grid.Row="3"
+                                    Padding="16,12,16,14"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="0,1,0,0"
+                                    RowSpacing="8">
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
-                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
-                                    <TextBox Header="角色名称" PlaceholderText="系统策划" Text="{Binding TemporaryRoleName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBox Grid.Column="1" Header="本次邀请目的" PlaceholderText="为本场会议制定可执行系统方案" Text="{Binding TemporaryRolePurpose, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                    <TextBox
-                                        Grid.Row="1"
-                                        Grid.ColumnSpan="2"
-                                        MinHeight="76"
-                                        AcceptsReturn="True"
-                                        Header="完整 System Prompt"
-                                        PlaceholderText="定义职责、边界、输出格式与禁止事项……"
-                                        Text="{Binding TemporaryRoleSystemPrompt, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                        TextWrapping="Wrap" />
-                                    <ComboBox
-                                        Grid.Row="2"
-                                        Header="本会话模型路由"
-                                        ItemsSource="{Binding Models}"
-                                        SelectedItem="{Binding SelectedInvitationModel, Mode=TwoWay}" />
-                                    <ComboBox
-                                        Grid.Row="2"
-                                        Grid.Column="1"
-                                        Header="邀请者"
-                                        ItemsSource="{Binding InvitationInviterOptions}"
-                                        SelectedValue="{Binding InvitationInviterId, Mode=TwoWay}"
-                                        SelectedValuePath="Value" />
-                                    <ComboBox
-                                        Grid.Row="3"
-                                        Header="闭会处置"
-                                        ItemsSource="{Binding RetentionOptions}"
-                                        SelectedValue="{Binding InvitationRetentionPolicy, Mode=TwoWay}"
-                                        SelectedValuePath="Value" />
-                                    <ComboBox
-                                        Grid.Row="3"
-                                        Grid.Column="1"
-                                        Header="网络访问"
-                                        ItemsSource="{Binding NetworkAccessOptions}"
-                                        SelectedValue="{Binding InvitationNetworkAccess, Mode=TwoWay}"
-                                        SelectedValuePath="Value" />
-                                    <ListView
-                                        Grid.Row="4"
-                                        Grid.ColumnSpan="2"
-                                        MaxHeight="112"
-                                        Header="本会话 Skill / MCP 授权"
-                                        ItemsSource="{Binding InvitationCapabilities}"
-                                        SelectionMode="None">
+                                    <ListView MaxHeight="44" ItemsSource="{Binding MentionTargets}" SelectionMode="None">
+                                        <ListView.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <ItemsStackPanel Orientation="Horizontal" />
+                                            </ItemsPanelTemplate>
+                                        </ListView.ItemsPanel>
                                         <ListView.ItemTemplate>
-                                            <DataTemplate x:DataType="models:CapabilityGrantItem">
-                                                <CheckBox Padding="2,4" IsChecked="{x:Bind IsGranted, Mode=TwoWay}">
-                                                    <TextBlock Text="{x:Bind DisplayName}" />
-                                                </CheckBox>
+                                            <DataTemplate x:DataType="models:MentionTargetItem">
+                                                <CheckBox Margin="0,0,8,0" Content="{x:Bind DisplayName}" IsChecked="{x:Bind IsMentioned, Mode=TwoWay}" />
                                             </DataTemplate>
                                         </ListView.ItemTemplate>
                                     </ListView>
-                                    <TextBlock
-                                        Grid.Row="5"
-                                        Grid.ColumnSpan="2"
-                                        VerticalAlignment="Center"
-                                        FontSize="11"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                        Text="权限采用最小授权；当前 MCP 工具白名单为空、始终审批、优先委派 SubAgent，精细编辑仍为 planned。"
+                                    <TextBox
+                                        x:Name="PromptBox"
+                                        Grid.Row="1"
+                                        MinHeight="86"
+                                        AcceptsReturn="True"
+                                        Header="我 · 公开发言"
+                                        PlaceholderText="表达意见或给出约束；未选择 @ 时由所有角色依次回应……"
                                         TextWrapping="Wrap" />
-                                    <Button
-                                        Grid.Row="6"
-                                        Grid.Column="1"
-                                        HorizontalAlignment="Right"
-                                        Click="AddTemporaryRole_Click"
-                                        Content="发送邀请并创建"
-                                        IsEnabled="{Binding CanInviteTemporaryRole}"
-                                        Style="{StaticResource AccentButtonStyle}" />
-                                </Grid>
-                            </ScrollViewer>
-                        </Expander>
-                        <TextBox
-                            x:Name="PromptBox"
-                            MinHeight="68"
-                            AcceptsReturn="True"
-                            Header="给所选参与者的议题或约束"
-                            PlaceholderText="说明目标、上下文和期望输出……"
-                            TextWrapping="Wrap" />
-                        <Grid ColumnSpacing="8">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock VerticalAlignment="Center" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="所有写操作携带当前 Runtime Generation" />
-                            <Button Grid.Column="1" MinHeight="40" Click="CancelGeneration_Click" Content="停止" IsEnabled="{Binding CanOperate}" />
-                            <Button Grid.Column="2" MinHeight="40" Click="Interrupt_Click" Content="打断并接管" IsEnabled="{Binding CanOperate}" />
-                            <Button Grid.Column="3" MinHeight="40" Click="SendPrompt_Click" Content="发送" IsEnabled="{Binding CanSend}" Style="{StaticResource AccentButtonStyle}" />
-                        </Grid>
-                    </StackPanel>
-                </Grid>
-            </Border>
-
-            <!-- Context inspector: role capabilities and durable provider catalog. -->
-            <Border
-                Grid.Column="2"
-                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                BorderThickness="1"
-                CornerRadius="14">
-                <TabView x:Name="ContextTabs" IsAddTabButtonVisible="False" TabWidthMode="Equal">
-                    <TabViewItem Header="角色" IsClosable="False">
-                        <ScrollViewer Padding="17">
-                            <StackPanel Spacing="13">
-                                <StackPanel Spacing="3">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="{Binding SelectedRole.DisplayName}" />
-                                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding SelectedRole.Summary}" />
-                                </StackPanel>
-                                <Grid ColumnSpacing="8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Border Padding="9,6" Background="#140F6CBD" CornerRadius="8">
-                                        <TextBlock FontSize="11" Foreground="#0F6CBD" Text="{Binding SelectedRole.CapabilitiesSummary}" />
-                                    </Border>
-                                    <Border Grid.Column="1" Padding="9,6" Background="#140B6E69" CornerRadius="8">
-                                        <TextBlock FontSize="11" Foreground="#0B6E69" Text="网络 · SubAgent 必需" />
-                                    </Border>
-                                </Grid>
-                                <TextBox
-                                    MinHeight="150"
-                                    AcceptsReturn="True"
-                                    Header="System Prompt"
-                                    IsEnabled="{Binding IsRoleConfigurationEditable}"
-                                    Text="{Binding SelectedRole.SystemPrompt, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                                    TextWrapping="Wrap" />
-                                <ComboBox
-                                    Header="该角色使用的模型"
-                                    IsEnabled="{Binding IsRoleConfigurationEditable}"
-                                    ItemsSource="{Binding Models}"
-                                    SelectedItem="{Binding SelectedRoleModel, Mode=TwoWay}" />
-                                <StackPanel Spacing="4">
-                                    <TextBlock FontWeight="SemiBold" Text="Skills / MCP 显式授权" />
-                                    <TextBlock
-                                        FontSize="11"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                        Text="未勾选即不可用；MCP 目前仅保存授权策略，执行器仍为 planned。"
-                                        TextWrapping="Wrap" />
-                                </StackPanel>
-                                <ListView
-                                    MaxHeight="190"
-                                    IsEnabled="{Binding IsRoleConfigurationEditable}"
-                                    ItemsSource="{Binding AvailableCapabilities}"
-                                    SelectionMode="None">
-                                    <ListView.ItemTemplate>
-                                        <DataTemplate x:DataType="models:CapabilityGrantItem">
-                                            <CheckBox Padding="2,6" IsChecked="{x:Bind IsGranted, Mode=TwoWay}">
-                                                <StackPanel Spacing="2">
-                                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
-                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Summary}" />
-                                                </StackPanel>
-                                            </CheckBox>
-                                        </DataTemplate>
-                                    </ListView.ItemTemplate>
-                                </ListView>
-                                <Border Padding="12" Background="#149A6700" CornerRadius="9">
-                                    <StackPanel Spacing="3">
-                                        <TextBlock FontWeight="SemiBold" Foreground="#9A6700" Text="长期记忆与提示词演进" />
+                                    <Grid Grid.Row="2">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
                                         <TextBlock
+                                            VerticalAlignment="Center"
                                             FontSize="11"
                                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                            Text="策略已持久化；记忆内容存储与提示词演进执行仍为 planned。"
-                                            TextWrapping="Wrap" />
-                                    </StackPanel>
-                                </Border>
-                                <Button
-                                    Click="SaveRole_Click"
-                                    Content="保存长期角色配置"
-                                    IsEnabled="{Binding IsRoleConfigurationEditable}"
-                                    Style="{StaticResource AccentButtonStyle}" />
-                                <Grid ColumnSpacing="8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <Button Click="PromoteRole_Click" Content="转为长期" IsEnabled="{Binding CanPromoteSelectedRole}" />
-                                    <Button Grid.Column="1" Click="ArchiveRole_Click" Content="归档" IsEnabled="{Binding CanArchiveSelectedRole}" />
+                                            Text="所有角色都能看到公开发言；@ 仅控制本轮回应者。" />
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                            <Button Click="Interrupt_Click" Content="打断并接管" IsEnabled="{Binding CanOperate}" />
+                                            <Button Click="SendPrompt_Click" Content="发送" IsEnabled="{Binding CanSend}" Style="{StaticResource AccentButtonStyle}" />
+                                        </StackPanel>
+                                    </Grid>
                                 </Grid>
-                            </StackPanel>
-                        </ScrollViewer>
-                    </TabViewItem>
+                            </Grid>
+                        </Border>
+                    </SplitView>
+                </Grid>
 
-                    <TabViewItem Header="提供商" IsClosable="False">
-                        <ScrollViewer Padding="17">
-                            <StackPanel Spacing="12">
-                                <StackPanel Spacing="3">
-                                    <TextBlock FontSize="19" FontWeight="SemiBold" Text="长期模型目录" />
-                                    <TextBlock
-                                        FontSize="11"
-                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                        Text="非敏感配置写入 JSON；密钥只写 Windows Credential Manager。"
-                                        TextWrapping="Wrap" />
-                                </StackPanel>
-                                <Grid ColumnSpacing="8">
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-                                    <ComboBox IsEnabled="{Binding IsRoleConfigurationEditable}" ItemsSource="{Binding Providers}" SelectedItem="{Binding SelectedProvider, Mode=TwoWay}" />
-                                    <Button Grid.Column="1" Click="BeginNewProvider_Click" Content="新建" IsEnabled="{Binding IsRoleConfigurationEditable}" />
+                <Grid x:Name="RoleManagementPage" Visibility="Collapsed">
+                    <SplitView
+                        x:Name="RoleManagementSplitView"
+                        CompactPaneLength="0"
+                        DisplayMode="Overlay"
+                        IsPaneOpen="False"
+                        OpenPaneLength="288"
+                        PanePlacement="Left">
+                        <SplitView.Pane>
+                            <Border
+                                Margin="0,0,12,0"
+                                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                BorderThickness="1"
+                                CornerRadius="14">
+                                <Grid Width="288" Padding="14" RowSpacing="10">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock FontSize="18" FontWeight="SemiBold" Text="长期角色" />
+                                        <Button Grid.Column="1" Click="NewLongTermRole_Click" Content="＋" IsEnabled="{Binding IsRoleConfigurationEditable}" />
+                                    </Grid>
+                                    <ListView Grid.Row="1" ItemsSource="{Binding LongTermRoles}" SelectedItem="{Binding SelectedRole, Mode=TwoWay}">
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate x:DataType="models:RoleItem">
+                                                <StackPanel Padding="5,8" Spacing="3">
+                                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind CapabilitiesSummary, Mode=OneWay}" />
+                                                </StackPanel>
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
                                 </Grid>
-                                <TextBox Header="显示名称" IsEnabled="{Binding IsRoleConfigurationEditable}" Text="{Binding ProviderDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                <TextBox Header="Runtime Provider ID" IsEnabled="{Binding IsRoleConfigurationEditable}" PlaceholderText="openai / anthropic / google" Text="{Binding RuntimeProviderId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                <ComboBox Header="API 家族" IsEnabled="{Binding IsRoleConfigurationEditable}" ItemsSource="{Binding ApiFamilies}" SelectedItem="{Binding ApiFamily, Mode=TwoWay}" />
-                                <TextBox Header="可选端点" IsEnabled="{Binding IsRoleConfigurationEditable}" PlaceholderText="HTTPS 或回环 HTTP" Text="{Binding ProviderEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                <TextBox Header="模型显示名称" IsEnabled="{Binding IsRoleConfigurationEditable}" Text="{Binding ModelDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                <TextBox Header="模型 ID" IsEnabled="{Binding IsRoleConfigurationEditable}" Text="{Binding ModelId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                <PasswordBox x:Name="ProviderApiKeyBox" Header="API Key（留空则保留现有值）" IsEnabled="{Binding IsRoleConfigurationEditable}" PasswordRevealMode="Peek" />
-                                <Button Click="SaveProvider_Click" Content="保存提供商、模型与凭据" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
-                                <Rectangle Height="1" Margin="0,4" Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
-                                <TextBlock FontWeight="SemiBold" Text="Runtime Owner" />
-                                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Windows · 本机进程 · .NET 10" />
-                                <TextBlock FontWeight="SemiBold" Text="代次 / 事件序号" />
-                                <TextBlock FontFamily="Cascadia Mono" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding GenerationSummary}" />
-                            </StackPanel>
+                            </Border>
+                        </SplitView.Pane>
+                        <ScrollViewer>
+                            <Grid MaxWidth="920" Padding="20" HorizontalAlignment="Center">
+                                <StackPanel Spacing="14">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Button Click="ToggleRoleList_Click" Content="☰" ToolTipService.ToolTip="角色列表" />
+                                        <StackPanel Grid.Column="1" Margin="12,0,0,0" Spacing="3">
+                                            <TextBlock FontSize="24" FontWeight="SemiBold" Text="角色管理" />
+                                            <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="长期角色的模型、系统提示词、Skill、MCP 与记忆策略" />
+                                        </StackPanel>
+                                    </Grid>
+                                    <Border Style="{StaticResource SectionCardStyle}">
+                                        <StackPanel Spacing="12">
+                                            <TextBlock FontSize="20" FontWeight="SemiBold" Text="{Binding SelectedRole.DisplayName}" />
+                                            <TextBox
+                                                MinHeight="220"
+                                                AcceptsReturn="True"
+                                                Header="System Prompt"
+                                                IsEnabled="{Binding IsRoleConfigurationEditable}"
+                                                Text="{Binding SelectedRole.SystemPrompt, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                TextWrapping="Wrap" />
+                                            <ComboBox
+                                                Header="该角色使用的模型"
+                                                IsEnabled="{Binding IsRoleConfigurationEditable}"
+                                                ItemsSource="{Binding Models}"
+                                                SelectedItem="{Binding SelectedRoleModel, Mode=TwoWay}" />
+                                            <TextBlock FontWeight="SemiBold" Text="Skill / MCP 显式授权" />
+                                            <ListView MaxHeight="240" ItemsSource="{Binding AvailableCapabilities}" SelectionMode="None">
+                                                <ListView.ItemTemplate>
+                                                    <DataTemplate x:DataType="models:CapabilityGrantItem">
+                                                        <CheckBox Padding="2,6" IsChecked="{x:Bind IsGranted, Mode=TwoWay}">
+                                                            <StackPanel Spacing="2">
+                                                                <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                                                <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Summary}" />
+                                                            </StackPanel>
+                                                        </CheckBox>
+                                                    </DataTemplate>
+                                                </ListView.ItemTemplate>
+                                            </ListView>
+                                            <Border Padding="12" Background="#149A6700" CornerRadius="9">
+                                                <StackPanel Spacing="3">
+                                                    <TextBlock FontWeight="SemiBold" Foreground="#9A6700" Text="长期记忆与提示词演进" />
+                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="策略已持久化；记忆内容写入和提示词自优化执行仍为 planned。" TextWrapping="Wrap" />
+                                                </StackPanel>
+                                            </Border>
+                                            <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
+                                                <Button Click="ArchiveRole_Click" Content="归档" IsEnabled="{Binding CanArchiveSelectedRole}" />
+                                                <Button Click="SaveRole_Click" Content="保存角色配置" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </StackPanel>
+                            </Grid>
                         </ScrollViewer>
-                    </TabViewItem>
-                </TabView>
-            </Border>
-        </Grid>
+                    </SplitView>
+                </Grid>
+
+                <ScrollViewer x:Name="SkillPage" Visibility="Collapsed">
+                    <Grid MaxWidth="940" Padding="20" HorizontalAlignment="Center">
+                        <StackPanel Spacing="16">
+                            <StackPanel Spacing="3">
+                                <TextBlock FontSize="24" FontWeight="SemiBold" Text="Skill" />
+                                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="公共 Skill 目录与 Git 来源登记" />
+                            </StackPanel>
+                            <Border Style="{StaticResource SectionCardStyle}">
+                                <ContentControl HorizontalContentAlignment="Stretch" IsEnabled="{Binding IsRoleConfigurationEditable}">
+                                <StackPanel Spacing="10">
+                                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="从 Git 平台导入" />
+                                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="本里程碑登记来源和风险级别；Runtime Host 安装、内容摘要与 LLM 安全审计仍为 planned。" TextWrapping="Wrap" />
+                                    <TextBox Header="名称" Text="{Binding SkillDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBox Header="说明" Text="{Binding SkillDescription, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBox Header="GitHub / Git HTTPS 地址" PlaceholderText="https://github.com/org/repo/tree/main/skill" Text="{Binding SkillSourceLocator, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <Button HorizontalAlignment="Right" Click="SaveSkill_Click" Content="登记到公共 Skill 目录" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                                </ContentControl>
+                            </Border>
+                            <TextBlock FontSize="18" FontWeight="SemiBold" Text="已登记 Skill" />
+                            <ListView ItemsSource="{Binding Skills}" SelectionMode="None">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="models:SkillProfileConfiguration">
+                                        <Border Margin="0,4" Padding="14" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="10">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                                <TextBlock Text="{x:Bind Description}" TextWrapping="Wrap" />
+                                                <TextBlock FontFamily="Cascadia Mono" FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Source.Locator}" TextWrapping="Wrap" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+
+                <ScrollViewer x:Name="McpPage" Visibility="Collapsed">
+                    <Grid MaxWidth="940" Padding="20" HorizontalAlignment="Center">
+                        <StackPanel Spacing="16">
+                            <StackPanel Spacing="3">
+                                <TextBlock FontSize="24" FontWeight="SemiBold" Text="MCP" />
+                                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="公共 MCP 服务器目录与最小授权入口" />
+                            </StackPanel>
+                            <Border Style="{StaticResource SectionCardStyle}">
+                                <ContentControl HorizontalContentAlignment="Stretch" IsEnabled="{Binding IsRoleConfigurationEditable}">
+                                <StackPanel Spacing="10">
+                                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="登记 MCP 服务器" />
+                                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="可登记 stdio 命令或 HTTPS 端点；Git 仓库的 LLM 配置解析与执行器接入仍为 planned。" TextWrapping="Wrap" />
+                                    <TextBox Header="名称" Text="{Binding McpDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <ComboBox Header="传输" ItemsSource="{Binding McpTransports}" SelectedItem="{Binding McpTransport, Mode=TwoWay}" />
+                                    <TextBox Header="命令或端点" Text="{Binding McpCommandOrEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <Button HorizontalAlignment="Right" Click="SaveMcp_Click" Content="登记到公共 MCP 目录" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                                </ContentControl>
+                            </Border>
+                            <TextBlock FontSize="18" FontWeight="SemiBold" Text="已登记 MCP" />
+                            <ListView ItemsSource="{Binding McpServers}" SelectionMode="None">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate x:DataType="models:McpServerProfileConfiguration">
+                                        <Border Margin="0,4" Padding="14" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}" BorderThickness="1" CornerRadius="10">
+                                            <StackPanel Spacing="4">
+                                                <TextBlock FontWeight="SemiBold" Text="{x:Bind DisplayName}" />
+                                                <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Transport}" />
+                                                <TextBlock FontFamily="Cascadia Mono" FontSize="11" Text="{x:Bind Command}" TextWrapping="Wrap" />
+                                                <TextBlock FontFamily="Cascadia Mono" FontSize="11" Text="{x:Bind Endpoint}" TextWrapping="Wrap" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+
+                <ScrollViewer x:Name="SettingsPage" Visibility="Collapsed">
+                    <Grid MaxWidth="940" Padding="20" HorizontalAlignment="Center">
+                        <StackPanel Spacing="16">
+                            <StackPanel Spacing="3">
+                                <TextBlock FontSize="24" FontWeight="SemiBold" Text="设置" />
+                                <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="提供商、模型、远端同步与客户端外观" />
+                            </StackPanel>
+
+                            <Border Style="{StaticResource SectionCardStyle}">
+                                <ContentControl HorizontalContentAlignment="Stretch" IsEnabled="{Binding IsRoleConfigurationEditable}">
+                                <StackPanel Spacing="12">
+                                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="提供商与模型" />
+                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="非敏感配置写入长期 JSON；密钥只写 Windows Credential Manager。" TextWrapping="Wrap" />
+                                    <Grid ColumnSpacing="8">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <ComboBox ItemsSource="{Binding Providers}" SelectedItem="{Binding SelectedProvider, Mode=TwoWay}" />
+                                        <Button Grid.Column="1" Click="BeginNewProvider_Click" Content="新建" IsEnabled="{Binding IsRoleConfigurationEditable}" />
+                                    </Grid>
+                                    <TextBox Header="显示名称" Text="{Binding ProviderDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBox Header="Runtime Provider ID" PlaceholderText="openai / anthropic / google" Text="{Binding RuntimeProviderId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <ComboBox Header="API 家族" ItemsSource="{Binding ApiFamilies}" SelectedItem="{Binding ApiFamily, Mode=TwoWay}" />
+                                    <TextBox Header="可选端点" PlaceholderText="HTTPS 或回环 HTTP" Text="{Binding ProviderEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBox Header="模型显示名称" Text="{Binding ModelDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <TextBox Header="模型 ID" Text="{Binding ModelId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <PasswordBox x:Name="ProviderApiKeyBox" Header="API Key（留空则保留现有值）" PasswordRevealMode="Peek" />
+                                    <Button HorizontalAlignment="Right" Click="SaveProvider_Click" Content="保存提供商、模型与凭据" Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                                </ContentControl>
+                            </Border>
+
+                            <Border Style="{StaticResource SectionCardStyle}">
+                                <ContentControl HorizontalContentAlignment="Stretch" IsEnabled="{Binding IsRoleConfigurationEditable}">
+                                <StackPanel Spacing="12">
+                                    <TextBlock FontSize="18" FontWeight="SemiBold" Text="客户端与远端同步" />
+                                    <ComboBox Header="配色模式" ItemsSource="{Binding ThemeOptions}" SelectedValue="{Binding ThemeMode, Mode=TwoWay}" SelectedValuePath="Value" />
+                                    <ToggleSwitch Header="启用远端 Linux 同步服务器" IsOn="{Binding RemoteSyncEnabled, Mode=TwoWay}" />
+                                    <TextBox Header="同步服务器端点" PlaceholderText="https://roundtable.example.com" Text="{Binding RemoteSyncEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                    <PasswordBox x:Name="SyncCredentialBox" Header="同步凭据（留空则保留）" PasswordRevealMode="Peek" />
+                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="端点与凭据持久化已实现；远端连接、鉴权和加密同步仍为 pending。" TextWrapping="Wrap" />
+                                    <Button HorizontalAlignment="Right" Click="SaveClientSettings_Click" Content="保存客户端设置" Style="{StaticResource AccentButtonStyle}" />
+                                </StackPanel>
+                                </ContentControl>
+                            </Border>
+
+                            <Border Style="{StaticResource SectionCardStyle}">
+                                <StackPanel Spacing="5">
+                                    <TextBlock FontWeight="SemiBold" Text="Runtime Owner" />
+                                    <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="Windows · 本机进程 · .NET 10" />
+                                    <TextBlock Margin="0,8,0,0" FontWeight="SemiBold" Text="代次 / 事件序号" />
+                                    <TextBlock FontFamily="Cascadia Mono" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding GenerationSummary}" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
+                </ScrollViewer>
+            </Grid>
+        </SplitView>
     </Grid>
 </Window>

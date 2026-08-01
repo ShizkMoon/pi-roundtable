@@ -52,7 +52,7 @@ internal sealed class RoundtableSessionStore
             {
                 throw new InvalidDataException($"会话配置版本不受支持：{path}");
             }
-            sessions.Add(session);
+            sessions.Add(ConfigurationNormalizer.Normalize(session));
         }
         return sessions.OrderByDescending(session => session.UpdatedAt).ToArray();
     }
@@ -62,6 +62,7 @@ internal sealed class RoundtableSessionStore
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(session);
+        ConfigurationNormalizer.Normalize(session);
         if (!SafeIdPattern.IsMatch(session.SessionId))
         {
             throw new InvalidDataException("会话 ID 不符合公共协议，无法安全持久化。");

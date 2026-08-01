@@ -134,6 +134,13 @@ export interface WorkspaceDefaults {
   delegation?: DelegationPolicy;
 }
 
+export interface SessionGroupProfile {
+  groupId: string;
+  displayName: string;
+  kind: "project" | "folder";
+  sortOrder: number;
+}
+
 export interface WorkspaceProfile {
   configurationVersion: WorkspaceConfigurationVersion;
   workspaceId: string;
@@ -144,6 +151,7 @@ export interface WorkspaceProfile {
   skills: SkillProfile[];
   mcpServers: McpServerProfile[];
   roles: RoleProfile[];
+  sessionGroups?: SessionGroupProfile[];
   defaults?: WorkspaceDefaults;
 }
 
@@ -195,9 +203,23 @@ export interface RoundtableSession {
   sessionId: string;
   workspaceId: string;
   title: string;
+  groupId?: string;
   phase: "draft" | "live" | "closed";
   createdAt: string;
   updatedAt: string;
   agenda: SessionAgenda;
   participants: ParticipantManifest[];
+  messages?: SessionMessage[];
+}
+
+export interface SessionMessage {
+  messageId: string;
+  kind: "host" | "role" | "system";
+  speakerId: string;
+  speakerName: string;
+  visibility: "public" | "private";
+  audienceRoleIds: string[];
+  text: string;
+  state: "submitted" | "streaming" | "completed" | "cancelled";
+  occurredAt: string;
 }

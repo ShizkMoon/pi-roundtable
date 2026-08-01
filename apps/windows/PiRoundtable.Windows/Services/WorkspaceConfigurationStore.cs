@@ -47,7 +47,7 @@ internal sealed class WorkspaceConfigurationStore
         {
             throw new InvalidDataException("工作区配置版本不受支持。");
         }
-        return configuration;
+        return ConfigurationNormalizer.Normalize(configuration);
     }
 
     public async Task SaveAsync(
@@ -55,6 +55,7 @@ internal sealed class WorkspaceConfigurationStore
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(configuration);
+        ConfigurationNormalizer.Normalize(configuration);
         configuration.ConfigurationVersion = 1;
         configuration.UpdatedAt = DateTimeOffset.UtcNow;
         var directory = Path.GetDirectoryName(_configurationPath)

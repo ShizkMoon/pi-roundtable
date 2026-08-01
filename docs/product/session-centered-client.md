@@ -2,24 +2,25 @@
 
 ## Product job
 
-Pi Roundtable is a native Windows deliberation workspace for one human host who conducts durable, multi-role Agent sessions. The primary task is to reopen a session, understand who is present and what each participant may do, then continue the discussion without rebuilding runtime configuration. The current milestone restores the session definition and participant manifests; normalized transcript/event replay remains planned and must not yet be described as implemented.
+Pi Roundtable is a native Windows deliberation workspace for one human host who conducts durable, multi-role Agent sessions. The primary task is to reopen a session, understand who is present and what each participant may do, then continue the discussion without rebuilding runtime configuration. The current milestone restores the session definition, participant manifests, and normalized public/private message projections. Full normalized event-log replay remains planned and must not be described as implemented.
 
 ## Information architecture
 
 ```text
-┌─ Workspace rail ─────┬─ Active session ─────────────────────┬─ Context inspector ─────────┐
-│ + New session        │ title · phase · runtime owner        │ Participant                  │
-│ Recent sessions      │ agenda and participant strip         │  Overview                    │
-│  Architecture review │                                      │  Prompt                      │
-│  Product planning    │ normalized transcript                │  Model route                 │
-│                      │                                      │  Skills                      │
-│ Roles                │                                      │  MCP / tools                 │
-│ Capability library   │ composer · target · interrupt        │  Memory / retention          │
-│ Providers & models   │                                      │                              │
-└──────────────────────┴──────────────────────────────────────┴──────────────────────────────┘
+┌─ Session and page rail ┬─ Public meeting record ─────────────┬─ Private context ───────────┐
+│ group: folder/project  │ title · phase · participants        │ private chat with one role   │
+│ + New session          │                                     │ or                           │
+│ grouped sessions       │ public role and host messages       │ role status / prompt /       │
+│                        │                                     │ safe activity summary        │
+│ Current roundtable     │ @ one or more roles                 │                              │
+│ Role management       │ host composer visible to all roles  │ back to private chat         │
+│ Skill                  │                                     │                              │
+│ MCP                    │                                     │                              │
+│ Settings               │                                     │                              │
+└────────────────────────┴─────────────────────────────────────┴──────────────────────────────┘
 ```
 
-The session rail replaces the original role-first navigation. Roles remain visible inside the active session and in a reusable role library. Selecting a participant opens one inspector with the same vocabulary for long-term and temporary roles; temporary roles additionally show inviter, session-only scope, and end-of-session retention.
+The session rail replaces the original role-first navigation. Sessions may be filtered by project-style or folder-style groups. Role management, Skill, MCP, and Settings are separate workspace pages rather than right-column tabs. The center column belongs only to the public meeting record and host composer. The right column normally carries a private one-role thread; selecting a speaker in the public record temporarily replaces it with a safe role inspector and provides an explicit back path.
 
 ## Role editor
 
@@ -59,6 +60,16 @@ Segoe UI Variable carries interface text; Cascadia Mono is reserved for model ID
 - Grant changes during a live session are commands and normalized events, not silent local edits.
 - Network-heavy capabilities default to isolated SubAgent execution with summary-and-citation return.
 - Empty and error states name the missing configuration and link directly to the relevant editor.
+- A host message may mention one or more roles, but it remains public and is eventually available to every participant's public context.
+- A private host message is visible only to the host and its selected role. It is never injected into another role's context.
+- The role inspector reports normalized status and activity summaries. Provider chain-of-thought and hidden reasoning are not a client surface.
+- At wide widths all three meeting columns are visible. Medium widths keep the session rail and move private context to an overlay; compact widths move both side panes to overlays.
+
+## Milestone status
+
+- **Implemented:** session groups; separate Role/Skill/MCP/Settings pages; per-session public and private message projections; public multi-mention commands; one-role private commands; safe role-detail/back flow; native adaptive side panes; durable provider/model/theme/sync settings (sync credential remains in Credential Manager).
+- **Scaffolded:** Git-based Skill/MCP catalog registration and remote synchronization configuration.
+- **Planned:** LLM-assisted repository inspection, installation and security review; MCP execution and per-tool approval UI; authenticated/E2EE remote synchronization; full event-log persistence and replay.
 
 ## Reference boundaries
 

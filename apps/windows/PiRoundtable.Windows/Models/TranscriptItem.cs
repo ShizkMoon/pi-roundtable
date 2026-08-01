@@ -8,18 +8,39 @@ public sealed class TranscriptItem : INotifyPropertyChanged
     private string _text;
     private string _state;
 
-    public TranscriptItem(string roleId, string speaker, string text, string state)
+    public TranscriptItem(
+        string roleId,
+        string speaker,
+        string text,
+        string state,
+        string kind = "role",
+        string visibility = "public",
+        IEnumerable<string>? audienceRoleIds = null,
+        string? messageId = null,
+        DateTimeOffset? occurredAt = null)
     {
+        MessageId = messageId ?? $"message.{Guid.NewGuid():N}";
         RoleId = roleId;
         Speaker = speaker;
+        Kind = kind;
+        Visibility = visibility;
+        AudienceRoleIds = audienceRoleIds?.Distinct(StringComparer.Ordinal).ToArray() ?? [];
         _text = text;
         _state = state;
-        OccurredAt = DateTimeOffset.Now;
+        OccurredAt = occurredAt ?? DateTimeOffset.Now;
     }
+
+    public string MessageId { get; }
 
     public string RoleId { get; }
 
     public string Speaker { get; }
+
+    public string Kind { get; }
+
+    public string Visibility { get; }
+
+    public IReadOnlyList<string> AudienceRoleIds { get; }
 
     public DateTimeOffset OccurredAt { get; }
 

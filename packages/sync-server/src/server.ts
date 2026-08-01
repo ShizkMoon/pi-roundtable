@@ -103,6 +103,10 @@ function writeSse(response: ServerResponse, event: MeetingEvent): void {
   response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
+function isPublicEvent(event: MeetingEvent): boolean {
+  return event.visibility !== "private";
+}
+
 export function createSyncServer(store = new InMemoryMeetingStore()): Server {
   return createServer(async (request, response) => {
     try {
@@ -124,11 +128,16 @@ export function createSyncServer(store = new InMemoryMeetingStore()): Server {
         const meetingId = decodeSegment(eventsMatch[1] ?? "");
         if (method === "GET") {
           const after = parseCursor(url.searchParams.get("after"));
-          sendJson(response, 200, { events: store.eventsAfter(meetingId, after) });
+          sendJson(response, 200, {
+            events: store.eventsAfter(meetingId, after).filter(isPublicEvent),
+          });
           return;
         }
         if (method === "POST") {
           const body = await readJsonObject(request);
+          if (body.visibility === "private") {
+            throw new Error("private events require authenticated audience filtering and are not accepted by the development sync server");
+          }
           const kind = body.kind;
           if (!isMeetingEventKind(kind) || kind.startsWith("runtime.lease_")) {
             throw new Error("kind must be a non-lease meeting event kind");
@@ -142,6 +151,7 @@ export function createSyncServer(store = new InMemoryMeetingStore()): Server {
             ownerRuntimeId: requiredString(body, "ownerRuntimeId"),
             runtimeGeneration: generation as number,
             kind,
+            visibility: "public",
             payload: jsonObject(body.payload),
             ...(body.actorId !== undefined ? { actorId: optionalNullableString(body, "actorId") } : {}),
             ...(body.targetId !== undefined ? { targetId: optionalNullableString(body, "targetId") } : {}),
@@ -169,10 +179,14 @@ export function createSyncServer(store = new InMemoryMeetingStore()): Server {
           "x-accel-buffering": "no",
         });
         response.write(": connected\n\n");
-        for (const event of store.eventsAfter(meetingId, after)) {
+        for (const event of store.eventsAfter(meetingId, after).filter(isPublicEvent)) {
           writeSse(response, event);
         }
-        const unsubscribe = store.subscribe(meetingId, (event) => writeSse(response, event));
+        const unsubscribe = store.subscribe(meetingId, (event) => {
+          if (isPublicEvent(event)) {
+            writeSse(response, event);
+          }
+        });
         const keepAlive = setInterval(() => response.write(": keepalive\n\n"), 15_000);
         keepAlive.unref();
         request.once("close", () => {
