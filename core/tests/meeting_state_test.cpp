@@ -78,6 +78,18 @@ void c_api_exposes_stable_boundary() {
     check(pr_meeting_runtime_generation(meeting) == 1, "C API should expose generation");
     check(pr_meeting_has_active_lease(meeting) == 1, "C API should expose lease state");
     check(std::string{pr_meeting_runtime_owner(meeting)} == "runtime.windows", "C API should expose owner");
+    const pr_event oversized_audience{
+        2,
+        1,
+        PR_EVENT_MESSAGE_DIRECT_SENT,
+        "user.direct_host",
+        "role.secretary",
+        PR_EVENT_VISIBILITY_PRIVATE,
+        nullptr,
+        4'097,
+    };
+    check(pr_meeting_apply(meeting, &oversized_audience).error == PR_APPLY_INVALID_AUDIENCE,
+        "C API should reject unbounded audience arrays before allocation");
     pr_meeting_destroy(meeting);
 }
 
@@ -255,6 +267,7 @@ void private_events_advance_sequence_without_taking_public_floor() {
         "user.direct_host",
         "role.secretary",
         EventVisibility::Private,
+        {"user.direct_host", "role.secretary"},
     });
     apply_ok(state, {
         6,
@@ -263,6 +276,7 @@ void private_events_advance_sequence_without_taking_public_floor() {
         "role.secretary",
         "user.direct_host",
         EventVisibility::Private,
+        {"user.direct_host", "role.secretary"},
     });
     check(!state.active_speaker_id().has_value(),
         "private speech must not claim the public meeting floor");
@@ -282,6 +296,7 @@ void private_events_are_restricted_to_direct_conversation_kinds() {
         "runtime.windows",
         "",
         EventVisibility::Private,
+        {"runtime.windows"},
     });
     check(private_close.error == ApplyError::InvalidTransition,
         "private lifecycle events must not bypass the public meeting state machine");
@@ -294,6 +309,7 @@ void private_events_are_restricted_to_direct_conversation_kinds() {
         "role.secretary",
         "role.secretary",
         EventVisibility::Private,
+        {"role.secretary"},
     });
     check(wrong_direct_actor.error == ApplyError::InvalidActor,
         "only the direct host may initiate a private message");
@@ -305,6 +321,7 @@ void private_events_are_restricted_to_direct_conversation_kinds() {
         "role.secretary",
         "role.unknown",
         EventVisibility::Private,
+        {"role.secretary", "role.unknown"},
     });
     check(wrong_private_target.error == ApplyError::InvalidActor,
         "private role activity must target the direct host");
@@ -323,6 +340,7 @@ void tool_approval_activity_is_private_and_unknown_kinds_fail_closed() {
         "role.secretary",
         "user.direct_host",
         EventVisibility::Private,
+        {"user.direct_host", "role.secretary"},
     });
     apply_ok(state, {
         5,
@@ -331,6 +349,7 @@ void tool_approval_activity_is_private_and_unknown_kinds_fail_closed() {
         "role.secretary",
         "user.direct_host",
         EventVisibility::Private,
+        {"user.direct_host", "role.secretary"},
     });
     apply_ok(state, {
         6,
@@ -339,6 +358,7 @@ void tool_approval_activity_is_private_and_unknown_kinds_fail_closed() {
         "role.secretary",
         "role.secretary",
         EventVisibility::Private,
+        {"user.direct_host", "role.secretary"},
     });
 
     const auto unknown = state.apply({
@@ -350,6 +370,81 @@ void tool_approval_activity_is_private_and_unknown_kinds_fail_closed() {
     });
     check(unknown.error == ApplyError::InvalidTransition, "unknown event kinds must fail closed");
     check(state.last_sequence() == 6, "an unknown event kind must not consume sequence");
+}
+
+void private_event_audiences_are_required_and_cannot_hide_routing_principals() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.secretary", ""});
+    apply_ok(state, {3, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+
+    const auto missing = state.apply({
+        4,
+        1,
+        EventKind::MessageDirectSent,
+        "user.direct_host",
+        "role.secretary",
+        EventVisibility::Private,
+    });
+    check(missing.error == ApplyError::InvalidAudience,
+        "private events must carry the protocol audience");
+
+    const auto hidden_target = state.apply({
+        4,
+        1,
+        EventKind::MessageDirectSent,
+        "user.direct_host",
+        "role.secretary",
+        EventVisibility::Private,
+        {"user.direct_host"},
+    });
+    check(hidden_target.error == ApplyError::InvalidAudience,
+        "private audiences must include the routed target");
+
+    const auto public_audience = state.apply({
+        4,
+        1,
+        EventKind::MessagePublished,
+        "user.direct_host",
+        "",
+        EventVisibility::Public,
+        {"user.direct_host"},
+    });
+    check(public_audience.error == ApplyError::InvalidAudience,
+        "public events must not carry a private audience");
+}
+
+void facilitated_discussion_control_events_preserve_core_invariants() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.facilitator", ""});
+    apply_ok(state, {3, 1, EventKind::RoleRegistered, "role.critic", ""});
+    apply_ok(state, {4, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+    apply_ok(state, {5, 1, EventKind::DiscussionConfigured, "user.direct_host", ""});
+    apply_ok(state, {6, 1, EventKind::AgendaItemChanged, "runtime.windows", ""});
+    apply_ok(state, {7, 1, EventKind::FloorRequested, "role.critic", "role.facilitator"});
+    apply_ok(state, {8, 1, EventKind::FloorGranted, "runtime.windows", "role.critic"});
+    apply_ok(state, {9, 1, EventKind::SpeechStarted, "role.critic", ""});
+    apply_ok(state, {10, 1, EventKind::DiscussionBudgetUpdated, "runtime.windows", "role.critic"});
+    apply_ok(state, {11, 1, EventKind::SpeechCompleted, "role.critic", ""});
+    apply_ok(state, {12, 1, EventKind::DiscussionModeChanged, "runtime.windows", ""});
+    apply_ok(state, {13, 1, EventKind::ConvergenceRecorded, "role.facilitator", ""});
+
+    check(!state.active_speaker_id().has_value(),
+        "scheduler control events must not claim or retain the public floor");
+    check(state.last_sequence() == 13,
+        "scheduler control events must consume the same authoritative sequence");
+
+    const auto forged_grant = state.apply(
+        {14, 1, EventKind::FloorGranted, "role.critic", "role.facilitator"});
+    check(forged_grant.error == ApplyError::InvalidActor,
+        "a role cannot forge a scheduler floor grant");
+    const auto stale_budget = state.apply(
+        {14, 0, EventKind::DiscussionBudgetUpdated, "runtime.windows", "role.critic"});
+    check(stale_budget.error == ApplyError::StaleRuntimeGeneration,
+        "scheduler events must retain runtime-generation fencing");
+    check(state.last_sequence() == 13,
+        "rejected scheduler events must not consume sequence");
 }
 
 }  // namespace
@@ -369,6 +464,8 @@ int main() {
         private_events_advance_sequence_without_taking_public_floor();
         private_events_are_restricted_to_direct_conversation_kinds();
         tool_approval_activity_is_private_and_unknown_kinds_fail_closed();
+        private_event_audiences_are_required_and_cannot_hide_routing_principals();
+        facilitated_discussion_control_events_preserve_core_invariants();
         std::cout << "pi_roundtable_core_tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

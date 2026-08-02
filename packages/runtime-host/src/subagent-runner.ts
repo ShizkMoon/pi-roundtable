@@ -3,7 +3,7 @@ import {
   PiRuntimeAdapter,
   type PiRuntimeAdapterOptions,
 } from "./pi-runtime-adapter.js";
-import type { ApiFamily, ModelCapability } from "@pi-roundtable/protocol";
+import type { ApiFamily, ModelCapability, ThinkingLevel } from "@pi-roundtable/protocol";
 
 export interface SubagentRunRequest {
   subagentId: string;
@@ -17,6 +17,7 @@ export interface SubagentRunRequest {
   modelCapabilities: ModelCapability[];
   contextWindow?: number;
   maxOutputTokens?: number;
+  thinkingLevel?: ThinkingLevel;
   apiKey: string;
   cwd: string;
   systemPrompt: string;
@@ -69,6 +70,9 @@ export class PiSubagentRunner implements SubagentRunner {
       ...(request.maxOutputTokens === undefined
         ? {}
         : { maxOutputTokens: request.maxOutputTokens }),
+      ...(request.thinkingLevel === undefined
+        ? {}
+        : { thinkingLevel: request.thinkingLevel }),
       cwd: request.cwd,
       tools: [],
       systemPrompt: [

@@ -223,6 +223,19 @@ try {
         [PiRoundtableVisualCapture]::GetClientRect($process.MainWindowHandle, [ref]$clientRect) | Out-Null
         $actualWidth = [Math]::Round(($clientRect.Right - $clientRect.Left) / $scale, 1)
         $actualHeight = [Math]::Round(($clientRect.Bottom - $clientRect.Top) / $scale, 1)
+        $meetingTitle = Find-ByName -Root $root -Name '会话名称'
+        $inviteRole = Find-ByName -Root $root -Name '邀请临时角色'
+        $meetingHeader = Find-ByName -Root $root -Name '会议标题与主要操作'
+        if ($null -eq $meetingTitle -or $null -eq $inviteRole -or $null -eq $meetingHeader) {
+            throw 'The meeting header, title, or primary command was unavailable for adaptive QA.'
+        }
+        $titleBounds = $meetingTitle.Current.BoundingRectangle
+        $inviteBounds = $inviteRole.Current.BoundingRectangle
+        $headerBounds = $meetingHeader.Current.BoundingRectangle
+        $headerHeightDip = [Math]::Round($headerBounds.Height / $scale, 1)
+        $headerStacked = $titleBounds.Bottom -le ($inviteBounds.Top + 2)
+        $expectedHeaderStacked = $viewportWidth -lt 1180
+        $privateChatVisible = Get-VisibilityByName -Root $root -Name '私聊发言输入'
         $capturePath = Join-Path $resolvedOutput "meeting-$viewportWidth-dip.png"
         Save-WindowCapture -Handle $process.MainWindowHandle -Path $capturePath
         $measurements.Add([ordered]@{
@@ -231,11 +244,23 @@ try {
             actualHeightDip = $actualHeight
             shellNavigationVisible = Get-VisibilityByName -Root $root -Name '角色管理'
             transcriptVisible = Get-VisibilityByName -Root $root -Name '公开会话记录'
+            meetingHeaderStacked = $headerStacked
+            meetingHeaderHeightDip = $headerHeightDip
+            privateChatVisible = $privateChatVisible
             responding = $process.Responding
             screenshot = $capturePath
         })
         if ([Math]::Abs($actualWidth - $viewportWidth) -gt 3 -or !$process.Responding) {
             throw "Viewport acceptance failed for $viewportWidth DIP (actual $actualWidth DIP)."
+        }
+        if ($headerStacked -ne $expectedHeaderStacked) {
+            throw "Meeting header layout failed for $viewportWidth DIP (stacked=$headerStacked)."
+        }
+        if ($headerHeightDip -gt 120) {
+            throw "Meeting header is too tall for $viewportWidth DIP ($headerHeightDip DIP)."
+        }
+        if ($privateChatVisible) {
+            throw "Private chat opened without a user request at $viewportWidth DIP."
         }
     }
 

@@ -4,6 +4,8 @@
 
 #include <new>
 #include <string>
+#include <utility>
+#include <vector>
 
 struct pr_meeting {
     pi_roundtable::core::MeetingState state;
@@ -17,6 +19,8 @@ using pi_roundtable::core::EventVisibility;
 using pi_roundtable::core::MeetingEvent;
 using pi_roundtable::core::MeetingPhase;
 using pi_roundtable::core::RoleScope;
+
+constexpr std::uint64_t max_audience_count = 4'096;
 
 pr_apply_result invalid_result(const pr_meeting* meeting) {
     const auto expected = meeting == nullptr ? 1 : meeting->state.last_sequence() + 1;
@@ -36,10 +40,28 @@ void pr_meeting_destroy(pr_meeting* meeting) {
 pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
     if (meeting == nullptr || event == nullptr ||
         event->kind < PR_EVENT_RUNTIME_LEASE_ACQUIRED ||
-        event->kind > PR_EVENT_TOOL_APPROVAL_RESOLVED ||
+        event->kind > PR_EVENT_CONVERGENCE_RECORDED ||
         event->visibility < PR_EVENT_VISIBILITY_PUBLIC ||
         event->visibility > PR_EVENT_VISIBILITY_PRIVATE) {
         return invalid_result(meeting);
+    }
+
+    if (event->audience_count > max_audience_count) {
+        return {PR_APPLY_INVALID_AUDIENCE, meeting->state.last_sequence() + 1};
+    }
+
+    std::vector<std::string> audience;
+    if (event->audience_count > 0) {
+        if (event->audience_ids == nullptr) {
+            return {PR_APPLY_INVALID_AUDIENCE, meeting->state.last_sequence() + 1};
+        }
+        audience.reserve(static_cast<std::size_t>(event->audience_count));
+        for (std::uint64_t index = 0; index < event->audience_count; ++index) {
+            if (event->audience_ids[index] == nullptr) {
+                return {PR_APPLY_INVALID_AUDIENCE, meeting->state.last_sequence() + 1};
+            }
+            audience.emplace_back(event->audience_ids[index]);
+        }
     }
 
     MeetingEvent native_event{
@@ -49,6 +71,7 @@ pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
         event->actor_id == nullptr ? std::string{} : std::string{event->actor_id},
         event->target_id == nullptr ? std::string{} : std::string{event->target_id},
         static_cast<EventVisibility>(event->visibility),
+        std::move(audience),
     };
     const auto result = meeting->state.apply(native_event);
     return {static_cast<pr_apply_error>(result.error), result.expected_sequence};
@@ -142,6 +165,7 @@ const char* pr_apply_error_message(pr_apply_error error) {
         case PR_APPLY_INTERRUPTION_PENDING: return "interruption_pending";
         case PR_APPLY_ROLE_NOT_TEMPORARY: return "role_not_temporary";
         case PR_APPLY_ROLE_ARCHIVED: return "role_archived";
+        case PR_APPLY_INVALID_AUDIENCE: return "invalid_audience";
         default: return "unknown_error";
     }
 }

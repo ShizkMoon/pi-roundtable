@@ -12,8 +12,7 @@ internal static class RoleMentionParser
 {
     public static RoleMentionParseResult Parse(
         string message,
-        IEnumerable<RoleItem> roles,
-        IEnumerable<string>? selectedRoleIds = null)
+        IEnumerable<RoleItem> roles)
     {
         var activeRoles = roles
             .Where(role => !role.IsArchived && !string.IsNullOrWhiteSpace(role.DisplayName))
@@ -31,15 +30,6 @@ internal static class RoleMentionParser
         var fenceCharacter = '\0';
         var fenceLength = 0;
         var inlineDelimiterLength = 0;
-
-        var activeRoleIds = activeRoles.Select(role => role.RoleId).ToHashSet(StringComparer.Ordinal);
-        foreach (var selectedRoleId in selectedRoleIds ?? [])
-        {
-            if (activeRoleIds.Contains(selectedRoleId) && seenRoleIds.Add(selectedRoleId))
-            {
-                roleIds.Add(selectedRoleId);
-            }
-        }
 
         for (var index = 0; index < source.Length; index++)
         {

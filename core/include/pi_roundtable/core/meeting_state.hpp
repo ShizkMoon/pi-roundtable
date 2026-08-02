@@ -35,6 +35,7 @@ enum class ApplyError : std::uint8_t {
     InterruptionPending,
     RoleNotTemporary,
     RoleArchived,
+    InvalidAudience,
 };
 
 struct ApplyResult {

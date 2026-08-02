@@ -30,6 +30,14 @@ internal enum NativeEventKind
     MessageDirectSent = 22,
     ToolApprovalRequested = 23,
     ToolApprovalResolved = 24,
+    DiscussionConfigured = 25,
+    DiscussionModeChanged = 26,
+    AgendaItemChanged = 27,
+    FloorRequested = 28,
+    FloorGranted = 29,
+    FloorRejected = 30,
+    DiscussionBudgetUpdated = 31,
+    ConvergenceRecorded = 32,
 }
 
 internal enum NativeEventVisibility
@@ -45,7 +53,9 @@ internal readonly struct NativeEvent(
     NativeEventKind kind,
     nint actorId,
     nint targetId,
-    NativeEventVisibility visibility)
+    NativeEventVisibility visibility,
+    nint audienceIds,
+    ulong audienceCount)
 {
     public readonly ulong Sequence = sequence;
     public readonly ulong RuntimeGeneration = runtimeGeneration;
@@ -53,6 +63,8 @@ internal readonly struct NativeEvent(
     public readonly nint ActorId = actorId;
     public readonly nint TargetId = targetId;
     public readonly NativeEventVisibility Visibility = visibility;
+    public readonly nint AudienceIds = audienceIds;
+    public readonly ulong AudienceCount = audienceCount;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -102,6 +114,49 @@ internal static partial class NativeMeetingCore
 
 internal sealed class MeetingCoreSession : IMeetingCoreSession
 {
+    private sealed class Utf8StringArray : IDisposable
+    {
+        private readonly nint[] _strings;
+
+        public Utf8StringArray(IReadOnlyList<string> values)
+        {
+            _strings = new nint[values.Count];
+            if (values.Count == 0)
+            {
+                return;
+            }
+
+            Pointer = Marshal.AllocCoTaskMem(checked(values.Count * nint.Size));
+            try
+            {
+                for (var index = 0; index < values.Count; index++)
+                {
+                    _strings[index] = StringToUtf8(values[index]);
+                    Marshal.WriteIntPtr(Pointer, checked(index * nint.Size), _strings[index]);
+                }
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        public nint Pointer { get; private set; }
+
+        public ulong Count => checked((ulong)_strings.Length);
+
+        public void Dispose()
+        {
+            foreach (var value in _strings)
+            {
+                Marshal.FreeCoTaskMem(value);
+            }
+            Marshal.FreeCoTaskMem(Pointer);
+            Pointer = nint.Zero;
+        }
+    }
+
     private readonly NativeMeetingHandle _handle;
 
     public MeetingCoreSession()
@@ -119,6 +174,7 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
         var kind = MapEventKind(meetingEvent.Kind);
         var actor = StringToUtf8(meetingEvent.ActorId);
         var target = StringToUtf8(meetingEvent.TargetId);
+        using var audience = new Utf8StringArray(meetingEvent.Audience);
         try
         {
             var nativeEvent = new NativeEvent(
@@ -129,7 +185,9 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
                 target,
                 meetingEvent.Visibility == "private"
                     ? NativeEventVisibility.Private
-                    : NativeEventVisibility.Public);
+                    : NativeEventVisibility.Public,
+                audience.Pointer,
+                audience.Count);
             var result = NativeMeetingCore.ApplyRaw(
                 _handle.DangerousGetHandle(),
                 in nativeEvent);
@@ -187,6 +245,14 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
             "subagent.progress" => NativeEventKind.SubagentProgress,
             "subagent.completed" => NativeEventKind.SubagentCompleted,
             "subagent.failed" => NativeEventKind.SubagentFailed,
+            "discussion.configured" => NativeEventKind.DiscussionConfigured,
+            "discussion.mode_changed" => NativeEventKind.DiscussionModeChanged,
+            "agenda.item_changed" => NativeEventKind.AgendaItemChanged,
+            "floor.requested" => NativeEventKind.FloorRequested,
+            "floor.granted" => NativeEventKind.FloorGranted,
+            "floor.rejected" => NativeEventKind.FloorRejected,
+            "discussion.budget_updated" => NativeEventKind.DiscussionBudgetUpdated,
+            "convergence.recorded" => NativeEventKind.ConvergenceRecorded,
             _ => throw new NotSupportedException($"Unsupported meeting event kind: {kind}"),
         };
     }

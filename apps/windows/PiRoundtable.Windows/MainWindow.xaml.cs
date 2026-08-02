@@ -22,7 +22,8 @@ public sealed partial class MainWindow : Window
     private bool _initialized;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
-    private bool _contextPaneRequested = true;
+    // A wide display must not open a private context without an explicit user action.
+    private bool _contextPaneRequested;
     private bool _secondaryPanesWereInline;
     private bool _rolePaneWasInline;
     private bool _externalLinkDialogOpen;
@@ -73,6 +74,36 @@ public sealed partial class MainWindow : Window
     private async void StartMeeting_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(() => ViewModel.StartMeetingAsync());
+    }
+
+    private async void SetAgendaMode_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.SetDiscussionModeAsync("agenda"));
+    }
+
+    private async void SetFreeDiscussionMode_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.SetDiscussionModeAsync("free_discussion"));
+    }
+
+    private async void SetConvergenceMode_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.SetDiscussionModeAsync("convergence"));
+    }
+
+    private async void PauseDiscussion_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.SetDiscussionModeAsync("paused"));
+    }
+
+    private async void ResumeDiscussion_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.ResumeDiscussionAsync());
+    }
+
+    private async void AdvanceAgenda_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ViewModel.AdvanceAgendaAsync());
     }
 
     private async void SendPrompt_Click(object sender, RoutedEventArgs e)
@@ -1356,7 +1387,21 @@ public sealed partial class MainWindow : Window
         ParticipantStrip.Visibility = width >= 980 ? Visibility.Visible : Visibility.Collapsed;
         ParticipantCompactText.Visibility = width < 980 ? Visibility.Visible : Visibility.Collapsed;
         RuntimeStateText.MaxWidth = width >= 900 ? 320 : 180;
-        MeetingCommandBar.DefaultLabelPosition = width >= 1180
+        DiscussionQueueText.Visibility = width >= 1180 ? Visibility.Visible : Visibility.Collapsed;
+        DiscussionBudgetText.Visibility = width >= 860 ? Visibility.Visible : Visibility.Collapsed;
+        DiscussionAgendaText.MaxWidth = width >= 1180 ? 460 : width >= 860 ? 280 : 150;
+
+        // Once the inline navigation pane narrows the meeting column, reserve a full row for
+        // the editable title so it never competes with the primary meeting commands.
+        var meetingHeaderStacked = width < 1180;
+        Grid.SetRow(MeetingTitleStack, 0);
+        Grid.SetColumn(MeetingTitleStack, 0);
+        Grid.SetColumnSpan(MeetingTitleStack, meetingHeaderStacked ? 2 : 1);
+        Grid.SetRow(MeetingCommandBar, meetingHeaderStacked ? 1 : 0);
+        Grid.SetColumn(MeetingCommandBar, meetingHeaderStacked ? 0 : 1);
+        Grid.SetColumnSpan(MeetingCommandBar, meetingHeaderStacked ? 2 : 1);
+        MeetingHeaderGrid.RowSpacing = meetingHeaderStacked ? 2 : 0;
+        MeetingCommandBar.DefaultLabelPosition = width >= 1280
             ? CommandBarDefaultLabelPosition.Right
             : CommandBarDefaultLabelPosition.Collapsed;
 

@@ -25,7 +25,15 @@
         "generation.cancel",
         "subagent.spawn",
         "tool.approval.resolve",
-        "tool.invoke"
+        "tool.invoke",
+        "discussion.configure",
+        "discussion.mode.set",
+        "discussion.resume",
+        "agenda.advance",
+        "floor.request",
+        "floor.grant",
+        "floor.reject",
+        "convergence.record"
       ]
     },
     "issuedAt": { "type": "string", "format": "date-time" },

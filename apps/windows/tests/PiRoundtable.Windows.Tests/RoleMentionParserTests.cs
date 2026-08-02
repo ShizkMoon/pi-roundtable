@@ -94,15 +94,14 @@ public sealed class RoleMentionParserTests
     }
 
     [TestMethod]
-    public void Merges_checked_responder_targets_with_typed_mentions_and_ignores_stale_ids()
+    public void Preserves_inline_multi_role_assignment_order_without_a_second_target_source()
     {
         var result = RoleMentionParser.Parse(
-            "@产品体验官 answer",
-            Roles,
-            ["role.architect", "role.deleted"]);
+            "共同要求：给出一项可验收改进。\n@产品体验官：检查交互。\n@体系架构师：检查状态边界。",
+            Roles);
 
         CollectionAssert.AreEqual(
-            new[] { "role.architect", "role.experience" },
+            new[] { "role.experience", "role.architect" },
             result.RoleIds.ToArray());
         Assert.IsTrue(result.IsValid);
     }

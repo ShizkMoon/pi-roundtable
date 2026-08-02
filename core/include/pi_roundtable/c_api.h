@@ -43,7 +43,15 @@ typedef enum pr_event_kind {
     PR_EVENT_MESSAGE_PUBLISHED = 21,
     PR_EVENT_MESSAGE_DIRECT_SENT = 22,
     PR_EVENT_TOOL_APPROVAL_REQUESTED = 23,
-    PR_EVENT_TOOL_APPROVAL_RESOLVED = 24
+    PR_EVENT_TOOL_APPROVAL_RESOLVED = 24,
+    PR_EVENT_DISCUSSION_CONFIGURED = 25,
+    PR_EVENT_DISCUSSION_MODE_CHANGED = 26,
+    PR_EVENT_AGENDA_ITEM_CHANGED = 27,
+    PR_EVENT_FLOOR_REQUESTED = 28,
+    PR_EVENT_FLOOR_GRANTED = 29,
+    PR_EVENT_FLOOR_REJECTED = 30,
+    PR_EVENT_DISCUSSION_BUDGET_UPDATED = 31,
+    PR_EVENT_CONVERGENCE_RECORDED = 32
 } pr_event_kind;
 
 typedef enum pr_event_visibility {
@@ -65,7 +73,8 @@ typedef enum pr_apply_error {
     PR_APPLY_NO_ACTIVE_SPEAKER = 10,
     PR_APPLY_INTERRUPTION_PENDING = 11,
     PR_APPLY_ROLE_NOT_TEMPORARY = 12,
-    PR_APPLY_ROLE_ARCHIVED = 13
+    PR_APPLY_ROLE_ARCHIVED = 13,
+    PR_APPLY_INVALID_AUDIENCE = 14
 } pr_apply_error;
 
 typedef enum pr_role_scope {
@@ -87,6 +96,8 @@ typedef struct pr_event {
     const char* actor_id;
     const char* target_id;
     pr_event_visibility visibility;
+    const char* const* audience_ids;
+    uint64_t audience_count;
 } pr_event;
 
 typedef struct pr_apply_result {

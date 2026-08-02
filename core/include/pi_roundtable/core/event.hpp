@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace pi_roundtable::core {
 
@@ -31,6 +32,14 @@ enum class EventKind : std::uint8_t {
     MessageDirectSent,
     ToolApprovalRequested,
     ToolApprovalResolved,
+    DiscussionConfigured,
+    DiscussionModeChanged,
+    AgendaItemChanged,
+    FloorRequested,
+    FloorGranted,
+    FloorRejected,
+    DiscussionBudgetUpdated,
+    ConvergenceRecorded,
 };
 
 enum class EventVisibility : std::uint8_t {
@@ -45,6 +54,7 @@ struct MeetingEvent {
     std::string actor_id;
     std::string target_id;
     EventVisibility visibility{EventVisibility::Public};
+    std::vector<std::string> audience;
 };
 
 }  // namespace pi_roundtable::core
