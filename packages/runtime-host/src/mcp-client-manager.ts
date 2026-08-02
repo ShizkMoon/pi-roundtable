@@ -22,7 +22,20 @@ export interface ResolvedMcpServerRuntimeConfiguration {
   environment?: Record<string, string>;
   headers?: Record<string, string>;
   toolAllowlist: string[];
+  approvalMode: "always" | "on_first_use" | "never";
+  executionMode: "direct" | "subagent_preferred" | "subagent_required";
 }
+
+export interface McpToolApprovalRequest {
+  approvalId: string;
+  toolCallId: string;
+  serverId: string;
+  serverDisplayName: string;
+  toolName: string;
+  toolLabel: string;
+}
+
+export type McpToolApprovalHandler = (request: McpToolApprovalRequest) => Promise<boolean>;
 
 interface ConnectedServer {
   client: Client;
@@ -36,15 +49,19 @@ export type McpTransportFactory = (
 export class McpClientManager {
   readonly #servers: readonly ResolvedMcpServerRuntimeConfiguration[];
   readonly #transportFactory: McpTransportFactory;
+  readonly #approvalHandler: McpToolApprovalHandler | undefined;
   readonly #connections: ConnectedServer[] = [];
+  readonly #firstUseApprovals = new Set<string>();
   #closed = false;
 
   constructor(
     servers: readonly ResolvedMcpServerRuntimeConfiguration[],
     transportFactory: McpTransportFactory = createTransport,
+    approvalHandler?: McpToolApprovalHandler,
   ) {
     this.#servers = servers;
     this.#transportFactory = transportFactory;
+    this.#approvalHandler = approvalHandler;
   }
 
   async connect(): Promise<ToolDefinition[]> {
@@ -74,6 +91,7 @@ export class McpClientManager {
             if (
               discovered >= 256 ||
               tool.execution?.taskSupport === "required" ||
+              server.executionMode === "subagent_required" ||
               (server.toolAllowlist.length > 0 && !server.toolAllowlist.includes(tool.name))
             ) {
               continue;
@@ -91,7 +109,30 @@ export class McpClientManager {
               ].join(" ").slice(0, 2048),
               parameters: Type.Unsafe<Record<string, unknown>>(tool.inputSchema as never),
               executionMode: "sequential",
-              async execute(_toolCallId, params, signal) {
+              execute: async (toolCallId, params, signal) => {
+                const approvalKey = `${server.serverId}:${tool.name}`;
+                const needsApproval = server.approvalMode === "always" ||
+                  (server.approvalMode === "on_first_use" &&
+                    !this.#firstUseApprovals.has(approvalKey));
+                if (needsApproval) {
+                  const approved = await this.#approvalHandler?.({
+                    approvalId: createHash("sha256")
+                      .update(`${server.serverId}\0${tool.name}\0${toolCallId}`)
+                      .digest("hex")
+                      .slice(0, 32),
+                    toolCallId,
+                    serverId: server.serverId,
+                    serverDisplayName: server.displayName,
+                    toolName: tool.name,
+                    toolLabel: (tool.title ?? tool.name).slice(0, 128),
+                  });
+                  if (approved !== true) {
+                    throw new Error("MCP tool execution was not approved");
+                  }
+                  if (server.approvalMode === "on_first_use") {
+                    this.#firstUseApprovals.add(approvalKey);
+                  }
+                }
                 const timeoutSignal = AbortSignal.timeout(60_000);
                 const requestSignal = signal === undefined
                   ? timeoutSignal

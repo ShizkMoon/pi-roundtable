@@ -17,9 +17,7 @@ internal sealed class WorkspaceConfigurationStore
 
     public WorkspaceConfigurationStore(string? rootDirectory = null)
     {
-        var directory = rootDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PiRoundtable");
+        var directory = LocalDataRoot.Resolve(rootDirectory);
         _configurationPath = Path.Combine(directory, "workspace.v1.json");
     }
 

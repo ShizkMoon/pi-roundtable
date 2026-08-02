@@ -11,13 +11,15 @@ import {
   type MeetingCommand,
   type MeetingEvent,
   type MeetingEventKind,
+  type ApiFamily,
+  type ModelCapability,
   type RoleScope,
   type ParticipantManifest,
   type RoundtableSession,
   type WorkspaceProfile,
 } from "@pi-roundtable/protocol";
 
-import { PiRuntimeAdapter } from "./pi-runtime-adapter.js";
+import { PiRuntimeAdapter, PiRuntimeError } from "./pi-runtime-adapter.js";
 import {
   validateRemoteMcpEndpoint,
   type ResolvedMcpServerRuntimeConfiguration,
@@ -27,6 +29,10 @@ import type {
   RuntimeCommandResult,
   RuntimeEvent,
 } from "./runtime-adapter.js";
+import {
+  PiSubagentRunner,
+  type SubagentRunner,
+} from "./subagent-runner.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -37,16 +43,28 @@ export interface LocalRoundtableHostOptions {
   catalogMcpRoot?: string;
   now?: () => Date;
   adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
+  subagentRunner?: SubagentRunner;
 }
 
 export interface ResolvedRoleRuntimeConfiguration {
   displayName: string;
   providerId: string;
+  providerName: string;
+  apiFamily: ApiFamily;
+  endpoint?: string;
   modelId: string;
+  modelName: string;
+  modelCapabilities: ModelCapability[];
+  contextWindow?: number;
   apiKey: string;
   systemPrompt: string;
   skillPaths: string[];
   mcpServers: ResolvedMcpServerRuntimeConfiguration[];
+  delegation: {
+    networkAccess: "forbidden" | "subagent_required" | "subagent_preferred" | "direct_allowed";
+    resultMode: "summary_with_citations" | "summary" | "full";
+    maxConcurrentSubagents: number;
+  };
 }
 
 interface HostedRole {
@@ -54,6 +72,7 @@ interface HostedRole {
   scope: RoleScope;
   adapter: RuntimeAdapter;
   unsubscribe: () => void;
+  configuration?: ResolvedRoleRuntimeConfiguration;
 }
 
 interface PendingHandoff {
@@ -78,6 +97,19 @@ interface PublicHostMessage {
   mentions: string[];
 }
 
+interface ActiveSubagentRun {
+  parentRoleId: string;
+  controller: AbortController;
+  completion: Promise<void>;
+}
+
+interface PendingSubagentContinuation {
+  subagentId: string;
+  parentRoleId: string;
+  result: string;
+  failed: boolean;
+}
+
 interface RememberedReceipt {
   fingerprint: string;
   receipt: CommandReceipt;
@@ -85,6 +117,7 @@ interface RememberedReceipt {
 
 export type MeetingEventListener = (event: MeetingEvent) => void;
 export type HostDiagnosticListener = (errorCode: string, message: string) => void;
+export type LocalHostStopMode = "suspend" | "close";
 
 export class LocalRoundtableHost {
   readonly #options: LocalRoundtableHostOptions;
@@ -99,6 +132,9 @@ export class LocalRoundtableHost {
   readonly #pendingPublicTurns: PendingPublicTurn[] = [];
   readonly #publicMessages: PublicHostMessage[] = [];
   readonly #rolePublicCursors = new Map<string, number>();
+  readonly #subagentRunner: SubagentRunner;
+  readonly #subagentRuns = new Map<string, ActiveSubagentRun>();
+  readonly #pendingSubagentContinuations: PendingSubagentContinuation[] = [];
   #phase: "created" | "live" | "closed" = "created";
   #sequence = 0;
   #leaseActive = false;
@@ -128,6 +164,7 @@ export class LocalRoundtableHost {
     }
     this.#runtimeGeneration = runtimeGeneration;
     this.#now = options.now ?? (() => new Date());
+    this.#subagentRunner = options.subagentRunner ?? new PiSubagentRunner();
   }
 
   get meetingId(): string {
@@ -160,6 +197,7 @@ export class LocalRoundtableHost {
     workspace: WorkspaceProfile,
     session: RoundtableSession,
     credentials: Readonly<Record<string, string>>,
+    initialSequence = 0,
   ): void {
     if (this.#leaseActive || this.#stopped || this.#runtimeConfigurationInitialized) {
       throw new Error("Runtime configuration is already initialized");
@@ -167,6 +205,14 @@ export class LocalRoundtableHost {
     if (session.sessionId !== this.meetingId || session.workspaceId !== workspace.workspaceId) {
       throw new Error("Runtime session does not match the meeting or workspace");
     }
+    if (!Number.isSafeInteger(initialSequence) || initialSequence < 0) {
+      throw new RangeError("initialSequence must be a non-negative safe integer");
+    }
+    if (session.phase === "closed") {
+      throw new Error("A closed meeting cannot start a Runtime Host");
+    }
+    this.#sequence = initialSequence;
+    this.#phase = session.phase === "live" ? "live" : "created";
     this.#workspace = structuredClone(workspace);
     this.#session = structuredClone(session);
     this.#credentials = new Map(Object.entries(credentials));
@@ -182,6 +228,44 @@ export class LocalRoundtableHost {
     }
     this.#leaseActive = true;
     this.#emit("runtime.lease_acquired", this.#runtimeId, null, null, {});
+  }
+
+  async restoreConfiguredRoles(): Promise<void> {
+    if (!this.#leaseActive || this.#stopped || this.#phase !== "live") {
+      throw new Error("Configured roles can only be restored for an active live meeting");
+    }
+    const session = this.#session;
+    if (session === undefined) {
+      throw new Error("Runtime session is not initialized");
+    }
+    for (const participant of session.participants) {
+      const roleId = participant.participantId;
+      if (this.#roles.has(roleId)) {
+        throw new Error("Runtime session contains a duplicate role");
+      }
+      const configuration = this.#resolveRoleRuntimeConfiguration({}, roleId, participant.scope);
+      const adapter = this.#createAdapter(roleId, configuration);
+      const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
+      try {
+        await adapter.start();
+      } catch (error) {
+        unsubscribe();
+        try {
+          await adapter.stop();
+        } catch {
+          // The initialization failure below remains the stable process surface.
+        }
+        throw error;
+      }
+      this.#roles.set(roleId, {
+        displayName: configuration.displayName,
+        scope: participant.scope,
+        adapter,
+        unsubscribe,
+        configuration,
+      });
+      this.#rolePublicCursors.set(roleId, this.#publicMessages.length);
+    }
   }
 
   execute(command: MeetingCommand): Promise<CommandReceipt> {
@@ -222,11 +306,11 @@ export class LocalRoundtableHost {
     return this.#remember(command, fingerprint, receipt);
   }
 
-  stop(): Promise<void> {
-    return this.#enqueueOperation(() => this.#stopNow());
+  stop(mode: LocalHostStopMode = "suspend"): Promise<void> {
+    return this.#enqueueOperation(() => this.#stopNow(mode));
   }
 
-  async #stopNow(): Promise<void> {
+  async #stopNow(mode: LocalHostStopMode): Promise<void> {
     if (this.#stopped) {
       return;
     }
@@ -236,6 +320,13 @@ export class LocalRoundtableHost {
     this.#activeTurnCorrelationId = undefined;
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
+    this.#pendingSubagentContinuations.length = 0;
+    const subagentRuns = [...this.#subagentRuns.values()];
+    for (const run of subagentRuns) {
+      run.controller.abort();
+    }
+    await Promise.allSettled(subagentRuns.map((run) => run.completion));
+    this.#subagentRuns.clear();
     const roles = [...this.#roles.values()];
     this.#roles.clear();
     await Promise.all(
@@ -248,7 +339,7 @@ export class LocalRoundtableHost {
         }
       }),
     );
-    if (this.#phase === "live") {
+    if (mode === "close" && this.#phase === "live") {
       this.#phase = "closed";
       this.#emit("meeting.closed", this.#runtimeId, null, null, {});
     }
@@ -354,7 +445,12 @@ export class LocalRoundtableHost {
       case "generation.cancel":
         return this.#cancel(command);
 
+      case "tool.approval.resolve":
+        return this.#resolveToolApproval(command);
+
       case "subagent.spawn":
+        return this.#spawnSubagent(command);
+
       case "tool.invoke":
         return this.#receipt(
           command,
@@ -363,6 +459,188 @@ export class LocalRoundtableHost {
           "Tools and subagents require an explicit capability policy",
         );
     }
+  }
+
+  async #resolveToolApproval(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    const roleId = command.targetId;
+    const approvalId = this.#readString(command.payload, "approvalId");
+    const approved = command.payload.approved;
+    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    if (role === undefined || approvalId === undefined || typeof approved !== "boolean") {
+      return this.#receipt(
+        command,
+        "rejected",
+        "invalid_tool_approval",
+        "Tool approval requires a known target role, approvalId, and boolean decision",
+      );
+    }
+    const result = await role.adapter.execute({
+      kind: "tool.approval.resolve",
+      commandId: command.commandId,
+      roleId: roleId!,
+      approvalId,
+      approved,
+    });
+    return this.#fromRuntimeResult(command, result);
+  }
+
+  #spawnSubagent(command: MeetingCommand): CommandReceipt {
+    if (this.#phase !== "live") {
+      return this.#invalidTransition(command);
+    }
+    const parentRoleId = command.actorId;
+    const task = this.#readString(command.payload, "task");
+    if (parentRoleId === undefined || parentRoleId === null || !this.#roles.has(parentRoleId)) {
+      return this.#receipt(command, "rejected", "unknown_role", "SubAgent parent role does not exist");
+    }
+    if (task === undefined || task.length === 0 || task.length > 16_384) {
+      return this.#receipt(
+        command,
+        "rejected",
+        "invalid_subagent_task",
+        "SubAgent task must contain between 1 and 16384 characters",
+      );
+    }
+    try {
+      this.#startSubagentForRole(parentRoleId, task, command.commandId);
+      return this.#accepted(command);
+    } catch (error) {
+      const limitReached = error instanceof Error && error.message === "subagent_limit";
+      return this.#receipt(
+        command,
+        "rejected",
+        limitReached ? "subagent_limit" : "subagent_unavailable",
+        limitReached
+          ? "The parent role already has the maximum of two active SubAgents"
+          : "The frozen participant manifest does not allow this SubAgent",
+      );
+    }
+  }
+
+  #startSubagentForRole(
+    parentRoleId: string,
+    task: string,
+    causationId: string | null,
+  ): string {
+    const parent = this.#roles.get(parentRoleId);
+    const configuration = parent?.configuration;
+    if (
+      this.#phase !== "live" ||
+      this.#stopped ||
+      parent === undefined ||
+      configuration === undefined ||
+      configuration.delegation.maxConcurrentSubagents < 1
+    ) {
+      throw new Error("subagent_unavailable");
+    }
+    const limit = Math.min(2, configuration.delegation.maxConcurrentSubagents);
+    const activeForParent = [...this.#subagentRuns.values()]
+      .filter((run) => run.parentRoleId === parentRoleId)
+      .length;
+    if (activeForParent >= limit) {
+      throw new Error("subagent_limit");
+    }
+
+    const subagentId = `subagent.${randomUUID()}`;
+    const controller = new AbortController();
+    this.#emit(
+      "subagent.spawned",
+      parentRoleId,
+      parentRoleId,
+      causationId,
+      { subagentId, status: "running" },
+      "private",
+      [parentRoleId],
+    );
+    const completion = Promise.resolve().then(async () => {
+      try {
+        const result = await this.#subagentRunner.run({
+          subagentId,
+          parentRoleId,
+          providerId: configuration.providerId,
+          providerName: configuration.providerName,
+          apiFamily: configuration.apiFamily,
+          ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
+          modelId: configuration.modelId,
+          modelName: configuration.modelName,
+          modelCapabilities: [...configuration.modelCapabilities],
+          ...(configuration.contextWindow === undefined
+            ? {}
+            : { contextWindow: configuration.contextWindow }),
+          apiKey: configuration.apiKey,
+          cwd: this.#options.cwd ?? process.cwd(),
+          systemPrompt: configuration.systemPrompt,
+          skillPaths: [...configuration.skillPaths],
+          task,
+        }, (progress) => {
+          if (progress.updateCount % 16 !== 0) {
+            return;
+          }
+          this.#enqueueInternal(async () => {
+            if (this.#stopped || !this.#subagentRuns.has(subagentId)) {
+              return;
+            }
+            this.#emit(
+              "subagent.progress",
+              parentRoleId,
+              parentRoleId,
+              subagentId,
+              { subagentId, updateCount: progress.updateCount },
+              "private",
+              [parentRoleId],
+            );
+          });
+        }, controller.signal);
+        this.#enqueueInternal(async () => {
+          if (this.#stopped || !this.#subagentRuns.delete(subagentId)) {
+            return;
+          }
+          this.#emit(
+            "subagent.completed",
+            parentRoleId,
+            parentRoleId,
+            subagentId,
+            { subagentId, status: "completed" },
+            "private",
+            [parentRoleId],
+          );
+          this.#pendingSubagentContinuations.push({
+            subagentId,
+            parentRoleId,
+            result,
+            failed: false,
+          });
+          await this.#startNextSubagentContinuation();
+        });
+      } catch {
+        this.#enqueueInternal(async () => {
+          if (this.#stopped || !this.#subagentRuns.delete(subagentId)) {
+            return;
+          }
+          this.#emit(
+            "subagent.failed",
+            parentRoleId,
+            parentRoleId,
+            subagentId,
+            { subagentId, status: "failed", errorCode: "subagent_execution_failed" },
+            "private",
+            [parentRoleId],
+          );
+          this.#pendingSubagentContinuations.push({
+            subagentId,
+            parentRoleId,
+            result: "The delegated SubAgent task failed without a usable result.",
+            failed: true,
+          });
+          await this.#startNextSubagentContinuation();
+        });
+      }
+    });
+    this.#subagentRuns.set(subagentId, { parentRoleId, controller, completion });
+    return subagentId;
   }
 
   async #addRole(
@@ -403,21 +681,31 @@ export class LocalRoundtableHost {
     const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
     try {
       await adapter.start();
-    } catch {
+    } catch (error) {
       unsubscribe();
       try {
         await adapter.stop();
       } catch {
         // The stable receipt below is the public failure surface.
       }
+      const errorCode = this.#safeRuntimeErrorCode(
+        error instanceof PiRuntimeError ? error.code : "role_runtime_failed",
+      );
+      this.#diagnose(errorCode, "The role runtime could not be started");
       return this.#receipt(
         command,
         "rejected",
-        "role_runtime_failed",
+        errorCode,
         "The role runtime could not be started",
       );
     }
-    this.#roles.set(roleId, { displayName, scope, adapter, unsubscribe });
+    this.#roles.set(roleId, {
+      displayName,
+      scope,
+      adapter,
+      unsubscribe,
+      ...(configuration === undefined ? {} : { configuration }),
+    });
     this.#rolePublicCursors.set(roleId, 0);
     this.#emit(eventKind, roleId, null, command.commandId, { displayName, scope });
     return this.#accepted(command);
@@ -606,9 +894,9 @@ export class LocalRoundtableHost {
         kind: "turn.prompt",
         commandId: next.commandId,
         roleId: next.roleId,
-        message: this.#withUnseenPublicContext(
+       message: this.#withUnseenPublicContext(
           next.roleId,
-          "Respond to the latest public roundtable message. Keep private conversations private.",
+          this.#publicTurnInstruction(next.roleId, role),
         ),
         delivery: "immediate",
       });
@@ -617,6 +905,52 @@ export class LocalRoundtableHost {
       }
       this.#expectedTurns.delete(next.roleId);
       this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "A mentioned role could not take the public floor");
+    }
+  }
+
+  async #startNextSubagentContinuation(): Promise<void> {
+    if (
+      this.#activeRoleId !== undefined ||
+      this.#expectedTurns.size > 0 ||
+      this.#phase !== "live"
+    ) {
+      return;
+    }
+    while (this.#pendingSubagentContinuations.length > 0) {
+      const next = this.#pendingSubagentContinuations.shift();
+      if (next === undefined) {
+        return;
+      }
+      const parent = this.#roles.get(next.parentRoleId);
+      if (parent === undefined) {
+        continue;
+      }
+      const commandId = `subagent-result:${next.subagentId}`;
+      this.#expectedTurns.set(next.parentRoleId, {
+        commandId,
+        visibility: "public",
+      });
+      const result = await parent.adapter.execute({
+        kind: "turn.prompt",
+        commandId,
+        roleId: next.parentRoleId,
+        message: [
+          "[Private SubAgent result delivered only to the parent role.]",
+          next.failed
+            ? "The delegated task failed. Continue the meeting without inventing a result."
+            : "Use the result to continue your roundtable contribution. Do not expose internal execution details.",
+          next.result,
+        ].join("\n\n"),
+        delivery: "immediate",
+      });
+      if (result.accepted) {
+        return;
+      }
+      this.#expectedTurns.delete(next.parentRoleId);
+      this.#diagnose(
+        this.#safeRuntimeErrorCode(result.errorCode),
+        "A parent role could not continue after its SubAgent completed",
+      );
     }
   }
 
@@ -634,6 +968,17 @@ export class LocalRoundtableHost {
       return `[Public host message; ${mentionLabel}]\n${entry.message}`;
     }).join("\n\n");
     return `${context}\n\n${instruction}`;
+  }
+
+  #publicTurnInstruction(roleId: string, role: HostedRole): string {
+    return [
+      "[Roundtable role boundary]",
+      `You are the only role answering this turn: ${role.displayName} (${roleId}).`,
+      "Answer only from this role's own perspective and responsibilities.",
+      "Do not draft, simulate, summarize as, or create answer sections on behalf of any other mentioned role.",
+      "You may reference or disagree with statements already present in the public record, but label only your own position.",
+      "Respond to the latest public roundtable message. Keep private conversations private.",
+    ].join("\n");
   }
 
   async #interrupt(command: MeetingCommand): Promise<CommandReceipt> {
@@ -805,7 +1150,7 @@ export class LocalRoundtableHost {
             ? handoff.interruptorId
             : roleId,
           event,
-          {},
+          event.payload,
           event.kind === "turn.cancelled" ? roleId : null,
         );
         const completedVisibility = this.#activeTurnVisibility;
@@ -815,11 +1160,24 @@ export class LocalRoundtableHost {
         this.#enqueueInternal(() => this.#continueHandoff(roleId));
         if (completedVisibility === "public") {
           this.#enqueueInternal(() => this.#startNextPublicTurn());
+          this.#enqueueInternal(() => this.#startNextSubagentContinuation());
         }
         break;
       }
       case "tool.started":
         this.#emitActiveTurnEvent("tool.started", roleId, event, event.payload);
+        break;
+      case "tool.approval_requested":
+      case "tool.approval_resolved":
+        this.#emit(
+          event.kind,
+          roleId,
+          "user.direct_host",
+          event.correlationId ?? null,
+          event.payload,
+          "private",
+          ["user.direct_host"],
+        );
         break;
       case "tool.completed":
         this.#emitActiveTurnEvent("tool.completed", roleId, event, event.payload);
@@ -875,11 +1233,23 @@ export class LocalRoundtableHost {
       runtimeId: `${this.#runtimeId}:${roleId}`,
       roleId,
       providerId: configuration.providerId,
+      providerName: configuration.providerName,
+      apiFamily: configuration.apiFamily,
+      ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
       modelId: configuration.modelId,
+      modelName: configuration.modelName,
+      modelCapabilities: configuration.modelCapabilities,
+      ...(configuration.contextWindow === undefined
+        ? {}
+        : { contextWindow: configuration.contextWindow }),
       tools: [],
       systemPrompt: configuration.systemPrompt,
       skillPaths: configuration.skillPaths,
       mcpServers: configuration.mcpServers,
+      ...(configuration.delegation.maxConcurrentSubagents < 1
+        ? {}
+        : { subagentSpawner: (task: string) =>
+            Promise.resolve(this.#startSubagentForRole(roleId, task, null)) }),
       credentialProvider: {
         resolveApiKey: async (providerId: string) =>
           providerId === configuration.providerId ? configuration.apiKey : undefined,
@@ -1006,9 +1376,6 @@ export class LocalRoundtableHost {
       throw new Error("Participant MCP server grant limit exceeded");
     }
     const mcpServers = mcpGrants.map((grant): ResolvedMcpServerRuntimeConfiguration => {
-      if (grant.approvalMode !== "never") {
-        throw new Error("MCP grants requiring interactive approval cannot run headlessly");
-      }
       const server = workspace.mcpServers.find(
         (candidate) => candidate.mcpServerId === grant.mcpServerId && candidate.enabled,
       );
@@ -1064,16 +1431,32 @@ export class LocalRoundtableHost {
           this.#resolveCredentialReferences(server.headerCredentialRefs),
         ),
         toolAllowlist: [...grant.toolAllowlist],
+        approvalMode: grant.approvalMode,
+        executionMode: grant.executionMode,
       };
     });
     return {
       displayName,
       providerId: provider.runtimeProviderId,
+      providerName: provider.displayName,
+      apiFamily: provider.apiFamily,
+      ...(provider.endpoint === undefined ? {} : { endpoint: provider.endpoint }),
       modelId: model.modelId,
+      modelName: model.displayName,
+      modelCapabilities: [...model.capabilities],
+      ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
       apiKey,
       systemPrompt,
       skillPaths,
       mcpServers,
+      delegation: {
+        networkAccess: participant.delegationSnapshot.networkAccess,
+        resultMode: participant.delegationSnapshot.resultMode,
+        maxConcurrentSubagents: Math.min(
+          2,
+          participant.delegationSnapshot.maxConcurrentSubagents,
+        ),
+      },
     };
   }
 

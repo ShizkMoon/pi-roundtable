@@ -311,6 +311,47 @@ void private_events_are_restricted_to_direct_conversation_kinds() {
     check(state.last_sequence() == 3, "rejected private events must preserve authoritative sequence");
 }
 
+void tool_approval_activity_is_private_and_unknown_kinds_fail_closed() {
+    MeetingState state;
+    apply_ok(state, {1, 1, EventKind::RuntimeLeaseAcquired, "runtime.windows", ""});
+    apply_ok(state, {2, 1, EventKind::RoleRegistered, "role.secretary", ""});
+    apply_ok(state, {3, 1, EventKind::MeetingOpened, "runtime.windows", ""});
+    apply_ok(state, {
+        4,
+        1,
+        EventKind::ToolApprovalRequested,
+        "role.secretary",
+        "user.direct_host",
+        EventVisibility::Private,
+    });
+    apply_ok(state, {
+        5,
+        1,
+        EventKind::ToolApprovalResolved,
+        "role.secretary",
+        "user.direct_host",
+        EventVisibility::Private,
+    });
+    apply_ok(state, {
+        6,
+        1,
+        EventKind::SubagentSpawned,
+        "role.secretary",
+        "role.secretary",
+        EventVisibility::Private,
+    });
+
+    const auto unknown = state.apply({
+        7,
+        1,
+        static_cast<EventKind>(255),
+        "role.secretary",
+        "",
+    });
+    check(unknown.error == ApplyError::InvalidTransition, "unknown event kinds must fail closed");
+    check(state.last_sequence() == 6, "an unknown event kind must not consume sequence");
+}
+
 }  // namespace
 
 int main() {
@@ -327,6 +368,7 @@ int main() {
         c_api_exposes_interruption_projection_and_errors();
         private_events_advance_sequence_without_taking_public_floor();
         private_events_are_restricted_to_direct_conversation_kinds();
+        tool_approval_activity_is_private_and_unknown_kinds_fail_closed();
         std::cout << "pi_roundtable_core_tests: passed\n";
         return 0;
     } catch (const std::exception& error) {

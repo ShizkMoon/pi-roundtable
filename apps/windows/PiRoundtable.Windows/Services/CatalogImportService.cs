@@ -26,17 +26,14 @@ internal sealed class CatalogImportService
         ".md", ".txt", ".json", ".toml", ".yaml", ".yml", ".xml",
         ".ts", ".tsx", ".js", ".mjs", ".cjs", ".py", ".rs", ".go", ".java", ".cs",
     };
-    private readonly string _temporaryRoot = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PiRoundtable",
-        "imports");
-    private readonly string _catalogRoot = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "PiRoundtable",
-        "catalog");
+    private readonly string _temporaryRoot;
+    private readonly string _catalogRoot;
 
-    public CatalogImportService()
+    public CatalogImportService(string? rootDirectory = null)
     {
+        var root = LocalDataRoot.Resolve(rootDirectory);
+        _temporaryRoot = Path.Combine(root, "imports");
+        _catalogRoot = Path.Combine(root, "catalog");
         CleanupStaleImports();
     }
 

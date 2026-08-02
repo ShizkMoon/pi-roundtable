@@ -53,7 +53,13 @@ public sealed class RoleItem : INotifyPropertyChanged
     public string ModelProfileId
     {
         get => _modelProfileId;
-        set => SetField(ref _modelProfileId, value);
+        set
+        {
+            if (SetField(ref _modelProfileId, value))
+            {
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilityGrantSummary)));
+            }
+        }
     }
 
     public string RetentionPolicy
@@ -65,7 +71,13 @@ public sealed class RoleItem : INotifyPropertyChanged
     public string NetworkAccess
     {
         get => _networkAccess;
-        set => SetField(ref _networkAccess, value);
+        set
+        {
+            if (SetField(ref _networkAccess, value))
+            {
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilityGrantSummary)));
+            }
+        }
     }
 
     public HashSet<string> SkillIds { get; } = new(StringComparer.Ordinal);
@@ -110,20 +122,33 @@ public sealed class RoleItem : INotifyPropertyChanged
 
     public string CapabilitiesSummary => $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP";
 
+    public string CapabilityGrantSummary =>
+        $"{(string.IsNullOrWhiteSpace(ModelProfileId) ? "未路由模型" : ModelProfileId)} · " +
+        $"{SkillIds.Count} Skill · {McpServerIds.Count} MCP · 工具逐次审批 · {NetworkAccessLabel}";
+
+    private string NetworkAccessLabel => NetworkAccess switch
+    {
+        "direct_allowed" => "允许直连",
+        "forbidden" => "禁止联网",
+        "subagent_preferred" => "优先委派",
+        _ => "必须委派",
+    };
+
     public void NotifyCapabilitiesChanged()
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilitiesSummary)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilityGrantSummary)));
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public override string ToString() => DisplayName;
 
-    private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+    private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
     {
         if (EqualityComparer<T>.Default.Equals(field, value))
         {
-            return;
+            return false;
         }
 
         field = value;
@@ -133,5 +158,6 @@ public sealed class RoleItem : INotifyPropertyChanged
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ScopeLabel)));
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Summary)));
         }
+        return true;
     }
 }

@@ -36,7 +36,7 @@ void pr_meeting_destroy(pr_meeting* meeting) {
 pr_apply_result pr_meeting_apply(pr_meeting* meeting, const pr_event* event) {
     if (meeting == nullptr || event == nullptr ||
         event->kind < PR_EVENT_RUNTIME_LEASE_ACQUIRED ||
-        event->kind > PR_EVENT_MESSAGE_DIRECT_SENT ||
+        event->kind > PR_EVENT_TOOL_APPROVAL_RESOLVED ||
         event->visibility < PR_EVENT_VISIBILITY_PUBLIC ||
         event->visibility > PR_EVENT_VISIBILITY_PRIVATE) {
         return invalid_result(meeting);

@@ -95,7 +95,7 @@ test("role lifecycle event kinds are part of protocol v1", () => {
     assert.equal(isMeetingEventKind(kind), true);
     assert.equal(MEETING_EVENT_KINDS.some((candidate) => candidate === kind), true);
   }
-  assert.equal(isMeetingEventKind("omp.role.spawned"), false);
+  assert.equal(isMeetingEventKind("vendor.role.spawned"), false);
 });
 
 test("role lifecycle commands and scopes are recognized", () => {

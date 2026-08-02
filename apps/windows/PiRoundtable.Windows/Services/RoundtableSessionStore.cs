@@ -21,9 +21,7 @@ internal sealed class RoundtableSessionStore
 
     public RoundtableSessionStore(string? rootDirectory = null)
     {
-        var directory = rootDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PiRoundtable");
+        var directory = LocalDataRoot.Resolve(rootDirectory);
         _sessionsDirectory = Path.Combine(directory, "sessions");
     }
 

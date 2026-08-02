@@ -26,6 +26,8 @@ export type MeetingEventKind =
   | "speech.cancelled"
   | "interruption.requested"
   | "tool.started"
+  | "tool.approval_requested"
+  | "tool.approval_resolved"
   | "tool.completed"
   | "tool.failed"
   | "subagent.spawned"
@@ -51,6 +53,8 @@ export const MEETING_EVENT_KINDS = [
   "speech.cancelled",
   "interruption.requested",
   "tool.started",
+  "tool.approval_requested",
+  "tool.approval_resolved",
   "tool.completed",
   "tool.failed",
   "subagent.spawned",
@@ -99,6 +103,7 @@ export type MeetingCommandKind =
   | "speech.interrupt"
   | "generation.cancel"
   | "subagent.spawn"
+  | "tool.approval.resolve"
   | "tool.invoke";
 
 export const MEETING_COMMAND_KINDS = [
@@ -115,6 +120,7 @@ export const MEETING_COMMAND_KINDS = [
   "speech.interrupt",
   "generation.cancel",
   "subagent.spawn",
+  "tool.approval.resolve",
   "tool.invoke",
 ] as const satisfies readonly MeetingCommandKind[];
 

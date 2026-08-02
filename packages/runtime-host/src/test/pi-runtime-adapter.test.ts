@@ -4,6 +4,7 @@ import test from "node:test";
 import type { AgentSessionEvent, PromptOptions } from "@earendil-works/pi-coding-agent";
 
 import {
+  normalizeProviderEndpoint,
   PiRuntimeAdapter,
   type PiSessionCreateOptions,
   type PiSessionFactory,
@@ -94,7 +95,11 @@ class FakePiSessionFactory implements PiSessionFactory {
   }
 }
 
-function createAdapter(factory: FakePiSessionFactory, events: RuntimeEvent[]): PiRuntimeAdapter {
+function createAdapter(
+  factory: FakePiSessionFactory,
+  events: RuntimeEvent[],
+  subagentSpawner?: (task: string) => Promise<string>,
+): PiRuntimeAdapter {
   const adapter = new PiRuntimeAdapter({
     runtimeId: "runtime-pi-test",
     sessionId: "session-role-researcher",
@@ -109,6 +114,7 @@ function createAdapter(factory: FakePiSessionFactory, events: RuntimeEvent[]): P
     },
     sessionFactory: factory,
     now: () => new Date("2026-08-01T00:00:00.000Z"),
+    ...(subagentSpawner === undefined ? {} : { subagentSpawner }),
   });
   adapter.subscribe((event) => events.push(event));
   return adapter;
@@ -192,6 +198,121 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
   await adapter.stop();
   assert.equal(session.disposed, true);
   assert.equal(events.at(-1)?.kind, "runtime.stopped");
+});
+
+test("validates provider endpoints before they reach the Pi model runtime", () => {
+  assert.equal(
+    normalizeProviderEndpoint("https://api.deepseek.com/v1/"),
+    "https://api.deepseek.com/v1",
+  );
+  assert.equal(
+    normalizeProviderEndpoint("http://127.0.0.1:11434/v1"),
+    "http://127.0.0.1:11434/v1",
+  );
+  assert.throws(
+    () => normalizeProviderEndpoint("http://api.deepseek.com/v1"),
+    /HTTPS or loopback/,
+  );
+  assert.throws(
+    () => normalizeProviderEndpoint("https://user:secret@api.deepseek.com/v1"),
+    /credentials/,
+  );
+  assert.throws(
+    () => normalizeProviderEndpoint("https://api.deepseek.com/v1?key=secret"),
+    /query/,
+  );
+});
+
+test("creates an offline Pi session for a discovered DeepSeek-compatible model", async () => {
+  const adapter = new PiRuntimeAdapter({
+    runtimeId: "runtime-deepseek-offline",
+    sessionId: "session-deepseek-offline",
+    roleId: "role.deepseek",
+    providerId: "deepseek",
+    providerName: "DeepSeek",
+    apiFamily: "openai_chat_completions",
+    endpoint: "https://api.deepseek.com",
+    modelId: "deepseek-discovered-test",
+    modelName: "DeepSeek discovered test model",
+    modelCapabilities: ["text", "reasoning", "tool_calling"],
+    contextWindow: 65_536,
+    tools: [],
+    systemPrompt: "Test only. Do not contact the network during startup.",
+    credentialProvider: { resolveApiKey: async () => "offline-test-key" },
+  });
+
+  const info = await adapter.start();
+  assert.equal(info.engine, "pi");
+  assert.equal(info.sessionId, "session-deepseek-offline");
+  await adapter.stop();
+});
+
+test("exposes one asynchronous SubAgent tool without leaking the delegated task", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const delegatedTasks: string[] = [];
+  const adapter = createAdapter(factory, events, async (task) => {
+    delegatedTasks.push(task);
+    return "subagent.test-1";
+  });
+
+  const info = await adapter.start();
+  assert.equal(info.capabilities.subagents, true);
+  const tool = factory.lastOptions?.customTools?.find((candidate) =>
+    candidate.name === "spawn_subagent");
+  assert.ok(tool !== undefined);
+  const result = await tool.execute(
+    "tool-call-1",
+    { task: "bounded private research" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.deepEqual(delegatedTasks, ["bounded private research"]);
+  assert.deepEqual(result.details, { subagentId: "subagent.test-1" });
+  assert.equal(JSON.stringify(result).includes("bounded private research"), false);
+
+  await adapter.stop();
+});
+
+test("normalizes tool approval without exposing tool arguments", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  await adapter.start();
+  const requestApproval = factory.lastOptions?.approvalHandler;
+  assert.ok(requestApproval !== undefined);
+
+  const decision = requestApproval({
+    approvalId: "approval-1",
+    toolCallId: "tool-1",
+    serverId: "mcp.notes",
+    serverDisplayName: "Notes",
+    toolName: "write_note",
+    toolLabel: "Write note",
+  });
+  assert.equal(events.at(-1)?.kind, "tool.approval_requested");
+  assert.deepEqual(events.at(-1)?.payload, {
+    approvalId: "approval-1",
+    toolCallId: "tool-1",
+    serverId: "mcp.notes",
+    serverDisplayName: "Notes",
+    toolName: "write_note",
+    toolLabel: "Write note",
+  });
+  assert.equal("args" in (events.at(-1)?.payload ?? {}), false);
+
+  const receipt = await adapter.execute({
+    kind: "tool.approval.resolve",
+    commandId: "approve-1",
+    roleId: "role.researcher",
+    approvalId: "approval-1",
+    approved: true,
+  });
+  assert.equal(receipt.accepted, true);
+  assert.equal(await decision, true);
+  assert.deepEqual(events.at(-1)?.payload, { approvalId: "approval-1", approved: true });
+  await adapter.stop();
 });
 
 test("enforces role ownership, busy delivery, cancellation, and unsupported commands", async () => {
@@ -377,6 +498,10 @@ test("redacts raw provider failure details from runtime events", async () => {
   const failure = events.find((event) => event.kind === "runtime.failed");
   assert.equal(failure?.payload.message, "Pi provider response failed");
   assert.ok(!JSON.stringify(failure).includes("secret-value"));
+  session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  const terminal = events.find((event) => event.kind === "turn.cancelled");
+  assert.equal(terminal?.payload.reason, "failed");
+  assert.equal(terminal?.payload.errorCode, "pi_response_error");
   await adapter.stop();
 });
 
@@ -408,6 +533,10 @@ test("emits cancellation without a contradictory completion", async () => {
   session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
 
   assert.equal(events.filter((event) => event.kind === "turn.cancelled").length, 1);
+  assert.equal(
+    events.find((event) => event.kind === "turn.cancelled")?.payload.reason,
+    "cancelled",
+  );
   assert.equal(events.some((event) => event.kind === "turn.completed"), false);
   session.streaming = false;
   await adapter.stop();

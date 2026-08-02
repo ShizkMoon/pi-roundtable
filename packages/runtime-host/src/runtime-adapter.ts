@@ -1,6 +1,6 @@
 import type { JsonObject } from "@pi-roundtable/protocol";
 
-export type RuntimeEngine = "pi" | "omp" | "test";
+export type RuntimeEngine = "pi" | "test";
 export type RuntimeDelivery = "immediate" | "steer" | "follow_up";
 
 export interface RuntimeCapabilities {
@@ -36,6 +36,13 @@ export type RuntimeCommand =
       commandId: string;
       roleId: string;
       level: "off" | "progress" | "events";
+    }
+  | {
+      kind: "tool.approval.resolve";
+      commandId: string;
+      roleId: string;
+      approvalId: string;
+      approved: boolean;
     };
 
 export type RuntimeEventKind =
@@ -48,6 +55,8 @@ export type RuntimeEventKind =
   | "turn.cancelled"
   | "tool.started"
   | "tool.progress"
+  | "tool.approval_requested"
+  | "tool.approval_resolved"
   | "tool.completed"
   | "tool.failed"
   | "subagent.started"

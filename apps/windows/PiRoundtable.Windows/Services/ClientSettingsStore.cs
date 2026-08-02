@@ -10,11 +10,9 @@ internal sealed class ClientSettingsStore
         WriteIndented = true,
     };
 
-    public ClientSettingsStore()
+    public ClientSettingsStore(string? rootDirectory = null)
     {
-        var root = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "PiRoundtable");
+        var root = LocalDataRoot.Resolve(rootDirectory);
         Directory.CreateDirectory(root);
         ConfigurationPath = Path.Combine(root, "client-settings.json");
     }
