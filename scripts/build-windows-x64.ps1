@@ -4,7 +4,9 @@
 
     [string]$OutputRoot,
 
-    [switch]$SkipVerification
+    [switch]$SkipVerification,
+
+    [switch]$SuppressMsiValidation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -335,14 +337,21 @@ try {
         (Get-StableWixId 'fil' 'Microsoft.ui.xaml.dll'),
         (Get-StableWixId 'fil' 'Microsoft.UI.Xaml.Phone.dll')
     )
-    Invoke-CheckedWixBuild @(
+    $wixBuildArguments = @(
         'build', $wixProject,
         '--configuration', 'Release',
         "-p:ProductVersion=$Version",
         "-p:PublishDir=$appStage",
         "-p:GeneratedWxs=$generatedWxs",
         "-p:OutputPath=$installerOutput"
-    ) $repoRoot $knownLanguageOverflowIds
+    )
+    $expectedIce03FileIds = $knownLanguageOverflowIds
+    if ($SuppressMsiValidation) {
+        Write-Host 'WiX MSI validation is suppressed explicitly; use only after an equivalent release package passes validation.'
+        $wixBuildArguments += '-p:SuppressValidation=true'
+        $expectedIce03FileIds = @()
+    }
+    Invoke-CheckedWixBuild $wixBuildArguments $repoRoot $expectedIce03FileIds
 
     $msi = Get-ChildItem -LiteralPath $installerOutput -Filter '*.msi' -File |
         Sort-Object LastWriteTimeUtc -Descending |

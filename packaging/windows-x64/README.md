@@ -8,6 +8,8 @@ pwsh -File .\scripts\build-windows-x64.ps1
 
 The script requires Node.js 24+, CMake/Ninja, and the pinned .NET 10 SDK. It runs the repository verification suite unless `-SkipVerification` is supplied, publishes the WinUI application self-contained, checks that generated XBF/PRI resources exist, bundles Node plus the production Pi Runtime Host dependencies, generates a deterministic WiX component manifest, and builds an embedded-cab WiX 4 MSI.
 
+The default release path runs Windows Installer ICE validation and treats all warnings other than the two documented WinUI language metadata warnings as failures. GitHub Actions may pass `-SuppressMsiValidation` only after the equivalent release package has passed the default validation path on a Windows release machine. The switch still builds the complete MSI and does not skip project tests unless `-SkipVerification` is also explicit.
+
 Outputs:
 
 - staged application: `out\package\windows-x64\app`
