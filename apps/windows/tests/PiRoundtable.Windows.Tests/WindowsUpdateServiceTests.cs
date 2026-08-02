@@ -197,10 +197,10 @@ public sealed class WindowsUpdateServiceTests
 
         var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-03T00:00:00Z"));
 
-        Assert.AreEqual(new Version(0, 2, 1), verified.Version);
+        Assert.AreEqual(new Version(0, 2, 2), verified.Version);
         Assert.AreEqual("stable-2026-08", verified.Document.Signature.KeyId);
-        Assert.AreEqual(158368056, verified.Document.Asset.Size);
-        Assert.AreEqual("11FD4B12110AAF42CF298C30644CC2D95D45FBED24F18CC6054ABC5D8A40D7C5", verified.Document.Asset.Sha256);
+        Assert.AreEqual(158351672, verified.Document.Asset.Size);
+        Assert.AreEqual("9C826AA81AEDA3D71225086828B1EE87B92F38A9658001710B7513CEE67B4F77", verified.Document.Asset.Sha256);
     }
 
     private static async Task AssertManifestFailsAsync(UpdateFixture fixture, string json, Type expectedType)
