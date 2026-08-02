@@ -16,6 +16,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -164,6 +165,37 @@ public static class PiRoundtableE2EInterop
     {
         SetForegroundWindow(window);
     }
+
+    public static bool FileContainsUtf8Secret(string path, string secret)
+    {
+        byte[] needle = Encoding.UTF8.GetBytes(secret);
+        byte[] content = File.ReadAllBytes(path);
+        try
+        {
+            if (needle.Length == 0 || content.Length < needle.Length)
+            {
+                return false;
+            }
+            for (int offset = 0; offset <= content.Length - needle.Length; offset++)
+            {
+                int index = 0;
+                while (index < needle.Length && content[offset + index] == needle[index])
+                {
+                    index++;
+                }
+                if (index == needle.Length)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(needle);
+            CryptographicOperations.ZeroMemory(content);
+        }
+    }
 }
 '@
 
@@ -192,6 +224,7 @@ function Find-AutomationElement {
         [Parameter(Mandatory = $true)]$Root,
         [string]$AutomationId,
         [string]$Name,
+        [System.Windows.Automation.ControlType]$ControlType,
         [Parameter(Mandatory = $true)][DateTime]$Deadline
     )
     if ([string]::IsNullOrWhiteSpace($AutomationId) -eq [string]::IsNullOrWhiteSpace($Name)) {
@@ -203,7 +236,16 @@ function Find-AutomationElement {
         [System.Windows.Automation.AutomationElement]::NameProperty
     }
     $value = if (![string]::IsNullOrWhiteSpace($AutomationId)) { $AutomationId } else { $Name }
-    $condition = [System.Windows.Automation.PropertyCondition]::new($property, $value)
+    $selectorCondition = [System.Windows.Automation.PropertyCondition]::new($property, $value)
+    $condition = if ($null -eq $ControlType) {
+        $selectorCondition
+    } else {
+        $typeCondition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            $ControlType)
+        [System.Windows.Automation.AndCondition]::new(
+            [System.Windows.Automation.Condition[]]@($selectorCondition, $typeCondition))
+    }
     while ([DateTime]::UtcNow -lt $Deadline) {
         $element = $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
         if ($null -ne $element) {
@@ -216,6 +258,11 @@ function Find-AutomationElement {
 
 function Invoke-AutomationElement {
     param([Parameter(Mandatory = $true)]$Element)
+    $invokePattern = $null
+    if ($Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)) {
+        ([System.Windows.Automation.InvokePattern]$invokePattern).Invoke()
+        return
+    }
     $Element.SetFocus()
     Start-Sleep -Milliseconds 150
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
@@ -247,29 +294,81 @@ function Set-AutomationText {
     )
     $pattern = $Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     $pattern.SetValue($Value)
+    Start-Sleep -Milliseconds 100
+    $expected = $Value.Replace("`r`n", "`n").Replace("`r", "`n")
+    $actual = $pattern.Current.Value.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($actual -cne $expected) {
+        throw 'UI Automation did not commit the exact public prompt text.'
+    }
+}
+
+function Invoke-FocusedAutomationButton {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)]$Element
+    )
+    $Process.Refresh()
+    [PiRoundtableE2EInterop]::BringToFront($Process.MainWindowHandle)
+    $Element.SetFocus()
+    Start-Sleep -Milliseconds 200
+    $invokePattern = $null
+    if (!$Element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invokePattern)) {
+        throw 'The focused WinUI button does not expose InvokePattern.'
+    }
+    ([System.Windows.Automation.InvokePattern]$invokePattern).Invoke()
+}
+
+function Wait-ForAutomationTextCleared {
+    param(
+        [Parameter(Mandatory = $true)]$Element,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline
+    )
+    $pattern = $Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    while ([DateTime]::UtcNow -lt $Deadline) {
+        if ([string]::IsNullOrEmpty($pattern.Current.Value)) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw 'The public prompt remained populated after invoking the WinUI send button.'
 }
 
 function Wait-ForPersistedCompletedTurns {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsDirectory,
         [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][int]$RequiredHostCount,
         [Parameter(Mandatory = $true)][DateTime]$Deadline
     )
+    $dispatchDeadline = [DateTime]::UtcNow.AddSeconds(20)
     while ([DateTime]::UtcNow -lt $Deadline) {
         $sessionFile = Get-ChildItem -LiteralPath $SessionsDirectory -Filter '*.json' -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
         if ($null -ne $sessionFile) {
+            $session = $null
             try {
                 $session = Get-Content -Raw -LiteralPath $sessionFile.FullName | ConvertFrom-Json
+            } catch {
+                # The UI replaces this projection atomically; retry if a read overlaps replacement.
+            }
+            if ($null -ne $session) {
+                $hostCount = @($session.messages | Where-Object { $_.kind -eq 'host' }).Count
+                if ($hostCount -lt $RequiredHostCount -and [DateTime]::UtcNow -ge $dispatchDeadline) {
+                    throw "The public prompt was not persisted within 20 seconds; UI dispatch did not complete."
+                }
+                $failed = @($session.messages | Where-Object {
+                    $_.kind -eq 'role' -and $_.state -eq 'cancelled'
+                }).Count
+                if ($failed -gt 0) {
+                    throw "A persisted role turn failed or was cancelled before the expected completion count."
+                }
                 $completed = @($session.messages | Where-Object {
                     $_.kind -eq 'role' -and $_.state -eq 'completed'
                 }).Count
-                if ($completed -ge $Count) {
+                if ($hostCount -ge $RequiredHostCount -and $completed -ge $Count) {
                     return $completed
                 }
-            } catch {
-                # The UI replaces this projection atomically; retry if a read overlaps replacement.
             }
         }
         Start-Sleep -Milliseconds 500
@@ -457,12 +556,12 @@ try {
     }
 
     $window = Get-AutomationWindow -ProcessId $process.Id -Deadline ([DateTime]::UtcNow.AddSeconds(45))
-    $startButton = Find-AutomationElement -Root $window -Name '启动会议' -Deadline ([DateTime]::UtcNow.AddSeconds(30))
+    $startButton = Find-AutomationElement -Root $window -Name '启动会议' -ControlType ([System.Windows.Automation.ControlType]::Button) -Deadline ([DateTime]::UtcNow.AddSeconds(30))
     [PiRoundtableE2EInterop]::BringToFront($process.MainWindowHandle)
     Wait-ForEnabledElement -Element $startButton -Deadline ([DateTime]::UtcNow.AddSeconds(45)) -Description '启动会议'
     Invoke-AutomationElement $startButton
     try {
-        $pauseButton = Find-AutomationElement -Root $window -Name '暂停会议' -Deadline ([DateTime]::UtcNow.AddSeconds(60))
+        $pauseButton = Find-AutomationElement -Root $window -Name '暂停会议' -ControlType ([System.Windows.Automation.ControlType]::Button) -Deadline ([DateTime]::UtcNow.AddSeconds(60))
     } catch {
         Save-UiDiagnostic -Process $process -Root $window -EvidenceRoot $evidenceRoot
         throw
@@ -470,22 +569,37 @@ try {
     Wait-ForEnabledElement -Element $pauseButton -Deadline ([DateTime]::UtcNow.AddSeconds(60)) -Description '会议运行状态'
 
     $promptBox = Find-AutomationElement -Root $window -AutomationId 'PromptBox' -Deadline ([DateTime]::UtcNow.AddSeconds(15))
-    $sendButton = Find-AutomationElement -Root $window -Name '发送公开发言' -Deadline ([DateTime]::UtcNow.AddSeconds(15))
+    $sendButton = Find-AutomationElement -Root $window -Name '发送公开发言' -ControlType ([System.Windows.Automation.ControlType]::Button) -Deadline ([DateTime]::UtcNow.AddSeconds(15))
     Wait-ForEnabledElement -Element $sendButton -Deadline ([DateTime]::UtcNow.AddSeconds(15)) -Description '发送公开发言'
-    $roundOnePrompt = '@体系架构师 @产品体验官 @风险审查员 第一轮：为 Windows 本地优先的 AI 圆桌客户端，判断下一阶段最重要的一项改进。请从各自职责出发，标记 R1，并给出可验收标准。'
+    $roundOnePrompt = @'
+@体系架构师 单点名真实验收：只有你回应，其他角色保持静默。首行写 SINGLE_AT，然后用 Markdown 严格给出：
+1. 一个两列表格；
+2. 一个已勾选任务项 `- [x]`；
+3. 一个由 `$$` 包围的 LaTeX 公式块；
+4. 一个标注为 powershell 的代码块。
+内容围绕 Windows 本地优先圆桌的“只响应被 @ 角色”验收，保持简短，不要调用工具。
+'@
     Set-AutomationText -Element $promptBox -Value $roundOnePrompt
-    Invoke-AutomationElement $sendButton
+    Wait-ForEnabledElement -Element $sendButton -Deadline ([DateTime]::UtcNow.AddSeconds(15)) -Description '发送单点名公开发言'
+    Invoke-FocusedAutomationButton -Process $process -Element $sendButton
+    Wait-ForAutomationTextCleared -Element $promptBox -Deadline ([DateTime]::UtcNow.AddSeconds(10))
     $sessionsDirectory = Join-Path $dataRoot 'sessions'
-    $roundOneCount = Wait-ForPersistedCompletedTurns -SessionsDirectory $sessionsDirectory -Count 3 -Deadline ([DateTime]::UtcNow.AddSeconds($RoundTimeoutSeconds))
-    $roundOneScreenshot = Join-Path $evidenceRoot 'round-1.png'
+    try {
+        $roundOneCount = Wait-ForPersistedCompletedTurns -SessionsDirectory $sessionsDirectory -Count 1 -RequiredHostCount 1 -Deadline ([DateTime]::UtcNow.AddSeconds($RoundTimeoutSeconds))
+    } catch {
+        Save-UiDiagnostic -Process $process -Root $window -EvidenceRoot $evidenceRoot
+        throw
+    }
+    $roundOneScreenshot = Join-Path $evidenceRoot 'single-at-markdown.png'
     Save-RoundScreenshot -Process $process -Root $window -Path $roundOneScreenshot
 
-    $roundTwoPrompt = '@体系架构师 @产品体验官 @风险审查员 第二轮：阅读第一轮公开记录，指出至少一个不同意之处并修正自己的建议。标记 R2，最后给出共同验收门槛候选。'
+    $roundTwoPrompt = '@产品体验官 @风险审查员 多点名真实验收：只有你们两位回应，体系架构师保持静默。每位首行写 MULTI_AT；产品体验官检查信息密度与直觉交互，风险审查员给出一个反例和验收门槛。使用简短 Markdown 列表，不要调用工具。'
     Set-AutomationText -Element $promptBox -Value $roundTwoPrompt
     Wait-ForEnabledElement -Element $sendButton -Deadline ([DateTime]::UtcNow.AddSeconds(15)) -Description '发送第二轮公开发言'
-    Invoke-AutomationElement $sendButton
-    $roundTwoCount = Wait-ForPersistedCompletedTurns -SessionsDirectory $sessionsDirectory -Count 6 -Deadline ([DateTime]::UtcNow.AddSeconds($RoundTimeoutSeconds))
-    $roundTwoScreenshot = Join-Path $evidenceRoot 'round-2.png'
+    Invoke-FocusedAutomationButton -Process $process -Element $sendButton
+    Wait-ForAutomationTextCleared -Element $promptBox -Deadline ([DateTime]::UtcNow.AddSeconds(10))
+    $roundTwoCount = Wait-ForPersistedCompletedTurns -SessionsDirectory $sessionsDirectory -Count 3 -RequiredHostCount 2 -Deadline ([DateTime]::UtcNow.AddSeconds($RoundTimeoutSeconds))
+    $roundTwoScreenshot = Join-Path $evidenceRoot 'multi-at.png'
     Save-RoundScreenshot -Process $process -Root $window -Path $roundTwoScreenshot
 
     Invoke-AutomationElement $pauseButton
@@ -506,10 +620,9 @@ try {
     }
     $session = Get-Content -Raw -LiteralPath $sessionFile.FullName | ConvertFrom-Json
     $completedOutputs = @($session.messages | Where-Object { $_.kind -eq 'role' -and $_.state -eq 'completed' })
-    if ($completedOutputs.Count -lt 6) {
-        throw "The persisted transcript contains only $($completedOutputs.Count) completed role outputs."
+    if ($completedOutputs.Count -ne 3) {
+        throw "Expected exactly three completed role outputs across the single-@ and multi-@ scenarios, found $($completedOutputs.Count)."
     }
-    $expectedSpeakers = @('role.architect', 'role.ux', 'role.critic')
     $publicMessages = @($session.messages | Where-Object { $_.kind -in @('host', 'role') })
     $hostIndexes = @(for ($index = 0; $index -lt $publicMessages.Count; $index++) {
         if ($publicMessages[$index].kind -eq 'host') { $index }
@@ -517,25 +630,64 @@ try {
     if ($hostIndexes.Count -ne 2) {
         throw "Expected exactly two persisted public prompts, found $($hostIndexes.Count)."
     }
+    $roundSpecifications = @(
+        [ordered]@{
+            scenario = 'single-at-markdown'
+            promptMarker = '单点名真实验收'
+            outputMarker = 'SINGLE_AT'
+            expectedSpeakers = @('role.architect')
+            requireMarkdownMatrix = $true
+        },
+        [ordered]@{
+            scenario = 'multi-at'
+            promptMarker = '多点名真实验收'
+            outputMarker = 'MULTI_AT'
+            expectedSpeakers = @('role.ux', 'role.critic')
+            requireMarkdownMatrix = $false
+        }
+    )
     $roundEvidence = @(for ($roundIndex = 0; $roundIndex -lt 2; $roundIndex++) {
+        $specification = $roundSpecifications[$roundIndex]
         $start = $hostIndexes[$roundIndex]
         $end = if ($roundIndex + 1 -lt $hostIndexes.Count) {
             $hostIndexes[$roundIndex + 1] - 1
         } else {
             $publicMessages.Count - 1
         }
-        $roundOutputs = @($publicMessages[($start + 1)..$end] | Where-Object {
+        $roundSlice = if ($end -gt $start) { @($publicMessages[($start + 1)..$end]) } else { @() }
+        $roundOutputs = @($roundSlice | Where-Object {
             $_.kind -eq 'role' -and $_.state -eq 'completed'
         })
         $actualSpeakers = @($roundOutputs | ForEach-Object { $_.speakerId } | Sort-Object -Unique)
-        if ($roundOutputs.Count -ne 3 -or
-            ($actualSpeakers -join ',') -cne (($expectedSpeakers | Sort-Object) -join ',')) {
-            throw "Round $($roundIndex + 1) did not contain exactly one completed output from each expected role."
+        $expectedSpeakers = @($specification.expectedSpeakers | Sort-Object)
+        if ($roundOutputs.Count -ne $expectedSpeakers.Count -or
+            ($actualSpeakers -join ',') -cne ($expectedSpeakers -join ',')) {
+            throw "Scenario '$($specification.scenario)' routed to '$($actualSpeakers -join ',')' instead of exactly '$($expectedSpeakers -join ',')'."
         }
-        $expectedPromptMarker = if ($roundIndex -eq 0) { '第一轮' } else { '第二轮' }
         if (![string]$publicMessages[$start].text -or
-            !([string]$publicMessages[$start].text).Contains($expectedPromptMarker, [StringComparison]::Ordinal)) {
-            throw "Round $($roundIndex + 1) prompt marker was not persisted."
+            !([string]$publicMessages[$start].text).Contains($specification.promptMarker, [StringComparison]::Ordinal)) {
+            throw "Scenario '$($specification.scenario)' prompt marker was not persisted."
+        }
+        foreach ($output in $roundOutputs) {
+            if (!([string]$output.text).Contains($specification.outputMarker, [StringComparison]::Ordinal)) {
+                throw "Scenario '$($specification.scenario)' output from $($output.speakerId) omitted marker $($specification.outputMarker)."
+            }
+        }
+        $markdownChecks = [ordered]@{
+            table = $false
+            checkedTask = $false
+            latexBlock = $false
+            powershellFence = $false
+        }
+        if ($specification.requireMarkdownMatrix) {
+            $singleText = [string]$roundOutputs[0].text
+            $markdownChecks.table = $singleText -match '(?m)^\s*\|.+\|\s*$'
+            $markdownChecks.checkedTask = $singleText -match '(?im)^\s*-\s+\[x\]'
+            $markdownChecks.latexBlock = ([regex]::Matches($singleText, [regex]::Escape('$$'))).Count -ge 2
+            $markdownChecks.powershellFence = $singleText.Contains('```powershell', [StringComparison]::OrdinalIgnoreCase)
+            if (@($markdownChecks.Values | Where-Object { !$_ }).Count -gt 0) {
+                throw "The single-@ DeepSeek response did not exercise the complete Markdown/LaTeX matrix."
+            }
         }
         $outputs = @($roundOutputs | ForEach-Object {
             $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.text)
@@ -552,8 +704,11 @@ try {
         })
         [ordered]@{
             round = $roundIndex + 1
+            scenario = $specification.scenario
             promptMessageId = $publicMessages[$start].messageId
+            expectedSpeakerIds = $expectedSpeakers
             speakerIds = $actualSpeakers
+            markdownChecks = $markdownChecks
             outputs = $outputs
         }
     })
@@ -566,6 +721,7 @@ try {
         provider = 'DeepSeek'
         modelId = $modelId
         roles = @('体系架构师', '产品体验官', '风险审查员')
+        scenarios = @('single-at-markdown', 'multi-at')
         rounds = 2
         persistedCompletedCountAfterRound1 = $roundOneCount
         persistedCompletedCountAfterRound2 = $roundTwoCount
@@ -575,10 +731,19 @@ try {
         screenshots = @($roundOneScreenshot, $roundTwoScreenshot)
         sessionFile = $sessionFile.FullName
         credentialDeletedAfterRun = $credentialDeleted
+        secretLeakScan = 'passed'
     }
-    $evidence | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $evidenceRoot 'evidence.json') -Encoding utf8NoBOM
-    Write-Host "Verified 3-role, 2-round DeepSeek meeting with $($completedOutputs.Count) completed outputs."
-    Write-Host "Evidence: $(Join-Path $evidenceRoot 'evidence.json')"
+    $evidencePath = Join-Path $evidenceRoot 'evidence.json'
+    $evidence | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $evidencePath -Encoding utf8NoBOM
+    $leakFiles = @(Get-ChildItem -LiteralPath $evidenceRoot -Recurse -File | Where-Object {
+        [PiRoundtableE2EInterop]::FileContainsUtf8Secret($_.FullName, $apiKey)
+    })
+    if ($leakFiles.Count -gt 0) {
+        [IO.File]::Delete($evidencePath)
+        throw "Credential leak scan failed in $($leakFiles.Count) local evidence file(s)."
+    }
+    Write-Host "Verified DeepSeek single-@, multi-@, and Markdown/LaTeX scenarios with $($completedOutputs.Count) exact completed outputs."
+    Write-Host "Evidence: $evidencePath"
 } finally {
     $http.Dispose()
     if ($null -ne $process -and !$process.HasExited) {

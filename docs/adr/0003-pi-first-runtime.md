@@ -1,11 +1,11 @@
-# ADR 0003: Pi-first runtime with optional OMP compatibility
+# ADR 0003: Historical Pi-first runtime with optional OMP compatibility
 
 - Status: superseded by ADR 0008
 - Date: 2026-08-01
 
 ## Context
 
-Pi Roundtable is a meeting product built on Pi's agent runtime primitives. Oh My Pi is a useful reference and compatibility target, but making its RPC records, sessions, or command vocabulary the product model would couple every client to one fork and prevent the meeting domain from evolving independently.
+Pi Roundtable is a meeting product built on Pi's agent runtime primitives. In this superseded decision, Oh My Pi was treated as both a useful reference and a possible compatibility target, but making its RPC records, sessions, or command vocabulary the product model would couple every client to one fork and prevent the meeting domain from evolving independently. ADR 0008 removed that compatibility target; this sentence is historical context, not a current promise.
 
 The first scaffold used `omp --mode rpc` to exercise process isolation and streaming. This record is retained only as architectural history; the compatibility implementation was removed by ADR 0008.
 

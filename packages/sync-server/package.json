@@ -1,14 +1,19 @@
 {
   "name": "@pi-roundtable/sync-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -b",
     "dev": "npm run build && node --enable-source-maps dist/server.js",
-    "test": "node --test dist/test/meeting-store.test.js dist/test/server.test.js"
+    "test": "node --test dist/test/meeting-store.test.js dist/test/server.test.js",
+    "test:postgres": "npm run build && node --test dist/test/postgres-e2e.test.js"
   },
   "dependencies": {
-    "@pi-roundtable/protocol": "0.1.0"
+    "@pi-roundtable/protocol": "0.2.0",
+    "pg": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.20.3"
   }
 }

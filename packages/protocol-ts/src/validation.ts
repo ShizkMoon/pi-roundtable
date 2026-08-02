@@ -22,7 +22,8 @@ export interface ConfigurationValidationIssue {
     | "workspace_mismatch"
     | "invalid_invitation"
     | "invalid_retention"
-    | "invalid_audience";
+    | "invalid_audience"
+    | "unlisted_tool";
   message: string;
 }
 
@@ -171,6 +172,17 @@ function validateCapabilities(
       issues.push({ path: `${path}.mcpGrants[${index}]`, code: "missing_reference", message: `Unknown MCP server '${grant.mcpServerId}'.` });
     } else if (!server.enabled) {
       issues.push({ path: `${path}.mcpGrants[${index}]`, code: "disabled_reference", message: `MCP server '${grant.mcpServerId}' is disabled.` });
+    } else {
+      const reviewedTools = new Set((server.toolCatalog ?? []).map((tool) => tool.name));
+      for (const [toolIndex, toolName] of grant.toolAllowlist.entries()) {
+        if (!reviewedTools.has(toolName)) {
+          issues.push({
+            path: `${path}.mcpGrants[${index}].toolAllowlist[${toolIndex}]`,
+            code: "unlisted_tool",
+            message: `MCP tool '${toolName}' is not present in the reviewed catalog for '${grant.mcpServerId}'.`,
+          });
+        }
+      }
     }
   }
   for (const [index, grant] of policy.toolGrants.entries()) {
@@ -220,6 +232,12 @@ export function validateWorkspaceProfile(profile: WorkspaceProfile): Configurati
     validateId(server.mcpServerId, `mcpServers[${index}].mcpServerId`, issues);
     validateMcpTransport(server, `mcpServers[${index}]`, issues);
     validateEndpoint(server.endpoint, `mcpServers[${index}].endpoint`, issues);
+    addDuplicateIssues(
+      server.toolCatalog ?? [],
+      (tool) => tool.name,
+      `mcpServers[${index}].toolCatalog`,
+      issues,
+    );
     for (const [name, reference] of Object.entries(server.environmentCredentialRefs ?? {})) {
       validateCredentialRef(reference, `mcpServers[${index}].environmentCredentialRefs.${name}`, issues);
     }

@@ -73,7 +73,7 @@ export class McpClientManager {
     try {
       for (const server of this.#servers) {
         const client = new Client(
-          { name: "pi-roundtable-runtime-host", version: "0.1.0" },
+          { name: "pi-roundtable-runtime-host", version: "0.2.0" },
           { capabilities: {} },
         );
         const transport = this.#transportFactory(server);
@@ -92,7 +92,7 @@ export class McpClientManager {
               discovered >= 256 ||
               tool.execution?.taskSupport === "required" ||
               server.executionMode === "subagent_required" ||
-              (server.toolAllowlist.length > 0 && !server.toolAllowlist.includes(tool.name))
+              !server.toolAllowlist.includes(tool.name)
             ) {
               continue;
             }

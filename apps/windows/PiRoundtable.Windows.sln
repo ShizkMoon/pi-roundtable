@@ -6,6 +6,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Windows", "PiR
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Windows.Tests", "tests\PiRoundtable.Windows.Tests\PiRoundtable.Windows.Tests.csproj", "{E9B7C998-0AD9-49E7-98C1-BED75C58B170}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Updater", "PiRoundtable.Updater\PiRoundtable.Updater.csproj", "{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -30,5 +32,13 @@ Global
 		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|ARM64.Build.0 = Release|x64
 		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|x64.ActiveCfg = Release|x64
 		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|x64.Build.0 = Release|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Debug|ARM64.ActiveCfg = Debug|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Debug|ARM64.Build.0 = Debug|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Debug|x64.ActiveCfg = Debug|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Debug|x64.Build.0 = Debug|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|ARM64.ActiveCfg = Release|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|ARM64.Build.0 = Release|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|x64.ActiveCfg = Release|x64
+		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal

@@ -89,7 +89,15 @@ public sealed class McpServerProfileConfiguration
     public string? Endpoint { get; set; }
     public Dictionary<string, string>? EnvironmentCredentialRefs { get; set; }
     public Dictionary<string, string>? HeaderCredentialRefs { get; set; }
+    public List<McpToolProfileConfiguration> ToolCatalog { get; set; } = [];
     public bool Enabled { get; set; } = true;
+}
+
+public sealed class McpToolProfileConfiguration
+{
+    public string Name { get; set; } = string.Empty;
+    public string DisplayName { get; set; } = string.Empty;
+    public string? Description { get; set; }
 }
 
 public sealed class ModelRouteConfiguration

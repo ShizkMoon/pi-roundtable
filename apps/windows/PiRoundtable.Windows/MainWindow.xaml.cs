@@ -7,9 +7,13 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Windowing;
+using PiRoundtable.Windows.Controls;
+using PiRoundtable.Windows.Services;
 using PiRoundtable.Windows.ViewModels;
 using PiRoundtable.Windows.Models;
+using PiRoundtable.Windows.Services.Updater;
 using Windows.Graphics;
+using Windows.Storage.Pickers;
 
 namespace PiRoundtable.Windows;
 
@@ -21,6 +25,7 @@ public sealed partial class MainWindow : Window
     private bool _contextPaneRequested = true;
     private bool _secondaryPanesWereInline;
     private bool _rolePaneWasInline;
+    private bool _externalLinkDialogOpen;
     private Control? _contextPaneInvoker;
     private readonly HashSet<TranscriptItem> _observedPublicItems = [];
     private readonly HashSet<TranscriptItem> _observedPrivateItems = [];
@@ -34,6 +39,10 @@ public sealed partial class MainWindow : Window
     private bool _privateFollowsLatest = true;
     private int _publicForcePassesRemaining;
     private int _privateForcePassesRemaining;
+    private readonly WindowsUpdateService _updateService = new();
+    private VerifiedUpdateManifest? _availableUpdate;
+    private CancellationTokenSource? _updateOperationCancellation;
+    private readonly DispatcherQueueTimer _toolApprovalDeadlineTimer;
 
     public MainViewModel ViewModel { get; }
 
@@ -42,11 +51,18 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         ViewModel = new MainViewModel(DispatcherQueue);
         RootDataContext = ViewModel;
+        ViewModel.PendingToolApprovals.CollectionChanged += PendingToolApprovals_CollectionChanged;
+        _toolApprovalDeadlineTimer = DispatcherQueue.CreateTimer();
+        _toolApprovalDeadlineTimer.Interval = TimeSpan.FromSeconds(1);
+        _toolApprovalDeadlineTimer.IsRepeating = true;
+        _toolApprovalDeadlineTimer.Tick += (_, _) => ViewModel.RefreshToolApprovalDeadlines();
+        _toolApprovalDeadlineTimer.Start();
         InitializeTranscriptFollowing();
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
         SystemBackdrop = new MicaBackdrop();
         AppWindow.Closing += MainWindow_Closing;
+        CurrentVersionText.Text = $"当前版本 {_updateService.CurrentVersion.ToString(3)} · stable · {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}";
     }
 
     private object RootDataContext
@@ -126,6 +142,57 @@ public sealed partial class MainWindow : Window
                     QueuePublicFollow(force: true);
                 }
             });
+        }
+    }
+
+    private async void MarkdownMessage_ExternalLinkRequested(
+        object sender,
+        ExternalLinkRequestedEventArgs args)
+    {
+        if (_externalLinkDialogOpen || sender is not Control invoker || Root.XamlRoot is null)
+        {
+            return;
+        }
+        _externalLinkDialogOpen = true;
+        try
+        {
+            var address = new TextBox
+            {
+                Header = $"目标站点：{args.Uri.Host}",
+                IsReadOnly = true,
+                Text = args.Uri.AbsoluteUri,
+                TextWrapping = TextWrapping.Wrap,
+            };
+            var dialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = "在默认浏览器中打开外部链接？",
+                Content = new StackPanel
+                {
+                    Spacing = 10,
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = "此链接来自模型生成内容。请核对完整地址；Pi Roundtable 不会在应用内加载该网页。",
+                            TextWrapping = TextWrapping.Wrap,
+                        },
+                        address,
+                    },
+                },
+                PrimaryButtonText = "打开浏览器",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                _ = await global::Windows.System.Launcher.LaunchUriAsync(args.Uri);
+            }
+        }
+        finally
+        {
+            _externalLinkDialogOpen = false;
+            invoker.Focus(FocusState.Programmatic);
         }
     }
 
@@ -452,7 +519,7 @@ public sealed partial class MainWindow : Window
     {
         if (force)
         {
-            _publicForcePassesRemaining = 6;
+            _publicForcePassesRemaining = 2;
             _publicFollowsLatest = true;
         }
         if (!force && !_publicFollowsLatest)
@@ -467,7 +534,7 @@ public sealed partial class MainWindow : Window
     {
         if (force)
         {
-            _privateForcePassesRemaining = 6;
+            _privateForcePassesRemaining = 2;
             _privateFollowsLatest = true;
         }
         if (!force && !_privateFollowsLatest)
@@ -532,7 +599,6 @@ public sealed partial class MainWindow : Window
         }
 
         list.ScrollIntoView(latest);
-        list.UpdateLayout();
         scrollViewer?.ChangeView(null, scrollViewer.ScrollableHeight, null, disableAnimation: true);
     }
 
@@ -740,6 +806,52 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private void PendingToolApprovals_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs args)
+    {
+        if (!_initialized || Root.XamlRoot is null)
+        {
+            return;
+        }
+        if (args.NewItems is { Count: > 0 } && args.NewItems[0] is ToolApprovalItem added)
+        {
+            var previousFocus = FocusManager.GetFocusedElement(Root.XamlRoot) as Control;
+            ShowContextPanel(ToolApprovalPanel, previousFocus);
+            FocusToolApproval(added);
+            return;
+        }
+        if (args.OldItems is { Count: > 0 })
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                var next = ViewModel.PendingToolApprovals.FirstOrDefault();
+                if (next is not null)
+                {
+                    FocusToolApproval(next);
+                }
+                else
+                {
+                    _contextPaneInvoker?.Focus(FocusState.Programmatic);
+                }
+            });
+        }
+    }
+
+    private void FocusToolApproval(ToolApprovalItem approval)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            ToolApprovalList.ScrollIntoView(approval);
+            if (ToolApprovalList.ContainerFromItem(approval) is ListViewItem container)
+            {
+                container.Focus(FocusState.Programmatic);
+            }
+            else
+            {
+                ToolApprovalList.Focus(FocusState.Programmatic);
+            }
+        });
+    }
+
     private void CloseContextPane_Click(object sender, RoutedEventArgs e)
     {
         _contextPaneRequested = false;
@@ -885,6 +997,49 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void EditMcpTools_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string mcpServerId } button)
+        {
+            return;
+        }
+        var toolNames = new TextBox
+        {
+            AcceptsReturn = true,
+            MinHeight = 180,
+            Text = ViewModel.GetMcpToolCatalogText(mcpServerId),
+            TextWrapping = TextWrapping.NoWrap,
+            Header = "每行一个 MCP 工具名称",
+            PlaceholderText = "read_file\nsearch_docs",
+        };
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = "复核 MCP 工具清单",
+            Content = new StackPanel
+            {
+                Spacing = 10,
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "名称必须与 MCP tools/list 返回值完全一致。保存目录不等于授权；角色仍需逐项勾选。删除名称会撤销所有角色对该工具的授权。",
+                        TextWrapping = TextWrapping.Wrap,
+                    },
+                    toolNames,
+                },
+            },
+            PrimaryButtonText = "保存复核清单",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            await RunUiActionAsync(() => ViewModel.UpdateMcpToolCatalogAsync(mcpServerId, toolNames.Text));
+        }
+        button.Focus(FocusState.Programmatic);
+    }
+
     private async void SaveClientSettings_Click(object sender, RoutedEventArgs e)
     {
         await RunUiActionAsync(async () =>
@@ -899,6 +1054,256 @@ public sealed partial class MainWindow : Window
                 SyncCredentialBox.Password = string.Empty;
             }
         });
+    }
+
+    private async void ExportSessionJson_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ExportSessionAsync(markdown: false));
+    }
+
+    private async void ExportSessionMarkdown_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(() => ExportSessionAsync(markdown: true));
+    }
+
+    private async Task ExportSessionAsync(bool markdown)
+    {
+        var includePrivate = new CheckBox
+        {
+            Content = "明确包含私聊内容与 audience",
+            IsChecked = false,
+        };
+        var scopeDialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = "选择导出范围",
+            Content = new StackPanel
+            {
+                Spacing = 10,
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "默认只导出公开消息。导出包不会包含 API Key、Credential Manager 引用、DPAPI 密文、raw Pi 记录、工具参数/结果或模型私有推理。",
+                        TextWrapping = TextWrapping.Wrap,
+                    },
+                    includePrivate,
+                },
+            },
+            PrimaryButtonText = "继续",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await scopeDialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        var package = ViewModel.CreateSelectedSessionExport(includePrivate.IsChecked == true);
+        var picker = new FileSavePicker
+        {
+            SuggestedFileName = MakeSafeExportFileName(package.Title),
+        };
+        if (markdown)
+        {
+            picker.FileTypeChoices.Add("Markdown 会话记录", [".md"]);
+        }
+        else
+        {
+            picker.FileTypeChoices.Add("Pi Roundtable 会话包", [".json"]);
+        }
+        InitializePicker(picker);
+        var file = await picker.PickSaveFileAsync();
+        if (file is null)
+        {
+            return;
+        }
+        if (markdown)
+        {
+            await File.WriteAllTextAsync(file.Path, SessionTransferService.RenderMarkdown(package));
+        }
+        else
+        {
+            await File.WriteAllBytesAsync(file.Path, SessionTransferService.SerializeJson(package));
+        }
+        UpdateStatusTextIfVisible($"已导出 {package.Messages.Count} 条{(package.IncludesPrivateMessages ? "公开/私聊" : "公开")}消息。", file.Path);
+    }
+
+    private async void ImportSessionPackage_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(ImportSessionPackageAsync);
+    }
+
+    private async Task ImportSessionPackageAsync()
+    {
+        var picker = new FileOpenPicker();
+        picker.FileTypeFilter.Add(".json");
+        InitializePicker(picker);
+        var file = await picker.PickSingleFileAsync();
+        if (file is null)
+        {
+            return;
+        }
+        var properties = await file.GetBasicPropertiesAsync();
+        if (properties.Size > SessionTransferService.MaximumPackageBytes)
+        {
+            throw new InvalidDataException("会话包超过 32 MiB 预检限制。");
+        }
+        var preflight = SessionTransferService.Preflight(await File.ReadAllBytesAsync(file.Path));
+        var range = preflight.FirstMessageAt is null
+            ? "无消息"
+            : $"{preflight.FirstMessageAt.Value.ToLocalTime():yyyy-MM-dd HH:mm} 至 {preflight.LastMessageAt!.Value.ToLocalTime():yyyy-MM-dd HH:mm}";
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = "导入预检通过",
+            Content = new TextBlock
+            {
+                Text = $"来源：{preflight.Package.Title}\n公开消息：{preflight.PublicMessageCount}\n私聊消息：{preflight.PrivateMessageCount}\n发言者：{preflight.SpeakerCount}\n时间范围：{range}\n\n确认后只会创建新的独立草稿会话；不会覆盖、合并或追加到任何现有会话。",
+                TextWrapping = TextWrapping.Wrap,
+            },
+            PrimaryButtonText = "创建新草稿",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            await ViewModel.ImportSessionPackageAsync(preflight);
+        }
+    }
+
+    private void InitializePicker(object picker)
+    {
+        WinRT.Interop.InitializeWithWindow.Initialize(
+            picker,
+            WinRT.Interop.WindowNative.GetWindowHandle(this));
+    }
+
+    private static string MakeSafeExportFileName(string title)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var safe = new string(title.Trim().Select(character => invalid.Contains(character) ? '_' : character).ToArray());
+        return string.IsNullOrWhiteSpace(safe) ? "Pi-Roundtable-Session" : safe[..Math.Min(safe.Length, 80)];
+    }
+
+    private void UpdateStatusTextIfVisible(string message, string path)
+    {
+        ViewModel.ReportClientStatus($"{message} 文件：{path}");
+    }
+
+    private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
+    {
+        if (_updateOperationCancellation is not null)
+        {
+            return;
+        }
+        _updateOperationCancellation = new CancellationTokenSource();
+        SetUpdateControlsBusy(true);
+        UpdateStatusText.Text = "正在下载并验证签名更新清单…";
+        try
+        {
+            var result = await _updateService.CheckAsync(_updateOperationCancellation.Token);
+            if (result.Availability == UpdateAvailability.Available)
+            {
+                _availableUpdate = result.Manifest;
+                InstallUpdateButton.IsEnabled = true;
+                UpdateStatusText.Text = $"发现已验证更新 {result.AvailableVersion.ToString(3)}（发布于 {result.Manifest.PublishedAt.ToLocalTime():yyyy-MM-dd HH:mm}）。";
+            }
+            else
+            {
+                _availableUpdate = null;
+                InstallUpdateButton.IsEnabled = false;
+                UpdateStatusText.Text = result.AvailableVersion < result.CurrentVersion
+                    ? $"已安装版本 {result.CurrentVersion.ToString(3)} 高于通道版本 {result.AvailableVersion.ToString(3)}，不会降级。"
+                    : $"当前已是最新版本 {result.CurrentVersion.ToString(3)}。";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            UpdateStatusText.Text = "更新检查已取消。";
+        }
+        catch (Exception exception)
+        {
+            _availableUpdate = null;
+            InstallUpdateButton.IsEnabled = false;
+            UpdateStatusText.Text = "检查失败；未下载或执行任何安装包。";
+            ViewModel.ReportClientError($"检查更新失败：{exception.Message}");
+        }
+        finally
+        {
+            _updateOperationCancellation.Dispose();
+            _updateOperationCancellation = null;
+            SetUpdateControlsBusy(false);
+        }
+    }
+
+    private async void InstallUpdate_Click(object sender, RoutedEventArgs e)
+    {
+        if (_availableUpdate is null || _updateOperationCancellation is not null)
+        {
+            return;
+        }
+        var manifest = _availableUpdate;
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = $"安装 Pi Roundtable {manifest.Version.ToString(3)}？",
+            Content = "客户端会先下载到用户数据目录并完成签名清单、精确大小与 SHA-256 校验。通过后将正常结束当前会话和本地 Runtime，再显示 Windows UAC。安装成功后自动重新打开客户端。",
+            PrimaryButtonText = "下载并安装",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        {
+            InstallUpdateButton.Focus(FocusState.Programmatic);
+            return;
+        }
+
+        _updateOperationCancellation = new CancellationTokenSource();
+        SetUpdateControlsBusy(true);
+        UpdateProgressBar.Value = 0;
+        UpdateProgressBar.Visibility = Visibility.Visible;
+        UpdateStatusText.Text = "正在下载并逐字节验证更新包…";
+        try
+        {
+            var progress = new Progress<double>(value =>
+            {
+                UpdateProgressBar.Value = Math.Clamp(value * 100, 0, 100);
+                UpdateStatusText.Text = $"正在下载并验证更新包… {UpdateProgressBar.Value:0}%";
+            });
+            var staged = await _updateService.DownloadAndStageAsync(
+                manifest,
+                progress,
+                _updateOperationCancellation.Token);
+            using var helper = _updateService.LaunchInstallerHelper(staged);
+            UpdateStatusText.Text = "更新包已验证；正在安全结束客户端并移交 Windows Installer…";
+            Close();
+        }
+        catch (OperationCanceledException)
+        {
+            UpdateStatusText.Text = "更新下载已取消；未执行安装包。";
+        }
+        catch (Exception exception)
+        {
+            UpdateStatusText.Text = "更新失败；现有安装保持不变。";
+            ViewModel.ReportClientError($"安装更新失败：{exception.Message}");
+        }
+        finally
+        {
+            _updateOperationCancellation?.Dispose();
+            _updateOperationCancellation = null;
+            if (!_shutdownStarted)
+            {
+                SetUpdateControlsBusy(false);
+                UpdateProgressBar.Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    private void SetUpdateControlsBusy(bool busy)
+    {
+        CheckForUpdatesButton.IsEnabled = !busy;
+        InstallUpdateButton.IsEnabled = !busy && _availableUpdate is not null;
     }
 
     private void ApplyTheme()
@@ -1019,6 +1424,9 @@ public sealed partial class MainWindow : Window
             return;
         }
         _shutdownStarted = true;
+        _toolApprovalDeadlineTimer.Stop();
+        ViewModel.PendingToolApprovals.CollectionChanged -= PendingToolApprovals_CollectionChanged;
+        _updateOperationCancellation?.Cancel();
         try
         {
             await ViewModel.DisposeAsync();
@@ -1026,6 +1434,7 @@ public sealed partial class MainWindow : Window
         finally
         {
             ViewModel.TerminateRuntimeForAppExit();
+            _updateService.Dispose();
             _shutdownComplete = true;
             Close();
         }

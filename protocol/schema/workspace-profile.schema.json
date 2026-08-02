@@ -217,6 +217,21 @@
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/credentialRef" }
         },
+        "toolCatalog": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Reviewed MCP tool identities available for exact per-role selection. This catalog does not itself grant execution.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "displayName"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "displayName": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "description": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            }
+          }
+        },
         "enabled": { "type": "boolean" }
       },
       "allOf": [

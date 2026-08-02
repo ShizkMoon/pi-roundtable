@@ -158,6 +158,93 @@ public sealed class MeetingEventStoreTests
         }
     }
 
+    [TestMethod]
+    public async Task Command_journal_survives_restart_and_never_reopens_an_interrupted_command()
+    {
+        var root = TestRoot();
+        try
+        {
+            const string commandId = "command-durable";
+            var fingerprint = new string('a', 64);
+            var firstStore = new MeetingEventStore(root);
+
+            var reserved = await firstStore.ReserveCommandAsync("meeting-test", commandId, fingerprint);
+            Assert.AreEqual(CommandJournalReservationDisposition.Reserved, reserved.Disposition);
+            Assert.AreEqual("pending", reserved.Status);
+
+            var inProcessDuplicate = await firstStore.ReserveCommandAsync(
+                "meeting-test",
+                commandId,
+                fingerprint);
+            Assert.AreEqual(CommandJournalReservationDisposition.Duplicate, inProcessDuplicate.Disposition);
+            Assert.IsNull(inProcessDuplicate.Receipt);
+
+            var conflict = await firstStore.ReserveCommandAsync(
+                "meeting-test",
+                commandId,
+                new string('b', 64));
+            Assert.AreEqual(CommandJournalReservationDisposition.Conflict, conflict.Disposition);
+
+            await firstStore.MarkCommandInterruptedAsync("meeting-test", commandId, fingerprint);
+
+            var restartedStore = new MeetingEventStore(root);
+            var afterRestart = await restartedStore.ReserveCommandAsync(
+                "meeting-test",
+                commandId,
+                fingerprint);
+            Assert.AreEqual(CommandJournalReservationDisposition.Duplicate, afterRestart.Disposition);
+            Assert.AreEqual("interrupted", afterRestart.Status);
+            Assert.IsNotNull(afterRestart.Receipt);
+            Assert.AreEqual("command_outcome_unknown", afterRestart.Receipt.ErrorCode);
+            Assert.IsFalse(afterRestart.Receipt.Accepted);
+        }
+        finally
+        {
+            DeleteRoot(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task Command_journal_returns_the_identical_completed_receipt_after_restart()
+    {
+        var root = TestRoot();
+        try
+        {
+            const string commandId = "command-completed";
+            var fingerprint = new string('c', 64);
+            var store = new MeetingEventStore(root);
+            await store.ReserveCommandAsync("meeting-test", commandId, fingerprint);
+            var receipt = new RuntimeCommandReceipt(
+                commandId,
+                "accepted",
+                7,
+                null,
+                "sensitive receipt detail");
+            await store.CompleteCommandAsync("meeting-test", fingerprint, receipt);
+
+            var restartedStore = new MeetingEventStore(root);
+            var duplicate = await restartedStore.ReserveCommandAsync(
+                "meeting-test",
+                commandId,
+                fingerprint);
+            Assert.AreEqual(CommandJournalReservationDisposition.Duplicate, duplicate.Disposition);
+            Assert.AreEqual("completed", duplicate.Status);
+            Assert.AreEqual(receipt, duplicate.Receipt);
+
+            foreach (var path in Directory.EnumerateFiles(
+                         Path.GetDirectoryName(store.DatabasePath)!,
+                         "roundtable.db*"))
+            {
+                var text = Encoding.UTF8.GetString(await File.ReadAllBytesAsync(path));
+                Assert.IsFalse(text.Contains("sensitive receipt detail", StringComparison.Ordinal));
+            }
+        }
+        finally
+        {
+            DeleteRoot(root);
+        }
+    }
+
     private static RuntimeMeetingEvent Event(ulong sequence, string kind, string message)
     {
         using var document = JsonDocument.Parse(JsonSerializer.Serialize(new { message }));

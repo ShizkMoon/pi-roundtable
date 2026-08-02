@@ -6,8 +6,14 @@ using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Media;
 using PiRoundtable.Windows.Models;
+using Windows.ApplicationModel.DataTransfer;
 
 namespace PiRoundtable.Windows.Controls;
+
+public sealed class ExternalLinkRequestedEventArgs(Uri uri) : EventArgs
+{
+    public Uri Uri { get; } = uri;
+}
 
 public sealed class MarkdownMessageView : ContentControl
 {
@@ -18,6 +24,9 @@ public sealed class MarkdownMessageView : ContentControl
         new PropertyMetadata(string.Empty, OnTextChanged));
 
     private DispatcherQueueTimer? _renderTimer;
+    private string? _renderedText;
+
+    public event EventHandler<ExternalLinkRequestedEventArgs>? ExternalLinkRequested;
 
     public MarkdownMessageView()
     {
@@ -59,7 +68,12 @@ public sealed class MarkdownMessageView : ContentControl
 
     private void Render()
     {
-        var blocks = SafeMarkdownParser.Parse(Text);
+        var text = Text ?? string.Empty;
+        if (string.Equals(_renderedText, text, StringComparison.Ordinal) && Content is not null)
+        {
+            return;
+        }
+        var blocks = SafeMarkdownParser.Parse(text);
         var root = new StackPanel { Spacing = 8 };
         AutomationProperties.SetName(root, "消息正文");
         foreach (var block in blocks)
@@ -71,20 +85,22 @@ public sealed class MarkdownMessageView : ContentControl
             root.Children.Add(CreateTextBlock([]));
         }
         Content = root;
+        _renderedText = text;
     }
 
-    private static UIElement CreateBlock(MarkdownBlockPresentation block) => block.Kind switch
+    private UIElement CreateBlock(MarkdownBlockPresentation block) => block.Kind switch
     {
         MarkdownBlockKind.Heading => CreateHeading(block),
         MarkdownBlockKind.ListItem => CreateListItem(block),
         MarkdownBlockKind.Quote => CreateQuote(block),
-        MarkdownBlockKind.Code => CreateCodeBlock(block.Text ?? string.Empty),
+        MarkdownBlockKind.Code => CreateCodeBlock(block.Text ?? string.Empty, block.Language),
         MarkdownBlockKind.Math => CreateMathBlock(block.Text ?? string.Empty),
+        MarkdownBlockKind.Table => CreateTable(block.Rows ?? []),
         MarkdownBlockKind.ThematicBreak => CreateDivider(),
         _ => CreateTextBlock(block.Inlines),
     };
 
-    private static TextBlock CreateHeading(MarkdownBlockPresentation block)
+    private TextBlock CreateHeading(MarkdownBlockPresentation block)
     {
         var heading = CreateTextBlock(block.Inlines);
         heading.FontSize = block.Level switch
@@ -98,7 +114,7 @@ public sealed class MarkdownMessageView : ContentControl
         return heading;
     }
 
-    private static Grid CreateListItem(MarkdownBlockPresentation block)
+    private Grid CreateListItem(MarkdownBlockPresentation block)
     {
         var grid = new Grid { Margin = new Thickness(Math.Min(block.Level, 3) * 18, 0, 0, 0) };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -117,7 +133,7 @@ public sealed class MarkdownMessageView : ContentControl
         return grid;
     }
 
-    private static Border CreateQuote(MarkdownBlockPresentation block) => new()
+    private Border CreateQuote(MarkdownBlockPresentation block) => new()
     {
         Padding = new Thickness(12, 6, 8, 6),
         BorderThickness = new Thickness(3, 0, 0, 0),
@@ -127,17 +143,30 @@ public sealed class MarkdownMessageView : ContentControl
         Child = CreateTextBlock(block.Inlines),
     };
 
-    private static Border CreateCodeBlock(string text)
+    private static Border CreateCodeBlock(string text, string? language)
     {
+        var normalizedText = text.TrimEnd();
         var code = new TextBlock
         {
-            Text = text.TrimEnd(),
+            Text = normalizedText,
             FontFamily = new FontFamily("Cascadia Mono, Consolas"),
             FontSize = 12.5,
             IsTextSelectionEnabled = true,
             TextWrapping = TextWrapping.NoWrap,
         };
         AutomationProperties.SetName(code, "代码块");
+        var header = CreateBlockHeader(
+            string.IsNullOrWhiteSpace(language) ? "代码" : $"代码 · {language}",
+            normalizedText,
+            "复制代码");
+        var content = new StackPanel { Spacing = 7 };
+        content.Children.Add(header);
+        content.Children.Add(new ScrollViewer
+        {
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Content = code,
+        });
         return new Border
         {
             Padding = new Thickness(12, 10, 12, 10),
@@ -145,23 +174,12 @@ public sealed class MarkdownMessageView : ContentControl
             BorderBrush = ThemeBrush("CardStrokeColorDefaultBrush"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
-            Child = new ScrollViewer
-            {
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                Content = code,
-            },
+            Child = content,
         };
     }
 
     private static Border CreateMathBlock(string text)
     {
-        var label = new TextBlock
-        {
-            Text = "公式 · LaTeX 源码",
-            FontSize = 11,
-            Foreground = ThemeBrush("TextFillColorSecondaryBrush"),
-        };
         var formula = new TextBlock
         {
             Text = text,
@@ -172,7 +190,7 @@ public sealed class MarkdownMessageView : ContentControl
         };
         AutomationProperties.SetName(formula, "LaTeX 公式源码");
         var content = new StackPanel { Spacing = 4 };
-        content.Children.Add(label);
+        content.Children.Add(CreateBlockHeader("公式 · LaTeX 源码", text, "复制公式源码"));
         content.Children.Add(formula);
         return new Border
         {
@@ -185,6 +203,103 @@ public sealed class MarkdownMessageView : ContentControl
         };
     }
 
+    private Border CreateTable(IReadOnlyList<MarkdownTableRowPresentation> rows)
+    {
+        var table = new Grid { RowSpacing = 1, ColumnSpacing = 1 };
+        var columnCount = rows.Count == 0 ? 0 : rows.Max(row => row.Cells.Count);
+        for (var column = 0; column < columnCount; column++)
+        {
+            table.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = GridLength.Auto,
+                MinWidth = 96,
+                MaxWidth = 360,
+            });
+        }
+        for (var rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            var row = rows[rowIndex];
+            table.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            for (var columnIndex = 0; columnIndex < row.Cells.Count; columnIndex++)
+            {
+                var cellText = CreateTextBlock(row.Cells[columnIndex]);
+                if (row.IsHeader)
+                {
+                    cellText.FontWeight = FontWeights.SemiBold;
+                }
+                var cell = new Border
+                {
+                    Padding = new Thickness(10, 7, 10, 7),
+                    Background = ThemeBrush(row.IsHeader
+                        ? "SubtleFillColorSecondaryBrush"
+                        : "LayerFillColorAltBrush"),
+                    Child = cellText,
+                };
+                Grid.SetRow(cell, rowIndex);
+                Grid.SetColumn(cell, columnIndex);
+                table.Children.Add(cell);
+            }
+        }
+        AutomationProperties.SetName(table, "Markdown 表格");
+        return new Border
+        {
+            BorderBrush = ThemeBrush("CardStrokeColorDefaultBrush"),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Child = new ScrollViewer
+            {
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollMode = ScrollMode.Enabled,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = table,
+            },
+        };
+    }
+
+    private static Grid CreateBlockHeader(string labelText, string copyText, string automationName)
+    {
+        var header = new Grid();
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = labelText,
+            FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = ThemeBrush("TextFillColorSecondaryBrush"),
+        });
+        var copyButton = new Button
+        {
+            Content = "复制",
+            MinHeight = 28,
+            Padding = new Thickness(8, 2, 8, 2),
+            FontSize = 11,
+        };
+        AutomationProperties.SetName(copyButton, automationName);
+        copyButton.Click += (_, _) => CopyText(copyButton, copyText);
+        Grid.SetColumn(copyButton, 1);
+        header.Children.Add(copyButton);
+        return header;
+    }
+
+    private static void CopyText(Button button, string text)
+    {
+        try
+        {
+            var package = new DataPackage();
+            package.SetText(text);
+            Clipboard.SetContent(package);
+            Clipboard.Flush();
+            button.Content = "已复制";
+            AutomationProperties.SetHelpText(button, "内容已复制到剪贴板");
+        }
+        catch
+        {
+            button.Content = "复制失败";
+            AutomationProperties.SetHelpText(button, "剪贴板当前不可用；仍可选择源码手动复制");
+        }
+    }
+
     private static Border CreateDivider() => new()
     {
         Height = 1,
@@ -192,7 +307,7 @@ public sealed class MarkdownMessageView : ContentControl
         Background = ThemeBrush("DividerStrokeColorDefaultBrush"),
     };
 
-    private static TextBlock CreateTextBlock(IReadOnlyList<MarkdownInlinePresentation> presentations)
+    private TextBlock CreateTextBlock(IReadOnlyList<MarkdownInlinePresentation> presentations)
     {
         var textBlock = new TextBlock
         {
@@ -226,9 +341,16 @@ public sealed class MarkdownMessageView : ContentControl
                 run.FontFamily = new FontFamily("Cambria Math");
                 run.Foreground = ThemeBrush("AccentTextFillColorPrimaryBrush");
             }
+            if (presentation.Strikethrough)
+            {
+                run.TextDecorations = global::Windows.UI.Text.TextDecorations.Strikethrough;
+            }
             if (presentation.SafeUrl is not null && Uri.TryCreate(presentation.SafeUrl, UriKind.Absolute, out var uri))
             {
-                var hyperlink = new Hyperlink { NavigateUri = uri };
+                var hyperlink = new Hyperlink();
+                hyperlink.Click += (_, _) => ExternalLinkRequested?.Invoke(
+                    this,
+                    new ExternalLinkRequestedEventArgs(uri));
                 hyperlink.Inlines.Add(run);
                 textBlock.Inlines.Add(hyperlink);
             }
@@ -246,6 +368,12 @@ public sealed class MarkdownMessageView : ContentControl
         {
             return brush;
         }
-        return new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        if (!string.Equals(key, "TextFillColorPrimaryBrush", StringComparison.Ordinal) &&
+            Application.Current?.Resources.TryGetValue("TextFillColorPrimaryBrush", out var fallback) == true &&
+            fallback is Brush fallbackBrush)
+        {
+            return fallbackBrush;
+        }
+        return new SolidColorBrush(Microsoft.UI.Colors.Gray);
     }
 }

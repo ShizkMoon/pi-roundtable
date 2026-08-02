@@ -13,6 +13,7 @@ export interface SubagentRunRequest {
   modelName: string;
   modelCapabilities: ModelCapability[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   apiKey: string;
   cwd: string;
   systemPrompt: string;
@@ -50,6 +51,9 @@ export class PiSubagentRunner implements SubagentRunner {
       modelName: request.modelName,
       modelCapabilities: request.modelCapabilities,
       ...(request.contextWindow === undefined ? {} : { contextWindow: request.contextWindow }),
+      ...(request.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: request.maxOutputTokens }),
       cwd: request.cwd,
       tools: [],
       systemPrompt: [

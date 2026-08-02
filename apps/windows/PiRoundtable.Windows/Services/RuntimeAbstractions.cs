@@ -33,7 +33,8 @@ internal interface IRuntimeHostProcess : IAsyncDisposable
         string? actorId,
         string? targetId,
         IReadOnlyDictionary<string, object?> payload,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        string? commandId = null);
 
     Task StopAsync(RuntimeHostShutdownMode mode, CancellationToken cancellationToken);
 
@@ -42,12 +43,12 @@ internal interface IRuntimeHostProcess : IAsyncDisposable
 
 internal interface IRuntimeHostFactory
 {
-    IRuntimeHostProcess Create();
+    IRuntimeHostProcess Create(IMeetingEventStore eventStore);
 }
 
 internal sealed class RuntimeHostFactory : IRuntimeHostFactory
 {
-    public IRuntimeHostProcess Create() => new RuntimeHostProcess();
+    public IRuntimeHostProcess Create(IMeetingEventStore eventStore) => new RuntimeHostProcess(eventStore);
 }
 
 internal interface IMeetingCoreSession : IDisposable

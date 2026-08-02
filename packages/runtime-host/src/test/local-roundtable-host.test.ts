@@ -212,7 +212,7 @@ const RESUME_SESSION = structuredClone(TEST_SESSION);
 RESUME_SESSION.phase = "live";
 RESUME_SESSION.participants[0]!.capabilitiesSnapshot.skillIds = [];
 
-function createHost(): {
+function createHost(turnTimeoutMs?: number): {
   host: LocalRoundtableHost;
   adapters: Map<string, FakeRuntimeAdapter>;
 } {
@@ -222,6 +222,7 @@ function createHost(): {
     runtimeId: "runtime.windows",
     runtimeGeneration: 1,
     now: () => new Date("2026-08-01T00:00:00.000Z"),
+    ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }),
     adapterFactory: (roleId) => {
       const adapter = new FakeRuntimeAdapter(roleId);
       adapters.set(roleId, adapter);
@@ -374,6 +375,40 @@ test("broadcasts public host messages sequentially with a role-exclusive prompt 
   await host.stop();
 });
 
+test("dispatches an explicitly mentioned public turn only to that role", async () => {
+  const { host, adapters } = createHost();
+  host.start();
+  await host.execute(command("role.add", "add-a", {
+    actorId: "role.a",
+    payload: { displayName: "Architect" },
+  }));
+  await host.execute(command("role.add", "add-b", {
+    actorId: "role.b",
+    payload: { displayName: "Experience reviewer" },
+  }));
+  await host.execute(command("role.add", "add-c", {
+    actorId: "role.c",
+    payload: { displayName: "Risk reviewer" },
+  }));
+  await host.execute(command("meeting.open", "open"));
+
+  const receipt = await host.execute(command("speech.broadcast", "mention-b", {
+    actorId: "user.direct_host",
+    payload: { message: "@Experience reviewer focus on usability", mentions: ["role.b"] },
+  }));
+
+  assert.equal(receipt.status, "accepted");
+  assert.equal(adapters.get("role.a")?.commands.filter((entry) => entry.kind === "turn.prompt").length, 0);
+  assert.equal(adapters.get("role.b")?.commands.filter((entry) => entry.kind === "turn.prompt").length, 1);
+  assert.equal(adapters.get("role.c")?.commands.filter((entry) => entry.kind === "turn.prompt").length, 0);
+  const mentionedPrompt = adapters.get("role.b")?.commands.at(-1);
+  assert.match(
+    mentionedPrompt?.kind === "turn.prompt" ? mentionedPrompt.message : "",
+    /only role answering this turn/i,
+  );
+  await host.stop();
+});
+
 test("resolves a frozen participant manifest into private Pi runtime options", async () => {
   const runtimeDirectory = mkdtempSync(join(tmpdir(), "pi-roundtable-runtime-"));
   mkdirSync(join(runtimeDirectory, "skills", "test"), { recursive: true });
@@ -508,6 +543,7 @@ test("resolves an approved Git MCP grant and its credential references", async (
     arguments: ["server.js"],
     workingDirectory: installation,
     environmentCredentialRefs: { TEST_TOKEN: "memory://mcp.test/token" },
+    toolCatalog: [{ name: "echo", displayName: "Echo" }],
     enabled: true,
   }];
   const session = structuredClone(TEST_SESSION);
@@ -717,6 +753,100 @@ test("preserves a sanitized runtime failure reason on the public terminal event"
   assert.equal(terminalEvents.length, 1);
   assert.equal(terminalEvents[0]?.payload.reason, "failed");
   assert.equal(terminalEvents[0]?.payload.errorCode, "pi_retry_exhausted");
+  await host.stop();
+});
+
+test("cancels a timed-out turn and emits one retryable timeout terminal event", async () => {
+  const { host, adapters } = createHost(20);
+  const terminalEvents: MeetingEvent[] = [];
+  host.subscribe((event) => {
+    if (event.kind === "speech.cancelled") {
+      terminalEvents.push(event);
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-a", { actorId: "role.a" }));
+  await host.execute(command("meeting.open", "open"));
+  await host.execute(command("speech.prompt", "prompt-timeout", {
+    actorId: "role.a",
+    payload: { message: "hang" },
+  }));
+  const roleA = adapters.get("role.a");
+  assert.ok(roleA !== undefined);
+  roleA.onExecute = (runtimeCommand) => {
+    if (runtimeCommand.kind === "turn.cancel") {
+      roleA.emit("turn.cancelled", { reason: "cancelled" }, "prompt-timeout");
+    }
+    return undefined;
+  };
+  roleA.emit("turn.started", {}, "prompt-timeout");
+
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(terminalEvents.length, 1);
+
+  assert.equal(roleA.commands.at(-1)?.kind, "turn.cancel");
+  assert.equal(roleA.commands.at(-1)?.commandId, "prompt-timeout:timeout");
+  assert.equal(terminalEvents[0]?.payload.reason, "timeout");
+  assert.equal(terminalEvents[0]?.payload.errorCode, "turn_timeout");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(terminalEvents.length, 1);
+  await host.stop();
+});
+
+test("retries only the failed role without repeating completed role output", async () => {
+  const { host, adapters } = createHost();
+  const terminalEvents: MeetingEvent[] = [];
+  host.subscribe((event) => {
+    if (event.kind === "speech.completed" || event.kind === "speech.cancelled") {
+      terminalEvents.push(event);
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-a", { actorId: "role.a" }));
+  await host.execute(command("role.add", "add-b", { actorId: "role.b" }));
+  await host.execute(command("meeting.open", "open"));
+  await host.execute(command("speech.broadcast", "round-one", {
+    actorId: "user.direct_host",
+    payload: { message: "Answer once", mentions: ["role.a", "role.b"] },
+  }));
+  const roleA = adapters.get("role.a");
+  const roleB = adapters.get("role.b");
+  assert.ok(roleA !== undefined);
+  assert.ok(roleB !== undefined);
+  const roleAFirst = roleA.commands.find((item) => item.kind === "turn.prompt");
+  assert.ok(roleAFirst !== undefined);
+  roleA.emit("turn.started", {}, roleAFirst.commandId);
+  roleA.emit("turn.completed", {}, roleAFirst.commandId);
+  await waitFor(
+    () => roleB.commands.some((item) => item.kind === "turn.prompt"),
+    "role B did not receive its queued turn",
+  );
+  const roleBFirst = roleB.commands.find((item) => item.kind === "turn.prompt");
+  assert.ok(roleBFirst !== undefined);
+  roleB.emit("turn.started", {}, roleBFirst.commandId);
+  roleB.emit("turn.cancelled", {
+    reason: "failed",
+    errorCode: "pi_retry_exhausted",
+  }, roleBFirst.commandId);
+
+  await host.execute(command("speech.broadcast", "retry-b", {
+    actorId: "user.direct_host",
+    payload: { message: "Answer once", mentions: ["role.b"] },
+  }));
+  const roleBPrompts = roleB.commands.filter((item) => item.kind === "turn.prompt");
+  assert.equal(roleBPrompts.length, 2);
+  roleB.emit("turn.started", {}, roleBPrompts[1]!.commandId);
+  roleB.emit("turn.completed", {}, roleBPrompts[1]!.commandId);
+
+  assert.equal(roleA.commands.filter((item) => item.kind === "turn.prompt").length, 1);
+  assert.deepEqual(
+    terminalEvents.map((event) => `${event.actorId}:${event.kind}`),
+    [
+      "role.a:speech.completed",
+      "role.b:speech.cancelled",
+      "role.b:speech.completed",
+    ],
+  );
   await host.stop();
 });
 

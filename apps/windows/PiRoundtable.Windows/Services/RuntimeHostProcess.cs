@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -42,12 +44,17 @@ internal sealed record RuntimeMeetingEvent(
 
 internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 {
+    private sealed record PendingRuntimeCommand(
+        string Fingerprint,
+        TaskCompletionSource<RuntimeCommandReceipt> Completion);
+
     private static readonly Encoding Utf8WithoutBom = new UTF8Encoding(false, true);
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
-    private readonly ConcurrentDictionary<string, TaskCompletionSource<RuntimeCommandReceipt>> _pending = new();
+    private readonly ConcurrentDictionary<string, PendingRuntimeCommand> _pending = new();
+    private readonly IMeetingEventStore? _commandJournal;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
     private readonly TaskCompletionSource _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,6 +71,11 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
     private ulong _expectedReadySequence;
     private int _stderrReported;
     private bool _disposed;
+
+    public RuntimeHostProcess(IMeetingEventStore? commandJournal = null)
+    {
+        _commandJournal = commandJournal;
+    }
 
     public event EventHandler<RuntimeMeetingEvent>? MeetingEventReceived;
 
@@ -143,7 +155,8 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
         string? actorId,
         string? targetId,
         IReadOnlyDictionary<string, object?> payload,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? commandId = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_stdin is null)
@@ -151,13 +164,24 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             throw new InvalidOperationException("Runtime Host is not ready.");
         }
 
-        var commandId = Guid.NewGuid().ToString("N");
+        commandId = string.IsNullOrWhiteSpace(commandId)
+            ? Guid.NewGuid().ToString("N")
+            : commandId.Trim();
+        var fingerprint = CreateCommandFingerprint(kind, actorId, targetId, payload);
         var completion = new TaskCompletionSource<RuntimeCommandReceipt>(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        if (!_pending.TryAdd(commandId, completion))
+        var pending = new PendingRuntimeCommand(fingerprint, completion);
+        if (!_pending.TryAdd(commandId, pending))
         {
-            throw new InvalidOperationException("Could not reserve a command ID.");
+            var existing = _pending[commandId];
+            if (!string.Equals(existing.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                return CommandConflict(commandId);
+            }
+            return await existing.Completion.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
         }
+
+        var journalReserved = false;
 
         var command = new Dictionary<string, object?>
         {
@@ -180,12 +204,53 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 
         try
         {
+            if (_commandJournal is not null)
+            {
+                var reservation = await _commandJournal.ReserveCommandAsync(
+                    _meetingId,
+                    commandId,
+                    fingerprint,
+                    cancellationToken);
+                if (reservation.Disposition == CommandJournalReservationDisposition.Conflict)
+                {
+                    return CommandConflict(commandId);
+                }
+                if (reservation.Disposition == CommandJournalReservationDisposition.Duplicate)
+                {
+                    return reservation.Receipt ?? new RuntimeCommandReceipt(
+                        commandId,
+                        "rejected",
+                        null,
+                        "command_outcome_unknown",
+                        "该命令已在先前进程中开始，但没有持久终态；为避免重复副作用，本次不会重放。");
+                }
+                journalReserved = true;
+            }
             await WriteFrameAsync(new Dictionary<string, object?>
             {
                 ["type"] = "command",
                 ["command"] = command,
             }, cancellationToken);
             return await completion.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+        catch
+        {
+            if (journalReserved && _commandJournal is not null)
+            {
+                try
+                {
+                    await _commandJournal.MarkCommandInterruptedAsync(
+                        _meetingId,
+                        commandId,
+                        fingerprint,
+                        CancellationToken.None);
+                }
+                catch
+                {
+                    // Preserve the original process/transport failure. The pending journal row still blocks replay.
+                }
+            }
+            throw;
         }
         finally
         {
@@ -328,7 +393,7 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             try
             {
                 using var document = JsonDocument.Parse(line);
-                HandleFrame(document.RootElement);
+                await HandleFrameAsync(document.RootElement, cancellationToken);
             }
             catch (JsonException error)
             {
@@ -360,7 +425,7 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
         }
     }
 
-    private void HandleFrame(JsonElement frame)
+    private async Task HandleFrameAsync(JsonElement frame, CancellationToken cancellationToken)
     {
         if (!frame.TryGetProperty("type", out var typeElement))
         {
@@ -404,7 +469,7 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
                 }
                 break;
             case "receipt":
-                HandleReceipt(frame.GetProperty("receipt"));
+                await HandleReceiptAsync(frame.GetProperty("receipt"), cancellationToken);
                 break;
             case "event":
                 HandleEvent(frame.GetProperty("event"));
@@ -459,19 +524,35 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
         }).ToArray());
     }
 
-    private void HandleReceipt(JsonElement receipt)
+    private async Task HandleReceiptAsync(JsonElement receipt, CancellationToken cancellationToken)
     {
         var commandId = receipt.GetProperty("commandId").GetString();
-        if (commandId is null || !_pending.TryGetValue(commandId, out var completion))
+        if (commandId is null || !_pending.TryGetValue(commandId, out var pending))
         {
             return;
         }
-        completion.TrySetResult(new RuntimeCommandReceipt(
+        var runtimeReceipt = new RuntimeCommandReceipt(
             commandId,
             receipt.GetProperty("status").GetString() ?? "rejected",
             receipt.TryGetProperty("sequence", out var sequence) ? sequence.GetUInt64() : null,
             receipt.TryGetProperty("errorCode", out var errorCode) ? errorCode.GetString() : null,
-            receipt.TryGetProperty("message", out var message) ? message.GetString() : null));
+            receipt.TryGetProperty("message", out var message) ? message.GetString() : null);
+        try
+        {
+            if (_commandJournal is not null)
+            {
+                await _commandJournal.CompleteCommandAsync(
+                    _meetingId,
+                    pending.Fingerprint,
+                    runtimeReceipt,
+                    cancellationToken);
+            }
+            pending.Completion.TrySetResult(runtimeReceipt);
+        }
+        catch (Exception error)
+        {
+            pending.Completion.TrySetException(error);
+        }
     }
 
     private void HandleEvent(JsonElement eventElement)
@@ -536,12 +617,82 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
     {
         foreach (var commandId in _pending.Keys)
         {
-            if (_pending.TryRemove(commandId, out var completion))
+            if (_pending.TryRemove(commandId, out var pending))
             {
-                completion.TrySetException(error);
+                pending.Completion.TrySetException(error);
             }
         }
     }
+
+    internal static string CreateCommandFingerprint(
+        string kind,
+        string? actorId,
+        string? targetId,
+        IReadOnlyDictionary<string, object?> payload)
+    {
+        var value = JsonSerializer.SerializeToElement(new Dictionary<string, object?>
+        {
+            ["kind"] = kind,
+            ["actorId"] = actorId,
+            ["targetId"] = targetId,
+            ["payload"] = payload,
+        }, SerializerOptions);
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = false }))
+        {
+            WriteCanonicalJson(writer, value);
+        }
+        return Convert.ToHexString(SHA256.HashData(buffer.WrittenSpan)).ToLowerInvariant();
+    }
+
+    private static void WriteCanonicalJson(Utf8JsonWriter writer, JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject().OrderBy(item => item.Name, StringComparer.Ordinal))
+                {
+                    writer.WritePropertyName(property.Name);
+                    WriteCanonicalJson(writer, property.Value);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                {
+                    WriteCanonicalJson(writer, item);
+                }
+                writer.WriteEndArray();
+                break;
+            case JsonValueKind.String:
+                writer.WriteStringValue(value.GetString());
+                break;
+            case JsonValueKind.Number:
+                writer.WriteRawValue(value.GetRawText(), skipInputValidation: false);
+                break;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                break;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                break;
+            case JsonValueKind.Null:
+            case JsonValueKind.Undefined:
+                writer.WriteNullValue();
+                break;
+            default:
+                throw new InvalidDataException("命令载荷包含不支持的 JSON 值。");
+        }
+    }
+
+    private static RuntimeCommandReceipt CommandConflict(string commandId) => new(
+        commandId,
+        "rejected",
+        null,
+        "command_id_conflict",
+        "同一命令 ID 不能用于不同命令内容。");
 
     private void ReportDiagnostic(string message)
     {

@@ -6,14 +6,14 @@
 
 ## 结论
 
-Pi Roundtable 已经越过“静态 UI 原型”阶段：Windows 客户端、C++ 会议内核、Pi Runtime Host、规范化事件、公开/私聊、暂停恢复、工具审批、受限 SubAgent、加密持久化和自包含 x64 打包均有实现。2026-08-02 的真实 DeepSeek 验收还证明了三角色、两轮、每轮每角色恰好一次完成输出的本地全链路。
+Pi Roundtable 已经越过“静态 UI 原型”阶段：Windows 客户端、C++ 会议内核、Pi Runtime Host、规范化事件、公开/私聊、暂停恢复、工具审批、受限 SubAgent、加密持久化、自包含 x64 打包和签名清单更新链路均有实现。2026-08-02 的最新真实 DeepSeek 验收证明了严格路由的本地全链路：单点名轮只有 1 个目标回答，双点名轮只有 2 个目标回答，总计且仅有 3 条完成输出。
 
-当前最重要的工作不再是继续扩大参考项目兼容面，而是让现有闭环具备可恢复、可审计、可长期使用的质量。优先级依次是：
+本轮 P0/P1 已把本地闭环推进到可恢复、可审计、可长期试用的状态。后续优先级依次是：
 
-1. 让命令幂等、工具授权和恢复场景经得住进程重启，而不只在单进程内成立；
-2. 用真实 Windows 场景覆盖取消、交接、审批、失败重试和恢复，而不只验证正常生成；
-3. 控制长记录的性能和信息密度，并补全无障碍、缩放和多宽度视觉矩阵；
-4. 在本地 alpha 稳定后，再建设认证、私有 audience、持久数据库和 E2EE 的远程平面。
+1. 完成 0.1→0.2 的真实安装更新、GitHub 发布和安装生命周期验收；
+2. 在不放宽安全边界的前提下决定是否引入真正的离线数学排版；
+3. 把已经实现的设备鉴权、私有 audience 和 PostgreSQL 后端接到 Windows/Android，并补 TLS、限流、E2EE 与多副本通知；
+4. 在 Windows 本地质量门稳定前，不扩大运行时兼容面；Oh My Pi 继续只作历史架构参考。
 
 ## 证据口径
 
@@ -44,46 +44,44 @@ Pi Roundtable 已经越过“静态 UI 原型”阶段：Windows 客户端、C++
 
 - 公共协议：版本化 Schema、公开/私有可见性、`runtimeGeneration`、工作区/会话/冻结参与者清单。
 - C++20 Core：权威 Runtime Owner、全局顺序、租约代次、角色生命周期、中断与交接、窄 C ABI。
-- Pi Runtime Host：每角色独立 Session、逐角色模型/System Prompt/Skill/MCP、取消、失败归一化、工具审批、最多两个且不可递归的隔离 SubAgent。
-- Windows：Session-first WinUI 3 壳、会话/角色/Skill/MCP/设置、公开记录/私聊、Windows Credential Manager、DPAPI + SQLite 事件存储、重放、暂停/恢复、本地 Runtime 监督。
+- Pi Runtime Host：每角色独立 Session、逐角色模型/System Prompt/Skill/MCP、取消、失败归一化、持久命令回执、精确 deny-by-default tool allowlist、工具审批、最多两个且不可递归的隔离 SubAgent；冻结角色输出 token 上限会传递到 Pi Session。
+- Windows：Session-first WinUI 3 壳、会话/角色/Skill/MCP/设置、公开记录/私聊、Windows Credential Manager、DPAPI + SQLite 事件/命令存储、重放、暂停/恢复、本地 Runtime 监督、会话导出/导入预检和签名清单更新器。
 - `@` 角色边界：公开消息仍对所有参与者可见，但只有被 `@` 的目标进入顺序发言队列；每个目标收到含自身 `roleId`/显示名的独占提示，禁止代写其他被提及角色的回答。
-- 原生 Markdown：标题、段落、粗体、斜体、列表、引用、代码块、分隔线、安全链接和行内数学标记均在 WinUI 原生控件中呈现。
-- 长记录跟随：默认合并跟随最新流式内容；用户离开底部后不抢滚动并显示“跳到最新”；发送、重试或切换上下文时恢复跟随。
+- 原生 Markdown：标题、段落、粗体、斜体、删除线、列表、任务项、表格、引用、代码块/复制、分隔线、安全链接和数学源码均在 WinUI 原生控件中呈现；原始 HTML 和危险 URL 不执行。
+- 长记录：ListView 虚拟化；默认合并跟随最新流式内容；用户离开底部后不抢滚动并显示“跳到最新”；发送、重试或切换上下文时恢复跟随。
+- 受控远端后端：签名设备令牌、meeting/audience/runtime/expiry 范围、私有 replay/SSE audience 过滤、可选 PostgreSQL 事务存储和幂等迁移。
 - Windows x64：自包含发布、内置 Node/Pi Runtime Host/C++ Core、WiX 4 MSI 构建管线。
 
 ### Verified
 
-- Runtime Host 定向测试：42/42。
-- Windows 测试：22/22，包含安全 Markdown、LaTeX 源码回退和记录跟随阈值。
-- 真实 DeepSeek/Pi：`deepseek-v4-flash`，三角色、两轮、每轮各角色恰好一个完成输出，共 6 个非空输出；证据只保存角色、字符数、SHA-256、事件归属和截图，不保存 Key。
-- 最新本机证据：`out/e2e/deepseek-20260802-012507-1a5c4e66/evidence.json`；临时 Windows 凭据在退出后已删除。
+- Runtime Host、协议、同步服务、Windows、C++ Core 的本机测试套件通过；最终发布以 CI 和打包脚本重新运行的结果为准。
+- Windows 1000 条记录场景：启动和滚动保持响应，实际只实现可见窗口附近的少量容器；720/900/1280/1520 DIP 与 150% DPI 矩阵完成截图/UIA 检查。
+- 真实 DeepSeek/Pi：`deepseek-v4-flash`；单点名只有体系架构师，双点名只有产品体验官和风险审查员，总计且仅有 3 个非空完成输出；首轮同时核验表格、已勾选任务项、LaTeX 源码块和 PowerShell 代码块。
+- 最新本机证据：`out/e2e/deepseek-20260802-073851-e423f64d/evidence.json`；证据只保存字符数/SHA-256/角色归属与截图，Key 逐文件扫描为零，临时 Windows 凭据已删除。`out/` 不进入版本控制。
 
 ### Scaffolded
 
-- 同步服务：租约、内存事件日志、游标回放、HTTP/SSE 开发面；无认证，拒绝不可信私有事件。
 - Android：Compose Material 3 自适应 UI 脚手架；未接入生产同步和私有 audience。
 
 ### Pending
 
-- 进程重启后仍有效的 durable command receipt / 幂等去重。
-- MCP 精确到 tool 的可视化 allowlist 编辑和变更事件；当前批准并附加的 server 在 allowlist 为空时会暴露其全部发现工具。
-- 真实取消、打断交接、工具批准/拒绝、provider 失败/重试、暂停恢复和崩溃恢复 E2E。
 - 真正的数学排版引擎。当前只把 LaTeX 作为安全、可复制的源码样式呈现，不宣称已经排版公式。
-- 超长 transcript 的分段虚拟化/折叠、代码块横向滚动与复制操作、审批焦点/过期状态、完整无障碍矩阵。
-- 认证远程同步、服务端持久数据库、私有 audience 授权、E2EE、限流和分布式租约。
-- 代码签名、真实安装/卸载/修复/升级矩阵、ARM64；Android 真实同步。
+- Windows/Android 到远端后端的完整认证同步、客户端内容 E2EE、key-envelope 管理、TLS、限流、保留任务和多副本通知。
+- MSI Authenticode、完整安装/卸载/修复/升级矩阵、ARM64；Android 真实同步。
+- 100%/200%、深色和系统高对比的完整人工视觉矩阵；当前自动矩阵验证了 150% DPI、多宽度、UIA 名称、键盘焦点和浅色渲染，控件使用动态 ThemeResource。
 
 ## 本轮实施细节
 
 ### `@` 只让目标角色回答自己
 
-路由层本来已经能够把多个 mention 解析成目标角色并顺序排队，缺陷在于所有角色收到同一个泛化提示。修复只包裹交给单个 Pi adapter 的 prompt，不修改公共用户消息和规范化事件：
+路由层把一个或多个 mention 解析成目标角色并顺序排队。修复同时约束 UI 解析和交给单个 Pi adapter 的提示，不修改公共用户消息和规范化事件：
 
 - 明确当前唯一答复身份的显示名与 `roleId`；
 - 要求只从本角色职责和视角作答；
 - 禁止为其他被 mention 角色拟稿、模拟、总结成替代答复或创建其答复分栏；
 - 仍允许引用公开记录并与其他角色观点发生分歧；
 - 私聊仍只进入指定角色的隔离上下文。
+- 独立的 `@` 是普通正文/Markdown 标点，不会被误判为一个空角色名；未知的非空 `@角色` 仍会显式报错，避免无意回退成全员回应。
 
 这一区分保留了圆桌的公共可见性，也避免把“谁能看到消息”错误地等同于“谁应当代答”。
 
@@ -107,48 +105,36 @@ Pi Roundtable 已经越过“静态 UI 原型”阶段：Windows 客户端、C++
 - 明确按钮恢复到最新；
 - 历史会话载入和 Markdown 延迟布局使用短暂稳定窗口，避免滚动到最后一条的顶部而不是末尾。
 
-## 后续详细执行计划
+## 执行结果与剩余计划
 
-### P0：可靠本地 alpha
+### P0：可靠本地 alpha — implemented / verified
 
-1. **Durable command receipt**
-   - receipt 写入受保护的本地事件/命令存储；
-   - 重启后重复 command ID 返回先前结果或明确终态，不再次触发模型/工具副作用；
-   - 验收：在模型请求前、响应中、事件落盘前后四个切点强杀进程，恢复后副作用次数始终为 0 或 1。
-2. **精确工具授权**
-   - Workspace catalog 维护 server；Role/Participant Manifest 保存明确 tool allowlist；
-   - 空列表的产品语义从“全部工具”改为显式选择或清楚的全量授权确认；
-   - 验收：未列出的工具不进入 Pi 工具表，批准事件也不能越权扩大范围。
-3. **故障 E2E 套件**
-   - 真实/可控 provider 覆盖取消、打断交接、超时、失败重试；
-   - mock MCP 覆盖批准、拒绝、首次记忆批准和副作用计数；
-   - 暂停/恢复与崩溃恢复核验 sequence、generation、私有 audience 和重复输出。
-4. **可发布门禁**
-   - 每次 x64 包运行 C++、TypeScript、Windows 测试；
-   - 管理提取和提取目录启动；
-   - 凭据内容扫描必须为零；MSI 记录 SHA-256。
+1. Durable command receipt 已进入受保护的 SQLite 存储，四个强杀切点验证副作用不超过一次。
+2. MCP allowlist 已精确到 tool，空列表不授权；未列出工具不能因审批而越权暴露。
+3. 可控 provider/MCP 已覆盖取消、打断、超时、重试、批准/拒绝/首次记忆批准、暂停/崩溃恢复。
+4. x64 打包脚本运行 C++、TypeScript、Windows 测试，并执行资源、管理提取、提取目录启动、凭据扫描和 MSI 哈希门禁。
 
-### P1：长期桌面使用质量
+### P1：长期桌面使用质量 — implemented；公式排版与补充视觉矩阵 pending
 
-1. transcript 分段虚拟化或折叠，验证 1,000 条消息、长代码块和持续流式输入下的内存/帧率；
-2. 代码块复制、外部链接确认、公式源码复制；若引入真公式排版，必须离线、无脚本注入、可缓存并提供纯文本可访问替代；
-3. 宽度 720/900/1280/1520、100%/200% 缩放、浅色/深色/高对比、键盘和屏幕阅读器截图/自动化矩阵；
-4. 工具审批加入到期状态、焦点恢复和来源说明；失败卡片提供就地重试且不重复已完成角色；
-5. 可导出的规范化 Markdown/JSON 会话包和非破坏性导入预检。
+1. transcript 使用原生虚拟化，1000 条消息场景验证实际容器数量保持有界。
+2. 代码块、公式源码支持复制；外部链接显示完整目标并确认后交给默认浏览器。
+3. 720/900/1280/1520 DIP、150% DPI、UIA 名称/焦点和浅色截图已验证；100%/200%、深色和实际系统高对比仍需补充人工矩阵。
+4. 工具审批具有到期状态与焦点恢复；失败角色可以就地重试，不重跑已完成角色。
+5. 会话可导出规范化 JSON/Markdown，并在非破坏性导入前完成 schema、ID、模型路由和凭据引用预检。
 
-### P1：受控远程平面
+### P1：受控远程平面 — backend implemented；client integration pending
 
-1. 身份认证和设备/用户 audience；
-2. PostgreSQL 等持久事件存储和可验证游标；
-3. 私有事件授权过滤、密钥轮换、E2EE 设计与迁移；
-4. 远程只转发/持久化规范化事件，默认不执行模型。
+1. 签名设备令牌绑定用户、设备、meeting、audience、runtime 和 expiry，并支持验证密钥轮换。
+2. PostgreSQL store、事务租约/序号/事件、持久 cursor 和私有 audience 过滤已实现；内存模式明确只供本机开发。
+3. E2EE 内容加密、envelope 管理 API、TLS、限流、保留任务和多副本通知仍 pending。
+4. 服务器继续只转发/持久化规范化事件，默认不执行模型。
 
-### P2：分发与第二平台
+### P2：分发与第二平台 — pending
 
-1. 代码签名、SmartScreen/安装/卸载/升级/修复矩阵；
-2. ARM64 打包；
-3. Android 作为 UI-only 客户端接入认证同步、断线游标恢复和前台流；
-4. 在 Windows 本地 alpha 的 P0 验收完成前，不并行扩展新的运行时兼容面。
+1. 完成本次 0.1→0.2 真实更新后，继续补 Authenticode、SmartScreen 和完整安装/卸载/升级/修复矩阵。
+2. ARM64 打包。
+3. Android 作为 UI-only 客户端接入认证同步、断线游标恢复和前台流。
+4. 不新增 Oh My Pi 或其他运行时兼容面；Pi 保持唯一运行时。
 
 ## 验收矩阵
 

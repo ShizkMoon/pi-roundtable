@@ -86,7 +86,14 @@ export interface McpServerProfile {
   endpoint?: string;
   environmentCredentialRefs?: Record<string, CredentialRef>;
   headerCredentialRefs?: Record<string, CredentialRef>;
+  toolCatalog?: McpToolProfile[];
   enabled: boolean;
+}
+
+export interface McpToolProfile {
+  name: string;
+  displayName: string;
+  description?: string;
 }
 
 export interface ModelRoute {
