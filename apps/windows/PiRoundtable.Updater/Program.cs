@@ -19,6 +19,54 @@ internal sealed record UpdateArguments(
     long ParentStartTimeUtcTicks,
     string RestartExecutable);
 
+public static class ParentProcessFence
+{
+    public static async Task WaitForExitAsync(
+        int processId,
+        long expectedStartTimeUtcTicks,
+        TimeSpan? timeout = null)
+    {
+        Process parent;
+        try
+        {
+            parent = Process.GetProcessById(processId);
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        using (parent)
+        {
+            long actualTicks;
+            try
+            {
+                actualTicks = parent.StartTime.ToUniversalTime().Ticks;
+            }
+            catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+            {
+                return;
+            }
+
+            if (actualTicks != expectedStartTimeUtcTicks)
+            {
+                throw new InvalidOperationException("Parent process identity changed before update handoff.");
+            }
+
+            using var timeoutSource = new CancellationTokenSource(timeout ?? TimeSpan.FromMinutes(3));
+            try
+            {
+                await parent.WaitForExitAsync(timeoutSource.Token);
+            }
+            catch (InvalidOperationException)
+            {
+                // The verified parent can exit between identity verification and
+                // registering the wait. That is the desired handoff state.
+            }
+        }
+    }
+}
+
 internal static class Program
 {
     private static readonly string LogPath = Path.Combine(
@@ -147,14 +195,9 @@ internal static class Program
 
     private static async Task WaitForParentAsync(UpdateArguments arguments)
     {
-        using var parent = Process.GetProcessById(arguments.ParentProcessId);
-        var actualTicks = parent.StartTime.ToUniversalTime().Ticks;
-        if (actualTicks != arguments.ParentStartTimeUtcTicks)
-        {
-            throw new InvalidOperationException("Parent process identity changed before update handoff.");
-        }
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
-        await parent.WaitForExitAsync(timeout.Token);
+        await ParentProcessFence.WaitForExitAsync(
+            arguments.ParentProcessId,
+            arguments.ParentStartTimeUtcTicks);
     }
 
     private static void Restart(string executable)
