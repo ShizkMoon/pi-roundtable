@@ -45,6 +45,7 @@ function Invoke-CheckedWixBuild {
         [string]$WorkingDirectory,
 
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [string[]]$ExpectedIce03FileIds
     )
 
