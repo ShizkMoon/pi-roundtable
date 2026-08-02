@@ -15,11 +15,11 @@ Meeting identity, runtime identity, generation, and non-secret process overrides
 
 The Windows projection applies every normalized event to the C++ meeting core before updating visible state. A rejected sequence, generation, phase, speaker, role, or interruption transition is therefore surfaced instead of silently becoming UI state.
 
-The local host starts with built-in tools and subagents disabled. It supports meeting open/close, long-term and temporary role creation, temporary-role promotion, role archive/removal, prompting, cancellation, explicit interrupt-then-handoff, explicitly granted Skill paths, and approved MCP tool discovery/execution. Durable long-term memory, prompt optimization, per-tool interactive approval, SubAgent-isolated execution, recovery checkpoints, and remote failover remain planned.
+The local host starts with built-in tools and delegation disabled unless the frozen participant manifest grants them. It supports meeting open/close, long-term and temporary role creation, temporary-role promotion, role archive/removal, prompting, cancellation, explicit interrupt-then-handoff, explicitly granted Skill paths, approved MCP tool discovery/execution, private interactive tool approval, and bounded non-recursive Pi SubAgents. Windows recovery checkpoints and normalized event replay are implemented above the Host boundary. Durable long-term memory, prompt optimization, exact Pi private-session restoration, and remote failover remain planned.
 
 ## Consequences
 
 - A normal Windows meeting no longer depends on the sync server.
 - Multiple role sessions share one authoritative sequence and runtime generation.
 - The stdio wrapper is a local transport; the payloads remain the public protocol contract.
-- The current developer build requires Node, the built Runtime Host output, and a built x64 C++ core. MSI bundling and ARM64 native-core packaging remain separate work.
+- The developer build requires Node, the built Runtime Host output, and a built x64 C++ core. The unsigned x64 MSI bundles those dependencies for end users; signing and ARM64 native-core packaging remain separate work.

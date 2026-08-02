@@ -4,6 +4,8 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Windows", "PiRoundtable.Windows\PiRoundtable.Windows.csproj", "{6F821D4B-5B9E-45E8-B8CE-4B0A31442BE7}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Windows.Tests", "tests\PiRoundtable.Windows.Tests\PiRoundtable.Windows.Tests.csproj", "{E9B7C998-0AD9-49E7-98C1-BED75C58B170}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -20,5 +22,13 @@ Global
 		{6F821D4B-5B9E-45E8-B8CE-4B0A31442BE7}.Release|ARM64.Build.0 = Release|ARM64
 		{6F821D4B-5B9E-45E8-B8CE-4B0A31442BE7}.Release|x64.ActiveCfg = Release|x64
 		{6F821D4B-5B9E-45E8-B8CE-4B0A31442BE7}.Release|x64.Build.0 = Release|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Debug|ARM64.ActiveCfg = Debug|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Debug|ARM64.Build.0 = Debug|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Debug|x64.ActiveCfg = Debug|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Debug|x64.Build.0 = Debug|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|ARM64.ActiveCfg = Release|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|ARM64.Build.0 = Release|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|x64.ActiveCfg = Release|x64
+		{E9B7C998-0AD9-49E7-98C1-BED75C58B170}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 EndGlobal

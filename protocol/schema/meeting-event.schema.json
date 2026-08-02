@@ -44,6 +44,8 @@
         "speech.cancelled",
         "interruption.requested",
         "tool.started",
+        "tool.approval_requested",
+        "tool.approval_resolved",
         "tool.completed",
         "tool.failed",
         "subagent.spawned",

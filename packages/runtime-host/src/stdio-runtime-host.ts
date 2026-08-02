@@ -12,7 +12,10 @@ import {
   parseLocalHostInput,
   type LocalHostOutputFrame,
 } from "./local-host-protocol.js";
-import { LocalRoundtableHost } from "./local-roundtable-host.js";
+import {
+  LocalRoundtableHost,
+  type LocalHostStopMode,
+} from "./local-roundtable-host.js";
 
 const HOST_CAPABILITIES: RuntimeCapabilities = {
   steering: true,
@@ -77,6 +80,7 @@ export class StdioRuntimeHost {
     const lines = createInterface({ input, crlfDelay: Infinity, terminal: false });
     let initialized = false;
     let shutdownRequestId: string | null = null;
+    let shutdownMode: LocalHostStopMode = "suspend";
     try {
       for await (const line of lines) {
         if (line.length === 0) {
@@ -89,6 +93,7 @@ export class StdioRuntimeHost {
           if (!initialized) {
             if (frame.type === "shutdown") {
               shutdownRequestId = frame.requestId;
+              shutdownMode = frame.mode;
               break;
             }
             if (frame.type !== "initialize") {
@@ -120,8 +125,12 @@ export class StdioRuntimeHost {
                   frame.workspace,
                   frame.session,
                   frame.credentials,
+                  frame.initialSequence,
                 );
                 this.host.start();
+                if (frame.session.phase === "live") {
+                  await this.host.restoreConfiguredRoles();
+                }
                 initialized = true;
                 await writer.write({
                   type: "ready",
@@ -129,6 +138,7 @@ export class StdioRuntimeHost {
                   meetingId: this.host.meetingId,
                   runtimeId: this.host.runtimeId,
                   runtimeGeneration: this.host.runtimeGeneration,
+                  sequence: this.host.sequence,
                   capabilities: HOST_CAPABILITIES,
                 });
                 while (pendingInitializationFrames.length > 0) {
@@ -154,6 +164,7 @@ export class StdioRuntimeHost {
             };
           } else if (frame.type === "shutdown") {
             shutdownRequestId = frame.requestId;
+            shutdownMode = frame.mode;
             break;
           } else {
             response = { type: "receipt", receipt: await this.host.execute(frame.command) };
@@ -180,7 +191,7 @@ export class StdioRuntimeHost {
         }
       }
     } finally {
-      await this.host.stop();
+      await this.host.stop(shutdownMode);
       unsubscribeEvents();
       unsubscribeDiagnostics();
       await writer.write({ type: "stopped", requestId: shutdownRequestId });

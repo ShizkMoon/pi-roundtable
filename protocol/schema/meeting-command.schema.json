@@ -24,6 +24,7 @@
         "speech.interrupt",
         "generation.cancel",
         "subagent.spawn",
+        "tool.approval.resolve",
         "tool.invoke"
       ]
     },

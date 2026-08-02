@@ -28,6 +28,8 @@ internal enum NativeEventKind
     RoleArchived = 20,
     MessagePublished = 21,
     MessageDirectSent = 22,
+    ToolApprovalRequested = 23,
+    ToolApprovalResolved = 24,
 }
 
 internal enum NativeEventVisibility
@@ -98,7 +100,7 @@ internal static partial class NativeMeetingCore
     internal static partial nint ApplyErrorMessage(int error);
 }
 
-internal sealed class MeetingCoreSession : IDisposable
+internal sealed class MeetingCoreSession : IMeetingCoreSession
 {
     private readonly NativeMeetingHandle _handle;
 
@@ -177,6 +179,8 @@ internal sealed class MeetingCoreSession : IDisposable
             "speech.cancelled" => NativeEventKind.SpeechCancelled,
             "interruption.requested" => NativeEventKind.InterruptionRequested,
             "tool.started" => NativeEventKind.ToolStarted,
+            "tool.approval_requested" => NativeEventKind.ToolApprovalRequested,
+            "tool.approval_resolved" => NativeEventKind.ToolApprovalResolved,
             "tool.completed" => NativeEventKind.ToolCompleted,
             "tool.failed" => NativeEventKind.ToolFailed,
             "subagent.spawned" => NativeEventKind.SubagentSpawned,

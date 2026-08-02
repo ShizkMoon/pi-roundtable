@@ -2,9 +2,9 @@
 
 ## Architecture invariants
 
-- Treat `protocol/schema` as the public cross-platform contract. Do not expose raw OMP session records or internal TypeScript types to clients.
+- Treat `protocol/schema` as the public cross-platform contract. Do not expose raw Pi session records or internal TypeScript types to clients.
 - Keep `core` deterministic, C++20, dependency-light, and free of network/UI/runtime-process concerns.
-- Keep all Pi/Oh My Pi compatibility code inside `packages/runtime-host`.
+- Keep all Pi SDK integration code inside `packages/runtime-host`.
 - A meeting has one authoritative runtime owner at a time. Every write must carry the active `runtimeGeneration`.
 - The sync server relays and persists normalized events; it is not the default model executor.
 - Android is a UI-only client. Windows owns the local runtime in the first implementation cycle.
@@ -22,4 +22,4 @@ Before handing off a change, run the smallest relevant checks:
 - Android: `apps/android/gradlew.bat -p apps/android :app:assembleDebug` when JDK/SDK and network/cache permit.
 - WinUI: `dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj` when the required SDK/workload is installed.
 
-Do not commit generated build output, credentials, raw `.omp` sessions, or local server data.
+Do not commit generated build output, credentials, raw Pi sessions, or local server data.

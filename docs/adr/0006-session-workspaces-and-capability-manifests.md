@@ -18,7 +18,7 @@ Pi Roundtable uses four distinct layers:
 3. A **role profile** is a reusable long-term identity. Joining a session creates a participant binding with frozen prompt, model, memory, and capability snapshots so later profile edits do not rewrite history.
 4. A **temporary-role invitation** is a session-scoped capability manifest. It requires an inviter, purpose, complete system prompt, explicit model route, explicit Skill/MCP/tool grants, delegation rules, and retention policy before the Runtime Host may create the role.
 
-The current Windows milestone persists the session definition and its frozen participant manifests. Durable normalized transcript/event history is a separate planned store, so reopening currently restores configuration and participants but does not replay prior discussion.
+The current Windows milestone persists the session definition and its frozen participant manifests. Normalized transcript/event history is stored in SQLite with current-user DPAPI protection; reopening replays accepted events through a fresh reducer before a resumable live meeting acquires the next runtime generation.
 
 Provider endpoints and model selections are durable configuration. Provider secrets are not: workspace JSON stores only an opaque `credentialRef`; Windows resolves that reference through Windows Credential Manager immediately before launching the Runtime Host.
 
@@ -33,5 +33,5 @@ Long-term memory and prompt evolution are separate policies. A long-term role ma
 - The Windows shell becomes session-first: session rail, active conversation, and contextual role/capability inspector.
 - The existing meeting event log remains authoritative for live state; workspace/session configuration does not become an alternate event stream.
 - Clients may synchronize non-secret profiles later, but credential material remains platform-local or in a dedicated secret service.
-- Runtime adapters receive resolved per-role model and prompt inputs. Pi/OMP-specific Skill or MCP mechanics remain private to `packages/runtime-host`.
+- Runtime adapters receive resolved per-role model and prompt inputs. Pi-specific Skill or MCP mechanics remain private to `packages/runtime-host`.
 - The initial capability milestone may persist and validate grants before every grant has an executor. Such entries must be labelled `planned` until a policy-enforced runtime adapter is verified.

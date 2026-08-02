@@ -7,6 +7,8 @@ namespace {
 bool is_runtime_activity(EventKind kind) {
     switch (kind) {
         case EventKind::ToolStarted:
+        case EventKind::ToolApprovalRequested:
+        case EventKind::ToolApprovalResolved:
         case EventKind::ToolCompleted:
         case EventKind::ToolFailed:
         case EventKind::SubagentSpawned:
@@ -26,6 +28,8 @@ bool is_private_role_activity(EventKind kind) {
         case EventKind::SpeechCompleted:
         case EventKind::SpeechCancelled:
         case EventKind::ToolStarted:
+        case EventKind::ToolApprovalRequested:
+        case EventKind::ToolApprovalResolved:
         case EventKind::ToolCompleted:
         case EventKind::ToolFailed:
         case EventKind::SubagentSpawned:
@@ -159,6 +163,15 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
             return reject(is_role_archived(event.actor_id)
                 ? ApplyError::RoleArchived
                 : ApplyError::UnknownRole);
+        }
+        if (event.kind == EventKind::SubagentSpawned ||
+            event.kind == EventKind::SubagentProgress ||
+            event.kind == EventKind::SubagentCompleted ||
+            event.kind == EventKind::SubagentFailed) {
+            if (event.target_id != event.actor_id) {
+                return reject(ApplyError::InvalidActor);
+            }
+            return accept(event.sequence);
         }
         if (event.target_id != "user.direct_host") {
             return reject(ApplyError::InvalidActor);
@@ -341,6 +354,8 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
             break;
 
         case EventKind::ToolStarted:
+        case EventKind::ToolApprovalRequested:
+        case EventKind::ToolApprovalResolved:
         case EventKind::ToolCompleted:
         case EventKind::ToolFailed:
         case EventKind::SubagentSpawned:
@@ -360,6 +375,9 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
         case EventKind::RuntimeLeaseAcquired:
         case EventKind::RuntimeLeaseReleased:
             break;
+
+        default:
+            return reject(ApplyError::InvalidTransition);
     }
 
     return accept(event.sequence);

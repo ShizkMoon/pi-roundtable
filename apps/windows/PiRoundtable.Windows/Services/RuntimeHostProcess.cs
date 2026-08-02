@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using PiRoundtable.Windows.Models;
@@ -10,6 +11,7 @@ internal sealed record RuntimeHostStartOptions(
     string MeetingId,
     string RuntimeId,
     ulong RuntimeGeneration,
+    ulong InitialSequence,
     WorkspaceConfiguration Workspace,
     RoundtableSessionConfiguration Session,
     IReadOnlyDictionary<string, string> Credentials);
@@ -38,8 +40,9 @@ internal sealed record RuntimeMeetingEvent(
     IReadOnlyList<string> Audience,
     JsonElement Payload);
 
-internal sealed class RuntimeHostProcess : IAsyncDisposable
+internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 {
+    private static readonly Encoding Utf8WithoutBom = new UTF8Encoding(false, true);
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -58,6 +61,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
     private string _meetingId = string.Empty;
     private string _runtimeId = string.Empty;
     private ulong _runtimeGeneration;
+    private ulong _expectedReadySequence;
     private int _stderrReported;
     private bool _disposed;
 
@@ -77,21 +81,26 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         _meetingId = options.MeetingId;
         _runtimeId = options.RuntimeId;
         _runtimeGeneration = options.RuntimeGeneration;
+        _expectedReadySequence = checked(options.InitialSequence + 1);
         var startInfo = new ProcessStartInfo
         {
-            FileName = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_NODE_PATH") ?? "node",
+            FileName = ResolveNodeExecutable(),
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardInputEncoding = Utf8WithoutBom,
+            StandardOutputEncoding = Utf8WithoutBom,
+            StandardErrorEncoding = Utf8WithoutBom,
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden,
-            WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? AppContext.BaseDirectory,
+            WorkingDirectory = AppContext.BaseDirectory,
         };
         startInfo.ArgumentList.Add(scriptPath);
         startInfo.Environment["PI_ROUNDTABLE_MEETING_ID"] = options.MeetingId;
         startInfo.Environment["PI_ROUNDTABLE_RUNTIME_ID"] = options.RuntimeId;
         startInfo.Environment["PI_ROUNDTABLE_RUNTIME_GENERATION"] = options.RuntimeGeneration.ToString();
+        startInfo.Environment["PI_ROUNDTABLE_WORKING_DIRECTORY"] = AppContext.BaseDirectory;
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         EventHandler exitedHandler = (_, _) => OnProcessExited(process);
@@ -121,6 +130,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             workspace = options.Workspace,
             session = options.Session,
             credentials = options.Credentials,
+            initialSequence = options.InitialSequence,
         }, cancellationToken);
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -183,7 +193,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         }
     }
 
-    public async Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(RuntimeHostShutdownMode mode, CancellationToken cancellationToken)
     {
         Process? process;
         lock (_stateGate)
@@ -201,6 +211,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             {
                 type = "shutdown",
                 requestId = Guid.NewGuid().ToString("N"),
+                mode = mode == RuntimeHostShutdownMode.Close ? "close" : "suspend",
             }, cancellationToken);
             await _stopped.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
             using var exitTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -238,7 +249,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await StopAsync(timeout.Token);
+            await StopAsync(RuntimeHostShutdownMode.Suspend, timeout.Token);
         }
         catch
         {
@@ -310,6 +321,7 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             }
             if (line.Length > 1_048_576)
             {
+                TraceProtocolFrame($"drop reason=oversize bytes={line.Length}");
                 ReportDiagnostic("Runtime Host 返回了超出限制的数据帧。");
                 continue;
             }
@@ -318,12 +330,15 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
                 using var document = JsonDocument.Parse(line);
                 HandleFrame(document.RootElement);
             }
-            catch (JsonException)
+            catch (JsonException error)
             {
+                TraceProtocolFrame(
+                    $"drop reason=json length={line.Length} byte={error.BytePositionInLine?.ToString() ?? "unknown"} window={RedactJsonWindow(line, error.BytePositionInLine)}");
                 ReportDiagnostic("Runtime Host 输出了无法解析的数据。");
             }
             catch (Exception error) when (error is KeyNotFoundException or InvalidOperationException or FormatException)
             {
+                TraceProtocolFrame($"drop reason=shape error={error.GetType().Name}");
                 ReportDiagnostic("Runtime Host 输出的数据不符合本地协议。");
             }
         }
@@ -349,16 +364,36 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
     {
         if (!frame.TryGetProperty("type", out var typeElement))
         {
+            TraceProtocolFrame("drop reason=missing_type");
             return;
         }
-        switch (typeElement.GetString())
+        var frameType = typeElement.GetString() ?? "unknown";
+        if (frameType == "event" && frame.TryGetProperty("event", out var tracedEvent))
+        {
+            var tracedSequence = tracedEvent.TryGetProperty("sequence", out var sequenceElement)
+                ? sequenceElement.GetRawText()
+                : "missing";
+            var tracedGeneration = tracedEvent.TryGetProperty("runtimeGeneration", out var generationElement)
+                ? generationElement.GetRawText()
+                : "missing";
+            var tracedKind = tracedEvent.TryGetProperty("kind", out var kindElement)
+                ? kindElement.GetString() ?? "missing"
+                : "missing";
+            TraceProtocolFrame($"frame type=event sequence={tracedSequence} generation={tracedGeneration} kind={tracedKind}");
+        }
+        else
+        {
+            TraceProtocolFrame($"frame type={frameType}");
+        }
+        switch (frameType)
         {
             case "ready":
                 if (
-                    frame.GetProperty("protocolVersion").GetInt32() != 2 ||
+                    frame.GetProperty("protocolVersion").GetInt32() != 3 ||
                     frame.GetProperty("meetingId").GetString() != _meetingId ||
                     frame.GetProperty("runtimeId").GetString() != _runtimeId ||
-                    frame.GetProperty("runtimeGeneration").GetUInt64() != _runtimeGeneration)
+                    frame.GetProperty("runtimeGeneration").GetUInt64() != _runtimeGeneration ||
+                    frame.GetProperty("sequence").GetUInt64() != _expectedReadySequence)
                 {
                     _ready.TrySetException(new InvalidOperationException(
                         "Runtime Host ready frame does not match the requested meeting lease."));
@@ -378,12 +413,50 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
                 var message = frame.TryGetProperty("message", out var messageElement)
                     ? messageElement.GetString()
                     : "Runtime Host 报告了未知错误。";
-                ReportDiagnostic(message ?? "Runtime Host 报告了未知错误。");
+                var errorCode = frame.TryGetProperty("errorCode", out var errorCodeElement)
+                    ? errorCodeElement.GetString()
+                    : null;
+                ReportDiagnostic(string.IsNullOrWhiteSpace(errorCode)
+                    ? message ?? "Runtime Host 报告了未知错误。"
+                    : $"{message ?? "Runtime Host 报告了错误。"} [{errorCode}]");
                 break;
             case "stopped":
                 _stopped.TrySetResult();
                 break;
         }
+    }
+
+    private static void TraceProtocolFrame(string message)
+    {
+        var tracePath = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_EVENT_TRACE_FILE");
+        if (string.IsNullOrWhiteSpace(tracePath) || !Path.IsPathFullyQualified(tracePath))
+        {
+            return;
+        }
+        try
+        {
+            File.AppendAllText(
+                tracePath,
+                $"{DateTimeOffset.UtcNow:O} protocol {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Opt-in diagnostics cannot affect protocol processing.
+        }
+    }
+
+    private static string RedactJsonWindow(string line, long? bytePosition)
+    {
+        var center = bytePosition is null
+            ? 0
+            : Math.Clamp((int)bytePosition.Value, 0, Math.Max(0, line.Length - 1));
+        var start = Math.Max(0, center - 32);
+        var length = Math.Min(65, line.Length - start);
+        return new string(line.AsSpan(start, length).ToArray().Select(character => character switch
+        {
+            '{' or '}' or '[' or ']' or ':' or ',' or '"' or '\\' => character,
+            _ => 'x',
+        }).ToArray());
     }
 
     private void HandleReceipt(JsonElement receipt)
@@ -517,6 +590,12 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             return Path.GetFullPath(configured);
         }
 
+        var packaged = Path.Combine(AppContext.BaseDirectory, "runtime-host", "host-main.js");
+        if (File.Exists(packaged))
+        {
+            return packaged;
+        }
+
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
         {
             var candidate = Path.Combine(
@@ -531,15 +610,21 @@ internal sealed class RuntimeHostProcess : IAsyncDisposable
             }
         }
 
-        var packaged = Path.Combine(AppContext.BaseDirectory, "runtime-host", "host-main.js");
-        if (File.Exists(packaged))
-        {
-            return packaged;
-        }
-
         throw new FileNotFoundException(
             "找不到 Runtime Host。请先运行 npm run build，或设置 PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT。",
             packaged);
+    }
+
+    private static string ResolveNodeExecutable()
+    {
+        var configured = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_NODE_PATH");
+        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
+        {
+            return Path.GetFullPath(configured);
+        }
+
+        var packaged = Path.Combine(AppContext.BaseDirectory, "runtime", "node.exe");
+        return File.Exists(packaged) ? packaged : "node";
     }
 
     private static async Task IgnoreFailureAsync(Task task)

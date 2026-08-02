@@ -1,7 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
-using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using PiRoundtable.Windows.Models;
 using PiRoundtable.Windows.Services;
@@ -10,9 +9,14 @@ namespace PiRoundtable.Windows.ViewModels;
 
 public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
-    private readonly DispatcherQueue _dispatcher;
+    private readonly IUiDispatcher _dispatcher;
+    private readonly IRuntimeHostFactory _runtimeHostFactory;
+    private readonly IMeetingCoreFactory _meetingCoreFactory;
+    private readonly IMeetingEventStore _eventStore;
+    private readonly MeetingEventIngestionQueue _eventQueue;
     private readonly Dictionary<string, TranscriptItem> _streamingMessages = [];
     private readonly Dictionary<string, TranscriptItem> _privateStreamingMessages = [];
+    private readonly Dictionary<string, string> _publicPromptsByCommandId = new(StringComparer.Ordinal);
     private readonly ObservableCollection<TranscriptItem> _emptyTranscript = [];
     private readonly ObservableCollection<TranscriptItem> _emptyPrivateThread = [];
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
@@ -25,9 +29,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private readonly LlmCatalogAnalysisService _llmCatalogAnalysis = new();
     private WorkspaceConfiguration _workspace = new();
     private ClientSettingsConfiguration _clientSettings = new();
-    private RuntimeHostProcess? _runtime;
-    private RuntimeHostProcess? _startingRuntime;
-    private MeetingCoreSession? _meetingCore;
+    private IRuntimeHostProcess? _runtime;
+    private IRuntimeHostProcess? _startingRuntime;
+    private IMeetingCoreSession? _meetingCore;
     private RoleItem? _selectedRole;
     private RoleItem? _selectedPrivateRole;
     private SessionItem? _selectedSession;
@@ -70,9 +74,29 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private bool _initialized;
     private bool _disposed;
 
-    public MainViewModel(DispatcherQueue dispatcher)
+    public MainViewModel(Microsoft.UI.Dispatching.DispatcherQueue dispatcher)
+        : this(
+            new DispatcherQueueAdapter(dispatcher),
+            new RuntimeHostFactory(),
+            new MeetingCoreFactory(),
+            new MeetingEventStore())
+    {
+    }
+
+    internal MainViewModel(
+        IUiDispatcher dispatcher,
+        IRuntimeHostFactory runtimeHostFactory,
+        IMeetingCoreFactory meetingCoreFactory,
+        IMeetingEventStore eventStore)
     {
         _dispatcher = dispatcher;
+        _runtimeHostFactory = runtimeHostFactory;
+        _meetingCoreFactory = meetingCoreFactory;
+        _eventStore = eventStore;
+        _eventQueue = new MeetingEventIngestionQueue(
+            AcceptMeetingEventAsync,
+            ReportEventStreamFaultAsync,
+            WriteEventIngestionTrace);
         LongTermRoles.Add(new RoleItem(
             "role.host",
             "主持人",
@@ -133,6 +157,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public ObservableCollection<CapabilityGrantItem> AvailableCapabilities { get; } = [];
 
     public ObservableCollection<CapabilityGrantItem> InvitationCapabilities { get; } = [];
+
+    public ObservableCollection<ToolApprovalItem> PendingToolApprovals { get; } = [];
+
+    public ObservableCollection<SubagentRunItem> SubagentRuns { get; } = [];
 
     public ObservableCollection<SelectionOptionItem> InvitationInviterOptions { get; } = [];
 
@@ -302,6 +330,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 OnPropertyChanged(nameof(Transcript));
                 OnPropertyChanged(nameof(PrivateMessages));
                 NotifySummary();
+                NotifyLifecycleProperties();
                 return;
             }
             _meetingTitle = value.Title;
@@ -321,6 +350,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             OnPropertyChanged(nameof(Transcript));
             OnPropertyChanged(nameof(PrivateMessages));
             NotifySummary();
+            NotifyLifecycleProperties();
         }
     }
 
@@ -434,7 +464,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public string StatusText
     {
         get => _statusText;
-        private set => SetField(ref _statusText, value);
+        private set
+        {
+            if (SetField(ref _statusText, value))
+            {
+                OnPropertyChanged(nameof(RuntimeStateSummary));
+            }
+        }
     }
 
     public string SkillDisplayName
@@ -526,6 +562,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 OnPropertyChanged(nameof(CanSend));
                 OnPropertyChanged(nameof(CanSendPrivate));
                 OnPropertyChanged(nameof(IsRoleConfigurationEditable));
+                NotifyLifecycleProperties();
             }
         }
     }
@@ -547,11 +584,36 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 OnPropertyChanged(nameof(CanPromoteSelectedRole));
                 OnPropertyChanged(nameof(CanArchiveSelectedRole));
                 OnPropertyChanged(nameof(IsRoleConfigurationEditable));
+                NotifyLifecycleProperties();
             }
         }
     }
 
-    public bool CanStart => !IsRunning && !IsBusy && Providers.Count > 0 && Models.Count > 0;
+    public bool IsPaused => !IsRunning && SelectedSession?.Phase == "live";
+
+    public bool CanStart =>
+        !IsRunning &&
+        !IsBusy &&
+        SelectedSession?.Phase == "draft" &&
+        Providers.Count > 0 &&
+        Models.Count > 0;
+
+    public bool CanResume =>
+        IsPaused &&
+        !IsBusy &&
+        Providers.Count > 0 &&
+        Models.Count > 0;
+
+    public bool CanPause => IsRunning && !IsBusy;
+
+    public bool CanClose => IsRunning && !IsBusy;
+
+    public Visibility StartMeetingVisibility =>
+        !IsRunning && SelectedSession?.Phase != "live" ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility ResumeMeetingVisibility => IsPaused ? Visibility.Visible : Visibility.Collapsed;
+
+    public Visibility PauseMeetingVisibility => IsRunning ? Visibility.Visible : Visibility.Collapsed;
 
     public bool CanOperate => IsRunning && !IsBusy;
 
@@ -580,15 +642,49 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public string MeetingSummary => $"{Roles.Count(role => !role.IsArchived)} 个活跃角色 · {StatusText}";
 
+    public string ParticipantSummary => $"{Roles.Count(role => !role.IsArchived)} 个角色";
+
     public string GenerationSummary => _runtimeGeneration == 0
         ? "尚未启动"
         : $"{_runtimeGeneration} / {_sequence}";
+
+    public string RuntimeStateSummary => _runtimeGeneration == 0
+        ? StatusText
+        : $"{StatusText} · Gen {_runtimeGeneration} · Seq {_sequence}";
+
+    public bool HasPendingToolApprovals => PendingToolApprovals.Count > 0;
+
+    public string ToolApprovalLabel => PendingToolApprovals.Count == 0
+        ? SubagentRuns.Count(item => item.IsActive) == 0
+            ? "活动与审批"
+            : $"活动 ({SubagentRuns.Count(item => item.IsActive)})"
+        : $"待审批 ({PendingToolApprovals.Count})";
+
+    public string ToolApprovalSectionLabel => PendingToolApprovals.Count == 0
+        ? "工具审批"
+        : $"工具审批 ({PendingToolApprovals.Count})";
+
+    public string SubagentActivityLabel => SubagentRuns.Count == 0
+        ? "SubAgent 活动"
+        : $"SubAgent 活动 ({SubagentRuns.Count})";
+
+    public Visibility SubagentEmptyVisibility => SubagentRuns.Count == 0
+        ? Visibility.Visible
+        : Visibility.Collapsed;
+
+    public Visibility ToolApprovalEmptyVisibility => PendingToolApprovals.Count == 0
+        ? Visibility.Visible
+        : Visibility.Collapsed;
 
     public string DiscoveredModelSummary => DiscoveredModels.Count == 0
         ? "尚未获取模型列表"
         : $"已发现 {DiscoveredModels.Count} 个可用模型";
 
     public Visibility TranscriptEmptyVisibility => Transcript.Count == 0
+        && Providers.Count > 0 ? Visibility.Visible
+        : Visibility.Collapsed;
+
+    public Visibility ProviderSetupVisibility => Transcript.Count == 0 && Providers.Count == 0
         ? Visibility.Visible
         : Visibility.Collapsed;
 
@@ -612,6 +708,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
         try
         {
+            await _eventStore.InitializeAsync(cancellationToken);
             _workspace = await _workspaceStore.LoadAsync(cancellationToken);
             _clientSettings = await _clientSettingsStore.LoadAsync(cancellationToken);
             ThemeMode = _clientSettings.ThemeMode;
@@ -666,7 +763,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         profile.DisplayName,
                         "long_term",
                         profile.SystemPrompt,
-                        profile.ModelRoute.PrimaryModelProfileId);
+                        profile.ModelRoute.PrimaryModelProfileId,
+                        retentionPolicy: "retain_profile",
+                        networkAccess: profile.Delegation.NetworkAccess);
                     role.SkillIds.UnionWith(profile.Capabilities.SkillIds);
                     role.McpServerIds.UnionWith(
                         profile.Capabilities.McpGrants.Select(grant => grant.McpServerId));
@@ -693,10 +792,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 Sessions.Clear();
                 foreach (var definition in workspaceSessions)
                 {
+                    var checkpoint = await _eventStore.GetCheckpointAsync(
+                        definition.SessionId,
+                        cancellationToken);
+                    var restoredPhase = checkpoint?.IsClosed == true
+                        ? "closed"
+                        : definition.Phase == "live" && checkpoint is null
+                            ? "draft"
+                            : definition.Phase;
                     var session = new SessionItem(definition.SessionId, definition.Title)
                     {
                         GroupId = definition.GroupId ?? SessionGroups.First().GroupId,
-                        Phase = definition.Phase == "live" ? "draft" : definition.Phase,
+                        Phase = restoredPhase,
                         CreatedAt = definition.CreatedAt,
                         UpdatedAt = definition.UpdatedAt,
                     };
@@ -751,6 +858,21 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 }
                 RefreshVisibleSessions();
             }
+            else
+            {
+                var selectedGroupId = SelectedSessionGroup?.GroupId
+                    ?? SessionGroups.First().GroupId;
+                var draft = Sessions.FirstOrDefault() ?? new SessionItem(
+                    $"session-{Guid.NewGuid():N}",
+                    _meetingTitle);
+                draft.GroupId = selectedGroupId;
+                if (!Sessions.Contains(draft))
+                {
+                    Sessions.Add(draft);
+                }
+                RefreshVisibleSessions();
+                SelectedSession = draft;
+            }
             SelectedProvider = Providers.FirstOrDefault(provider => provider.Enabled);
             SelectedModel ??= Models.FirstOrDefault(model => model.Enabled);
             SelectedInvitationModel ??= Models.FirstOrDefault(model => model.Enabled);
@@ -763,7 +885,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             RefreshMentionTargets();
             StatusText = Providers.Count == 0 ? "等待提供商配置" : "配置已加载";
             _initialized = true;
-            OnPropertyChanged(nameof(CanStart));
+            NotifyLifecycleProperties();
+            NotifySummary();
         }
         catch
         {
@@ -884,6 +1007,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 ErrorMessage = string.Empty;
                 StatusText = model is null ? "提供商配置已保存" : "长期配置已保存";
                 OnPropertyChanged(nameof(CanStart));
+                NotifySummary();
             }
             finally
             {
@@ -1568,7 +1692,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             IsBusy = true;
             ErrorMessage = string.Empty;
             StatusText = "正在启动 Runtime Host";
-            var runtime = new RuntimeHostProcess();
+            var runtime = _runtimeHostFactory.Create();
             _startingRuntime = runtime;
             runtime.MeetingEventReceived += OnMeetingEventReceived;
             runtime.DiagnosticReceived += OnDiagnosticReceived;
@@ -1577,19 +1701,47 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 SynchronizeWorkspaceConfiguration();
                 await _workspaceStore.SaveAsync(_workspace, cancellationToken);
                 var credentials = await ResolveSessionCredentialsAsync(activeRoles, cancellationToken);
-                _meetingCore = new MeetingCoreSession();
-                var meetingId = SelectedSession?.SessionId ?? $"session-{Guid.NewGuid():N}";
+                var meetingId = SelectedSession.SessionId;
+                var checkpoint = await _eventStore.GetCheckpointAsync(meetingId, cancellationToken);
+                if (checkpoint?.IsClosed == true)
+                {
+                    ShowError("该会议已经结束，不能恢复；请新建会议继续讨论。");
+                    StatusText = "会议已结束";
+                    return;
+                }
+                IReadOnlyList<RuntimeMeetingEvent> historicalEvents = checkpoint is null
+                    ? []
+                    : await _eventStore.LoadEventsAsync(meetingId, cancellationToken);
+                var isRecovery = historicalEvents.Any(meetingEvent => meetingEvent.Kind == "meeting.opened");
+
+                _meetingCore?.Dispose();
+                _meetingCore = _meetingCoreFactory.Create();
+                foreach (var historicalEvent in historicalEvents)
+                {
+                    _meetingCore.Apply(historicalEvent);
+                }
+                _sequence = checkpoint?.LastSequence ?? 0;
+                _runtimeGeneration = checkpoint?.RuntimeGeneration ?? 0;
+                _eventStreamFaulted = false;
+                if (historicalEvents.Count > 0)
+                {
+                    RebuildProjectionFromEvents(historicalEvents);
+                }
+
                 var sessionDefinition = BuildSessionConfiguration(
-                    SelectedSession ?? new SessionItem(meetingId, MeetingTitle),
+                    SelectedSession,
                     activeRoles,
-                    "draft");
+                    isRecovery ? "live" : "draft");
                 await _sessionStore.SaveAsync(sessionDefinition, cancellationToken);
                 var nextGeneration = checked(_runtimeGeneration + 1);
+                _runtimeGeneration = nextGeneration;
+                await _eventQueue.ResetAsync(nextGeneration, _sequence);
                 await runtime.StartAsync(
                     new RuntimeHostStartOptions(
                         meetingId,
                         $"runtime-windows-{Environment.ProcessId}",
                         nextGeneration,
+                        _sequence,
                         _workspace,
                         sessionDefinition,
                         credentials),
@@ -1606,32 +1758,33 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 }
                 _runtime = runtime;
                 _startingRuntime = null;
-                _runtimeGeneration = nextGeneration;
-                _sequence = 0;
-                _eventStreamFaulted = false;
 
-                foreach (var role in activeRoles)
+                if (!isRecovery)
                 {
-                    await EnsureAcceptedAsync(
-                        runtime.SendCommandAsync(
-                            role.Scope == "long_term" ? "role.add" : "role.create_temporary",
-                            role.RoleId,
-                            null,
-                            EmptyPayload,
-                            cancellationToken));
+                    foreach (var role in activeRoles)
+                    {
+                        await EnsureAcceptedAsync(
+                            runtime.SendCommandAsync(
+                                role.Scope == "long_term" ? "role.add" : "role.create_temporary",
+                                role.RoleId,
+                                null,
+                                EmptyPayload,
+                                cancellationToken));
+                    }
+                    await EnsureAcceptedAsync(runtime.SendCommandAsync(
+                        "meeting.open",
+                        null,
+                        null,
+                        EmptyPayload,
+                        cancellationToken));
                 }
-                await EnsureAcceptedAsync(runtime.SendCommandAsync(
-                    "meeting.open",
-                    null,
-                    null,
-                    EmptyPayload,
-                    cancellationToken));
                 IsRunning = true;
-                StatusText = "本地会议运行中";
+                StatusText = isRecovery ? "会议已从本地检查点恢复" : "本地会议运行中";
                 if (SelectedSession is not null)
                 {
                     SelectedSession.Phase = "live";
                     SelectedSession.UpdatedAt = DateTimeOffset.Now;
+                    NotifyLifecycleProperties();
                     await PersistSelectedSessionAsync(cancellationToken);
                 }
             }
@@ -1697,6 +1850,47 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             return false;
         }
         NotifySummary();
+        return true;
+    }
+
+    public async Task<bool> RetryTranscriptAsync(
+        string messageId,
+        CancellationToken cancellationToken = default)
+    {
+        var runtime = _runtime;
+        var item = Transcript.FirstOrDefault(candidate => candidate.MessageId == messageId);
+        var role = item is null
+            ? null
+            : Roles.FirstOrDefault(candidate => candidate.RoleId == item.RoleId && !candidate.IsArchived);
+        if (runtime is null || !IsRunning || item is null || role is null ||
+            !item.CanRetry || string.IsNullOrWhiteSpace(item.RetryPrompt))
+        {
+            ShowError("该回合当前不能重试；请确认会议仍在运行且角色仍然有效。");
+            return false;
+        }
+
+        item.CanRetry = false;
+        var priorState = item.State;
+        item.State = "正在重新排队";
+        var receipt = await runtime.SendCommandAsync(
+            "speech.broadcast",
+            "user.direct_host",
+            null,
+            new Dictionary<string, object?>
+            {
+                ["message"] = item.RetryPrompt,
+                ["mentions"] = new[] { role.RoleId },
+            },
+            cancellationToken);
+        if (!receipt.Accepted)
+        {
+            item.State = priorState;
+            item.CanRetry = true;
+            ShowReceiptError(receipt);
+            return false;
+        }
+        item.State = "已重新排队";
+        ErrorMessage = string.Empty;
         return true;
     }
 
@@ -1789,6 +1983,43 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         if (!receipt.Accepted)
         {
             ShowReceiptError(receipt);
+        }
+    }
+
+    public async Task ResolveToolApprovalAsync(
+        string approvalId,
+        bool approved,
+        CancellationToken cancellationToken = default)
+    {
+        var runtime = _runtime;
+        var approval = PendingToolApprovals.FirstOrDefault(item => item.ApprovalId == approvalId);
+        if (runtime is null || approval is null || approval.IsResolving)
+        {
+            return;
+        }
+        approval.IsResolving = true;
+        try
+        {
+            var receipt = await runtime.SendCommandAsync(
+                "tool.approval.resolve",
+                "user.direct_host",
+                approval.RoleId,
+                new Dictionary<string, object?>
+                {
+                    ["approvalId"] = approval.ApprovalId,
+                    ["approved"] = approved,
+                },
+                cancellationToken);
+            if (!receipt.Accepted)
+            {
+                approval.IsResolving = false;
+                ShowReceiptError(receipt);
+            }
+        }
+        catch
+        {
+            approval.IsResolving = false;
+            throw;
         }
     }
 
@@ -1947,6 +2178,67 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         await PersistSelectedSessionAsync(cancellationToken);
     }
 
+    public async Task SuspendMeetingAsync(CancellationToken cancellationToken = default)
+    {
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            var runtime = _runtime;
+            _runtime = null;
+            var startingRuntime = _startingRuntime;
+            _startingRuntime = null;
+            IsRunning = false;
+            if (runtime is null)
+            {
+                if (startingRuntime is not null)
+                {
+                    startingRuntime.MeetingEventReceived -= OnMeetingEventReceived;
+                    startingRuntime.DiagnosticReceived -= OnDiagnosticReceived;
+                    startingRuntime.Terminate();
+                    await startingRuntime.DisposeAsync();
+                }
+                _meetingCore?.Dispose();
+                _meetingCore = null;
+                await PersistSelectedSessionAsync(CancellationToken.None);
+                return;
+            }
+
+            IsBusy = true;
+            try
+            {
+                await runtime.StopAsync(RuntimeHostShutdownMode.Suspend, cancellationToken);
+                await WaitForEventQueueAsync();
+            }
+            catch (Exception error) when (error is not OperationCanceledException)
+            {
+                ShowError($"暂停会议时出现问题：{error.Message}");
+                runtime.Terminate();
+            }
+            finally
+            {
+                runtime.MeetingEventReceived -= OnMeetingEventReceived;
+                runtime.DiagnosticReceived -= OnDiagnosticReceived;
+                await runtime.DisposeAsync();
+                _meetingCore?.Dispose();
+                _meetingCore = null;
+                _streamingMessages.Clear();
+                _privateStreamingMessages.Clear();
+                IsBusy = false;
+                StatusText = _eventStreamFaulted ? "会议因事件故障暂停" : "会议已暂停，可从本地检查点恢复";
+                foreach (var role in Roles.Where(role => !role.IsArchived))
+                {
+                    role.Status = "未连接";
+                }
+                NotifySummary();
+                await PersistSelectedSessionAsync(CancellationToken.None);
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
     public async Task CloseMeetingAsync(CancellationToken cancellationToken = default)
     {
         await _lifecycleGate.WaitAsync(cancellationToken);
@@ -1995,6 +2287,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             }
             finally
             {
+                try
+                {
+                    await runtime.StopAsync(RuntimeHostShutdownMode.Close, CancellationToken.None);
+                    await WaitForEventQueueAsync();
+                }
+                catch
+                {
+                    runtime.Terminate();
+                }
                 runtime.MeetingEventReceived -= OnMeetingEventReceived;
                 runtime.DiagnosticReceived -= OnDiagnosticReceived;
                 try
@@ -2013,6 +2314,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     {
                         SelectedSession.Phase = "closed";
                         SelectedSession.UpdatedAt = DateTimeOffset.Now;
+                        NotifyLifecycleProperties();
                     }
                     foreach (var role in Roles.Where(role => !role.IsArchived))
                     {
@@ -2036,14 +2338,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             return;
         }
         _disposed = true;
-        await CloseMeetingAsync();
+        await SuspendMeetingAsync();
         await PersistSelectedSessionAsync(CancellationToken.None);
     }
 
     public async Task ShutdownAsync(CancellationToken cancellationToken)
     {
         _disposed = true;
-        await CloseMeetingAsync(cancellationToken);
+        await SuspendMeetingAsync(cancellationToken);
     }
 
     public void TerminateRuntimeForAppExit()
@@ -2054,7 +2356,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     private void OnMeetingEventReceived(object? sender, RuntimeMeetingEvent meetingEvent)
     {
-        _dispatcher.TryEnqueue(() => ApplyMeetingEvent(meetingEvent));
+        _eventQueue.Enqueue(meetingEvent);
     }
 
     private void OnDiagnosticReceived(object? sender, string message)
@@ -2062,34 +2364,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         _dispatcher.TryEnqueue(() => ShowError(message));
     }
 
-    private void ApplyMeetingEvent(RuntimeMeetingEvent meetingEvent)
+    private async Task AcceptMeetingEventAsync(RuntimeMeetingEvent meetingEvent)
     {
-        if (meetingEvent.RuntimeGeneration != _runtimeGeneration || meetingEvent.Sequence <= _sequence)
+        _meetingCore?.Apply(meetingEvent);
+        await _eventStore.AppendAsync(meetingEvent, CancellationToken.None);
+
+        await DispatchAsync(() =>
         {
-            return;
-        }
-        if (_eventStreamFaulted)
-        {
-            return;
-        }
-        if (meetingEvent.Sequence != _sequence + 1)
-        {
-            _eventStreamFaulted = true;
-            StatusText = "事件流已中断";
-            ShowError($"Runtime Host 事件序号不连续：期待 {_sequence + 1}，收到 {meetingEvent.Sequence}。会议将安全关闭。");
-            _ = CloseAfterStreamFaultAsync();
-            return;
-        }
-        try
-        {
-            _meetingCore?.Apply(meetingEvent);
-        }
-        catch (Exception error)
-        {
-            ShowError(error.Message);
-            return;
-        }
-        _sequence = meetingEvent.Sequence;
+            _sequence = meetingEvent.Sequence;
+            ProjectMeetingEvent(meetingEvent);
+        });
+    }
+
+    private void ProjectMeetingEvent(RuntimeMeetingEvent meetingEvent, bool isReplay = false)
+    {
         var role = meetingEvent.ActorId is null
             ? null
             : Roles.FirstOrDefault(item => item.RoleId == meetingEvent.ActorId);
@@ -2108,6 +2396,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             case "message.published":
                 if (meetingEvent.Payload.TryGetProperty("message", out var publicMessage))
                 {
+                    if (!string.IsNullOrWhiteSpace(meetingEvent.CausationId))
+                    {
+                        _publicPromptsByCommandId[meetingEvent.CausationId] =
+                            publicMessage.GetString() ?? string.Empty;
+                    }
                     Transcript.Add(new TranscriptItem(
                         "user.direct_host",
                         "我",
@@ -2210,7 +2503,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         "public",
                         null,
                         $"message.{meetingEvent.EventId.Replace('-', '.')}",
-                        meetingEvent.OccurredAt);
+                        meetingEvent.OccurredAt,
+                        ResolveRetryPrompt(meetingEvent.CausationId));
                     Transcript.Add(transcript);
                     _streamingMessages[role.RoleId] = transcript;
                 }
@@ -2241,10 +2535,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         : _streamingMessages;
                     if (completedMessages.Remove(finishedRole.RoleId, out var finished))
                     {
-                        finished.State = meetingEvent.Kind == "speech.completed" ? "已完成" : "已取消";
+                        if (meetingEvent.Kind == "speech.completed")
+                        {
+                            finished.State = "已完成";
+                        }
+                        else
+                        {
+                            var failed = meetingEvent.Payload.TryGetProperty("reason", out var reason) &&
+                                reason.GetString() == "failed";
+                            finished.State = failed ? "失败 · 可重试" : "已取消 · 可重试";
+                            finished.CanRetry = finished.Visibility == "public" &&
+                                !string.IsNullOrWhiteSpace(finished.RetryPrompt);
+                        }
                     }
                 }
-                PersistCurrentSessionInBackground();
+                if (!isReplay)
+                {
+                    PersistCurrentSessionInBackground();
+                }
                 break;
             case "tool.started":
                 if (role is not null)
@@ -2255,6 +2563,49 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     role.ActivitySummary = $"正在调用 {toolName}；参数和结果不在角色状态页公开";
                 }
                 break;
+            case "tool.approval_requested":
+                if (role is not null &&
+                    meetingEvent.Payload.TryGetProperty("approvalId", out var approvalIdElement) &&
+                    approvalIdElement.GetString() is { Length: > 0 } approvalId &&
+                    PendingToolApprovals.All(item => item.ApprovalId != approvalId))
+                {
+                    var serverName = meetingEvent.Payload.TryGetProperty("serverDisplayName", out var server)
+                        ? server.GetString() ?? "MCP"
+                        : "MCP";
+                    var toolName = meetingEvent.Payload.TryGetProperty("toolLabel", out var toolLabel)
+                        ? toolLabel.GetString() ?? "工具"
+                        : "工具";
+                    PendingToolApprovals.Add(new ToolApprovalItem(
+                        approvalId,
+                        role.RoleId,
+                        role.DisplayName,
+                        serverName,
+                        toolName,
+                        meetingEvent.OccurredAt));
+                    role.ActivitySummary = $"等待你审批 {serverName} · {toolName}；未显示参数或结果";
+                    NotifyToolApprovals();
+                }
+                break;
+            case "tool.approval_resolved":
+                if (meetingEvent.Payload.TryGetProperty("approvalId", out var resolvedIdElement) &&
+                    resolvedIdElement.GetString() is { Length: > 0 } resolvedId)
+                {
+                    var resolved = PendingToolApprovals.FirstOrDefault(item => item.ApprovalId == resolvedId);
+                    if (resolved is not null)
+                    {
+                        PendingToolApprovals.Remove(resolved);
+                        NotifyToolApprovals();
+                    }
+                    if (role is not null)
+                    {
+                        var approved = meetingEvent.Payload.TryGetProperty("approved", out var approvedElement) &&
+                            approvedElement.ValueKind == System.Text.Json.JsonValueKind.True;
+                        role.ActivitySummary = approved
+                            ? "工具调用已获批准；未显示参数或结果"
+                            : "工具调用已拒绝；没有执行外部副作用";
+                    }
+                }
+                break;
             case "tool.completed":
             case "tool.failed":
                 if (role is not null)
@@ -2262,6 +2613,54 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     role.ActivitySummary = meetingEvent.Kind == "tool.completed"
                         ? "工具调用已完成；未公开参数、结果或模型私有推理"
                         : "工具调用失败；未公开参数、结果或模型私有推理";
+                }
+                break;
+            case "subagent.spawned":
+                if (role is not null &&
+                    meetingEvent.Payload.TryGetProperty("subagentId", out var spawnedIdElement) &&
+                    spawnedIdElement.GetString() is { Length: > 0 } spawnedId &&
+                    SubagentRuns.All(item => item.SubagentId != spawnedId))
+                {
+                    TrimCompletedSubagentRuns();
+                    SubagentRuns.Insert(0, new SubagentRunItem(
+                        spawnedId,
+                        role.RoleId,
+                        role.DisplayName,
+                        meetingEvent.OccurredAt));
+                    role.ActivitySummary = "SubAgent 正在执行受限任务；任务正文和结果仅对父角色可见";
+                    NotifyActivityPanel();
+                }
+                break;
+            case "subagent.progress":
+                if (meetingEvent.Payload.TryGetProperty("subagentId", out var progressIdElement) &&
+                    progressIdElement.GetString() is { Length: > 0 } progressId)
+                {
+                    var run = SubagentRuns.FirstOrDefault(item => item.SubagentId == progressId);
+                    if (run is not null &&
+                        meetingEvent.Payload.TryGetProperty("updateCount", out var updateCountElement) &&
+                        updateCountElement.TryGetInt32(out var updateCount))
+                    {
+                        run.UpdateCount = updateCount;
+                    }
+                }
+                break;
+            case "subagent.completed":
+            case "subagent.failed":
+                if (meetingEvent.Payload.TryGetProperty("subagentId", out var terminalIdElement) &&
+                    terminalIdElement.GetString() is { Length: > 0 } terminalId)
+                {
+                    var run = SubagentRuns.FirstOrDefault(item => item.SubagentId == terminalId);
+                    if (run is not null)
+                    {
+                        run.Status = meetingEvent.Kind == "subagent.completed" ? "已完成" : "失败";
+                    }
+                    if (role is not null)
+                    {
+                        role.ActivitySummary = meetingEvent.Kind == "subagent.completed"
+                            ? "SubAgent 已完成，结果已私下交回父角色等待续答"
+                            : "SubAgent 执行失败，父角色将收到不编造结果的继续指令";
+                    }
+                    NotifyActivityPanel();
                 }
                 break;
             case "interruption.requested":
@@ -2277,6 +2676,95 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 break;
         }
         NotifySummary();
+    }
+
+    private void RebuildProjectionFromEvents(IReadOnlyList<RuntimeMeetingEvent> events)
+    {
+        if (SelectedSession is null)
+        {
+            return;
+        }
+        SelectedSession.Transcript.Clear();
+        SelectedSession.PrivateThreads.Clear();
+        _streamingMessages.Clear();
+        _privateStreamingMessages.Clear();
+        _publicPromptsByCommandId.Clear();
+        PendingToolApprovals.Clear();
+        SubagentRuns.Clear();
+        foreach (var role in Roles.Where(role => !role.IsArchived))
+        {
+            role.Status = "未连接";
+            role.ActivitySummary = "等待 Runtime Owner";
+        }
+        foreach (var meetingEvent in events)
+        {
+            ProjectMeetingEvent(meetingEvent, isReplay: true);
+        }
+        var staleApprovalRoleIds = PendingToolApprovals.Select(item => item.RoleId).Distinct().ToArray();
+        if (PendingToolApprovals.Count > 0)
+        {
+            PendingToolApprovals.Clear();
+            foreach (var roleId in staleApprovalRoleIds)
+            {
+                var role = Roles.FirstOrDefault(item => item.RoleId == roleId);
+                if (role is not null)
+                {
+                    role.ActivitySummary = "上次工具审批因 Runtime 中断而失效；外部副作用保持未执行";
+                }
+            }
+        }
+        foreach (var run in SubagentRuns.Where(item => item.IsActive))
+        {
+            run.Status = "已中断";
+            var role = Roles.FirstOrDefault(item => item.RoleId == run.ParentRoleId);
+            if (role is not null)
+            {
+                role.ActivitySummary = "上次 SubAgent 随 Runtime 中断；需要父角色按当前上下文重新委派";
+            }
+        }
+        OnPropertyChanged(nameof(Transcript));
+        OnPropertyChanged(nameof(PrivateMessages));
+        NotifyActivityPanel();
+    }
+
+    private Task DispatchAsync(Action callback)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_dispatcher.TryEnqueue(() =>
+            {
+                try
+                {
+                    callback();
+                    completion.TrySetResult();
+                }
+                catch (Exception error)
+                {
+                    completion.TrySetException(error);
+                }
+            }))
+        {
+            completion.TrySetException(new InvalidOperationException("Windows UI 调度器已停止。"));
+        }
+        return completion.Task;
+    }
+
+    private async Task ReportEventStreamFaultAsync(string message)
+    {
+        _eventStreamFaulted = true;
+        _runtime?.Terminate();
+        try
+        {
+            await DispatchAsync(() =>
+            {
+                StatusText = "事件流已中断";
+                ShowError(message);
+                _ = SuspendAfterStreamFaultAsync();
+            });
+        }
+        catch
+        {
+            // Process termination is the final safety boundary if the UI is already gone.
+        }
     }
 
     private void RefreshCapabilityGrants()
@@ -2439,7 +2927,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         {
                             McpServerId = id,
                             ToolAllowlist = [],
-                            ApprovalMode = "never",
+                            ApprovalMode = "always",
                             ExecutionMode = "subagent_preferred",
                         })
                         .ToList(),
@@ -2626,7 +3114,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     {
                         McpServerId = id,
                         ToolAllowlist = [],
-                        ApprovalMode = "never",
+                        ApprovalMode = "always",
                         ExecutionMode = "subagent_preferred",
                     })
                     .ToList(),
@@ -2779,13 +3267,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         return NetworkEndpointPolicy.TryNormalize(value, out endpoint);
     }
 
-    private static string ToStorageState(string state) => state switch
-    {
-        "已发送" or "已提交" => "submitted",
-        "生成中" or "处理中" => "streaming",
-        "已取消" => "cancelled",
-        _ => "completed",
-    };
+    private static string ToStorageState(string state) =>
+        state.StartsWith("已取消", StringComparison.Ordinal) ||
+        state.StartsWith("失败", StringComparison.Ordinal)
+            ? "cancelled"
+            : state switch
+            {
+                "已发送" or "已提交" => "submitted",
+                "生成中" or "处理中" or "正在重新排队" => "streaming",
+                _ => "completed",
+            };
 
     private static string ToDisplayState(string state) => state switch
     {
@@ -2794,6 +3285,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         "cancelled" => "已取消",
         _ => "已完成",
     };
+
+    private string? ResolveRetryPrompt(string? causationId)
+    {
+        if (string.IsNullOrWhiteSpace(causationId))
+        {
+            return null;
+        }
+        var separator = causationId.LastIndexOf(':');
+        var commandId = separator > 0 ? causationId[..separator] : causationId;
+        return _publicPromptsByCommandId.TryGetValue(commandId, out var prompt) &&
+            !string.IsNullOrWhiteSpace(prompt)
+                ? prompt
+                : null;
+    }
 
     private static string NormalizeId(string value)
     {
@@ -2805,6 +3310,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         return string.IsNullOrEmpty(normalized) ? "item" : normalized[..Math.Min(normalized.Length, 96)];
     }
 
+    private static void WriteEventIngestionTrace(string message)
+    {
+        var tracePath = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_EVENT_TRACE_FILE");
+        if (string.IsNullOrWhiteSpace(tracePath) || !Path.IsPathFullyQualified(tracePath))
+        {
+            return;
+        }
+        File.AppendAllText(
+            tracePath,
+            $"{DateTimeOffset.UtcNow:O} {message}{Environment.NewLine}");
+    }
+
     private static async Task EnsureAcceptedAsync(Task<RuntimeCommandReceipt> receiptTask)
     {
         var receipt = await receiptTask;
@@ -2814,11 +3331,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
     }
 
-    private async Task CloseAfterStreamFaultAsync()
+    private Task WaitForEventQueueAsync()
+    {
+        return _eventQueue.DrainAsync();
+    }
+
+    private async Task SuspendAfterStreamFaultAsync()
     {
         try
         {
-            await CloseMeetingAsync();
+            await SuspendMeetingAsync();
         }
         catch
         {
@@ -2839,12 +3361,55 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private void NotifySummary()
     {
         OnPropertyChanged(nameof(MeetingSummary));
+        OnPropertyChanged(nameof(ParticipantSummary));
         OnPropertyChanged(nameof(GenerationSummary));
+        OnPropertyChanged(nameof(RuntimeStateSummary));
         OnPropertyChanged(nameof(CanSend));
         OnPropertyChanged(nameof(CanSendPrivate));
         OnPropertyChanged(nameof(CanArchiveSelectedRole));
         OnPropertyChanged(nameof(CanPromoteSelectedRole));
         OnPropertyChanged(nameof(TranscriptEmptyVisibility));
+        OnPropertyChanged(nameof(ProviderSetupVisibility));
+    }
+
+    private void NotifyLifecycleProperties()
+    {
+        OnPropertyChanged(nameof(IsPaused));
+        OnPropertyChanged(nameof(CanStart));
+        OnPropertyChanged(nameof(CanResume));
+        OnPropertyChanged(nameof(CanPause));
+        OnPropertyChanged(nameof(CanClose));
+        OnPropertyChanged(nameof(StartMeetingVisibility));
+        OnPropertyChanged(nameof(ResumeMeetingVisibility));
+        OnPropertyChanged(nameof(PauseMeetingVisibility));
+    }
+
+    private void NotifyToolApprovals()
+    {
+        OnPropertyChanged(nameof(HasPendingToolApprovals));
+        OnPropertyChanged(nameof(ToolApprovalLabel));
+        OnPropertyChanged(nameof(ToolApprovalSectionLabel));
+        OnPropertyChanged(nameof(ToolApprovalEmptyVisibility));
+    }
+
+    private void NotifyActivityPanel()
+    {
+        NotifyToolApprovals();
+        OnPropertyChanged(nameof(SubagentActivityLabel));
+        OnPropertyChanged(nameof(SubagentEmptyVisibility));
+    }
+
+    private void TrimCompletedSubagentRuns()
+    {
+        while (SubagentRuns.Count >= 12)
+        {
+            var completed = SubagentRuns.LastOrDefault(item => !item.IsActive);
+            if (completed is null)
+            {
+                return;
+            }
+            SubagentRuns.Remove(completed);
+        }
     }
 
     private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)

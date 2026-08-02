@@ -20,14 +20,33 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Markdig" Version="1.3.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="10.0.9" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.3.1" />
+    <PackageReference Include="SQLitePCLRaw.bundle_winsqlite3" Version="2.1.11" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
   </ItemGroup>
 
   <PropertyGroup>
-    <NativeCoreDevPath>$(MSBuildProjectDirectory)\..\..\..\out\build\dev\core\pi_roundtable_core.dll</NativeCoreDevPath>
+    <NativeCorePath Condition="'$(Configuration)' == 'Release'">$(MSBuildProjectDirectory)\..\..\..\out\build\release\core\pi_roundtable_core.dll</NativeCorePath>
+    <NativeCorePath Condition="'$(NativeCorePath)' == ''">$(MSBuildProjectDirectory)\..\..\..\out\build\dev\core\pi_roundtable_core.dll</NativeCorePath>
   </PropertyGroup>
 
-  <Target Name="CopyDevelopmentNativeCore" AfterTargets="Build" Condition="Exists('$(NativeCoreDevPath)') and '$(RuntimeIdentifier)' == 'win-x64'">
-    <Copy SourceFiles="$(NativeCoreDevPath)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  <ItemGroup Condition="Exists('$(NativeCorePath)') and '$(RuntimeIdentifier)' == 'win-x64'">
+    <Content Include="$(NativeCorePath)" Link="pi_roundtable_core.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="CopyWinUiGeneratedResourcesToPublishDirectory" AfterTargets="Publish">
+    <ItemGroup>
+      <WinUiGeneratedPublishResource Include="$(TargetDir)*.xbf" />
+      <WinUiGeneratedPublishResource Include="$(TargetDir)$(AssemblyName).pri" />
+    </ItemGroup>
+    <Error
+        Condition="'@(WinUiGeneratedPublishResource)' == ''"
+        Text="WinUI generated resources were not produced for publishing." />
+    <Copy
+        SourceFiles="@(WinUiGeneratedPublishResource)"
+        DestinationFiles="@(WinUiGeneratedPublishResource->'$(PublishDir)%(Filename)%(Extension)')"
+        SkipUnchangedFiles="true" />
   </Target>
 </Project>

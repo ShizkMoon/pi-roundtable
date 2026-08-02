@@ -7,7 +7,7 @@ import type {
 } from "@pi-roundtable/protocol";
 import type { RuntimeCapabilities } from "./runtime-adapter.js";
 
-export const LOCAL_HOST_PROTOCOL_VERSION = 2 as const;
+export const LOCAL_HOST_PROTOCOL_VERSION = 3 as const;
 export const MAX_LOCAL_HOST_LINE_BYTES = 1_048_576;
 
 export interface LocalHostInitializeFrame {
@@ -16,6 +16,7 @@ export interface LocalHostInitializeFrame {
   workspace: WorkspaceProfile;
   session: RoundtableSession;
   credentials: Record<string, string>;
+  initialSequence: number;
 }
 
 export interface LocalHostCommandFrame {
@@ -26,6 +27,7 @@ export interface LocalHostCommandFrame {
 export interface LocalHostShutdownFrame {
   type: "shutdown";
   requestId: string;
+  mode: "suspend" | "close";
 }
 
 export type LocalHostInputFrame =
@@ -39,6 +41,7 @@ export interface LocalHostReadyFrame {
   meetingId: string;
   runtimeId: string;
   runtimeGeneration: number;
+  sequence: number;
   capabilities: RuntimeCapabilities;
 }
 
@@ -118,7 +121,14 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
         "Shutdown frames require a non-empty requestId",
       );
     }
-    return { type: "shutdown", requestId };
+    if (value.mode !== "suspend" && value.mode !== "close") {
+      throw new LocalHostProtocolError(
+        "invalid_frame",
+        "Shutdown frames require mode suspend or close",
+        requestId,
+      );
+    }
+    return { type: "shutdown", requestId, mode: value.mode };
   }
 
   if (value.type === "initialize") {
@@ -127,11 +137,13 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
       requestId === null ||
       !isRecord(value.workspace) ||
       !isRecord(value.session) ||
-      !isRecord(value.credentials)
+      !isRecord(value.credentials) ||
+      !Number.isSafeInteger(value.initialSequence) ||
+      (value.initialSequence as number) < 0
     ) {
       throw new LocalHostProtocolError(
         "invalid_frame",
-        "Initialize frames require requestId, workspace, session, and credentials",
+        "Initialize frames require requestId, workspace, session, credentials, and a non-negative initialSequence",
         requestId,
       );
     }
@@ -152,6 +164,7 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
       workspace: value.workspace as unknown as WorkspaceProfile,
       session: value.session as unknown as RoundtableSession,
       credentials,
+      initialSequence: value.initialSequence as number,
     };
   }
 

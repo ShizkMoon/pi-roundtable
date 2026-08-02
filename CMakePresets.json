@@ -16,12 +16,26 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "PI_ROUNDTABLE_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "release",
+      "displayName": "Release x64 (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PI_ROUNDTABLE_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "dev",
       "configurePreset": "dev"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
     }
   ],
   "testPresets": [

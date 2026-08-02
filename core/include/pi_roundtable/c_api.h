@@ -41,7 +41,9 @@ typedef enum pr_event_kind {
     PR_EVENT_ROLE_PROMOTED = 19,
     PR_EVENT_ROLE_ARCHIVED = 20,
     PR_EVENT_MESSAGE_PUBLISHED = 21,
-    PR_EVENT_MESSAGE_DIRECT_SENT = 22
+    PR_EVENT_MESSAGE_DIRECT_SENT = 22,
+    PR_EVENT_TOOL_APPROVAL_REQUESTED = 23,
+    PR_EVENT_TOOL_APPROVAL_RESOLVED = 24
 } pr_event_kind;
 
 typedef enum pr_event_visibility {

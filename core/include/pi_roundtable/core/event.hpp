@@ -29,6 +29,8 @@ enum class EventKind : std::uint8_t {
     RoleArchived,
     MessagePublished,
     MessageDirectSent,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
 };
 
 enum class EventVisibility : std::uint8_t {

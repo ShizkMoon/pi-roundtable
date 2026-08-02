@@ -2,7 +2,7 @@
 
 ## 1. Deployment model
 
-A meeting is controlled by one Runtime Host. In the first implementation cycle that host will run beside the Windows application and embed Pi through its supported SDK surface. Oh My Pi remains an optional compatibility runtime behind an adapter. Linux hosts the optional synchronization plane: normalized event storage, lease fencing, and replay cursors; authentication and push notifications remain planned. Android is a presentation and control client and never launches Pi locally.
+A meeting is controlled by one Runtime Host. In the first implementation cycle that host runs beside the Windows application and embeds Pi through its supported SDK surface. Pi is the only supported model runtime. Linux hosts the optional synchronization plane: normalized event storage, lease fencing, and replay cursors; authentication and push notifications remain planned. Android is a presentation and control client and never launches Pi locally.
 
 This split avoids two conflicting sources of truth. If a runtime moves to another machine, the sync server increments `runtimeGeneration`; events from the old generation are rejected even if the old process reconnects late.
 
@@ -14,22 +14,13 @@ This split avoids two conflicting sources of truth. If a runtime moves to anothe
 
 ### C++ meeting core
 
-`core` applies ordered events and enforces deterministic meeting invariants. It does not parse OMP events, open sockets, access storage, or render UI. A narrow C ABI makes the reducer consumable from native shells without exporting C++ ABI details.
+`core` applies ordered events and enforces deterministic meeting invariants. It does not parse Pi events, open sockets, access storage, or render UI. A narrow C ABI makes the reducer consumable from native shells without exporting C++ ABI details.
 
 ### Runtime Host
 
-`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi/OMP compatibility. The implemented `PiRuntimeAdapter` embeds the pinned Pi SDK directly. It creates one supervised session for one active role, injects provider credentials in memory, applies a frozen System Prompt, disables default Skill discovery and loads only the participant's explicit Skill paths, and registers only tools resolved from approved MCP grants. The MCP client boundary supports stdio, Streamable HTTP, and legacy SSE with bounded discovery/output, approved launchers, same-origin secure remote transport, and in-memory credential resolution. Raw Pi session records remain private.
+`packages/runtime-host` defines a domain-neutral runtime contract and owns all Pi SDK integration. The implemented `PiRuntimeAdapter` embeds the pinned Pi SDK directly. It creates one supervised session for one active role, injects provider credentials in memory, applies a frozen System Prompt, disables default Skill discovery and loads only the participant's explicit Skill paths, and registers only tools resolved from approved MCP grants. The MCP client boundary supports stdio, Streamable HTTP, and legacy SSE with bounded discovery/output, approved launchers, same-origin secure remote transport, and in-memory credential resolution. Raw Pi session records remain private.
 
-The currently implemented low-level OMP client:
-
-1. starts `omp --mode rpc`;
-2. waits for the `ready` frame;
-3. negotiates protocol v2 when advertised;
-4. validates and reassembles `rpc_chunk` frames;
-5. correlates command responses by ID;
-6. will pass validated OMP frames to a planned `OmpRuntimeAdapter` for normalization before synchronization.
-
-The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill/MCP inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. A public host broadcast may target one or more roles for the next response while remaining visible to all participants; responses are queued so only one role owns the public floor. A private host command runs in the selected role's isolated context and emits audience-scoped events without claiming the public floor. Server-level MCP approval and tool callbacks are implemented; per-tool interactive approval, SubAgent-isolated execution, prompt/memory execution, recovery checkpoints, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
+The implemented local host owns one meeting-wide sequence and generation, creates one Pi session per active role, resolves provider/model/prompt/Skill/MCP inputs from validated workspace and participant manifests, processes normalized meeting commands, and performs the basic cancel-then-handoff interruption flow over bounded stdio JSONL. A public host broadcast may target one or more roles for the next response while remaining visible to all participants; responses are queued so only one role owns the public floor. A private host command runs in the selected role's isolated context and emits audience-scoped events without claiming the public floor. MCP tool callbacks honor `always`, `on_first_use`, and `never` approval modes; approval requests are private host events and omit tool arguments/results. An isolated Pi SubAgent cannot recurse, runs without MCP tools, is capped at two concurrent children per parent role, reports bounded progress, and returns its bounded text only to that parent. Prompt/memory evolution, exact Pi private-session restoration, and OTel export remain planned. Runtime-specific mechanics stay below the neutral adapter even as those capabilities are added.
 
 ### Sync server
 
@@ -37,7 +28,7 @@ The implemented local host owns one meeting-wide sequence and generation, create
 
 ### Native clients
 
-Windows uses .NET 10 LTS with WinUI 3 and owns the implemented first local runtime integration. Its session-first shell persists non-secret workspace profiles, session groups, frozen session definitions, and normalized public/private message projections under Local AppData; stores provider and optional sync secrets in Windows Credential Manager; supervises the stdio Host; sends normalized commands; applies every event to the C++ core; and projects accepted state into the UI. Full normalized event-log replay is not persisted yet. A normal local meeting does not require a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models; neither imports Pi or OMP internals.
+Windows uses .NET 10 LTS with WinUI 3 and owns the implemented first local runtime integration. Its session-first shell persists non-secret workspace profiles, session groups, and frozen session definitions under Local AppData; stores provider and optional sync secrets in Windows Credential Manager; supervises the stdio Host; sends normalized commands; applies every event to the C++ core; and projects accepted state into the UI. Accepted normalized events and checkpoints are stored in SQLite with event content protected by current-user DPAPI. On resume, the client replays the prior event stream through a fresh C++ reducer, invalidates stale approvals/runs, increments `runtimeGeneration`, and restores configured roles without pretending to restore Pi's private token/session state. Pause is a recoverable clean shutdown; close is terminal. A normal local meeting does not require a remote sync server. Android uses Kotlin/Compose Material 3 with layouts that adapt at 600 dp and 840 dp. Both consume normalized protocol models and never import Pi internals.
 
 ## 3. Interruption model
 
@@ -48,20 +39,24 @@ Interruption is not simulated by visually reordering chat messages. The authorit
 3. `speech.cancelled` for the current generation;
 4. `speech.started` for the interrupting role.
 
-The core rejects a second interruption while one is pending, a cancellation targeting a non-speaker, and a new speaker that bypasses the pending handoff. Runtime-specific cancellation maps to OMP `abort`, `steer`, or `abort_and_prompt` according to the orchestration policy.
+The core rejects a second interruption while one is pending, a cancellation targeting a non-speaker, and a new speaker that bypasses the pending handoff. The Pi adapter maps the normalized orchestration policy to supported prompt, steering, follow-up, and cancellation operations.
 
 ## 4. Role lifecycle
 
 The meeting core distinguishes a long-term role from a meeting-scoped temporary role. Registration adds an active participant. A temporary role may be promoted once to long-term. Archiving removes the role from the active roster while retaining its meeting record; leaving removes that record. All transitions remain ordered meeting events and carry the active `runtimeGeneration`.
 
-This implemented lifecycle is the deterministic meeting foundation. The Windows path now persists long-term role prompts, model routes, default auto-join behavior, and explicit Skill/MCP attachments, then freezes them into participant manifests. Approved MCP execution is implemented through the Runtime Host. Durable memory contents, prompt revision history, live grant mutation events, per-tool interactive approval, and end-of-meeting retention workflows remain planned.
+This implemented lifecycle is the deterministic meeting foundation. The Windows path now persists long-term role prompts, model routes, default auto-join behavior, and explicit Skill/MCP attachments, then freezes them into participant manifests. Approved MCP execution and interactive host decisions are implemented through the Runtime Host and Windows approval panel. Durable memory contents, prompt revision history, live grant mutation events, exact tool-allowlist editing, and end-of-meeting retention workflows remain planned.
 
 ## 5. Data ownership
 
-The synchronization plane stores domain events and snapshots, not raw provider credentials, local tool output directories, or complete OMP session files. Large artifacts should be referenced by scoped object identifiers. Secrets stay with the Runtime Host or a future dedicated secrets service.
+The synchronization plane stores domain events and snapshots, not raw provider credentials, local tool output directories, or raw Pi session files. Large artifacts should be referenced by scoped object identifiers. Secrets stay with the Runtime Host or a future dedicated secrets service.
 
 ## 6. Agent execution model
 
 Each active role owns an isolated runtime session supervised by the meeting Runtime Host. The meeting orchestrator decides who may speak, create a temporary role, invoke a capability, or retain a role; the model runtime does not become the authorization layer. Tools start disabled and are exposed through explicit role- and meeting-scoped capabilities. Commands carry stable IDs so retries do not duplicate model or tool work.
 
-Normalized domain events are the authoritative meeting history. Provider transcripts, reasoning records, caches, and tool implementation details are private runtime state. Durable checkpoints, human approval before consequential tools, MCP consent boundaries, and OpenTelemetry GenAI spans are planned integration surfaces; their schemas must remain additive and must not weaken `runtimeGeneration` fencing.
+Normalized domain events are the authoritative meeting history. Provider transcripts, reasoning records, caches, tool arguments/results, and Pi private sessions are private runtime state. Windows durable checkpoints, human approval before granted MCP tools, and MCP consent boundaries are implemented. OpenTelemetry GenAI spans, content-safe diagnostics export, budget/loop limits, and authenticated remote recovery remain planned integration surfaces; their schemas must remain additive and must not weaken `runtimeGeneration` fencing.
+
+## 7. Windows packaging boundary
+
+The x64 alpha is published framework-self-contained and Windows App SDK-self-contained. The MSI bundles the generated WinUI XBF/PRI resources, the release C++ core, a Node 24 executable, the compiled Runtime Host, the protocol package, and production Pi/MCP dependencies. Packaged path resolution prefers these adjacent assets and does not depend on a repository checkout or machine-wide Node installation. The WiX 4 pipeline is implemented and its administrative extraction plus extracted-payload launch are verification gates. The current MSI is unsigned; signing, real install/uninstall and upgrade/repair matrices, and ARM64 packaging remain pending.

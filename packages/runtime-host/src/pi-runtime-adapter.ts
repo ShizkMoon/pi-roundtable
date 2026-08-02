@@ -9,8 +9,11 @@ import {
   type AgentSessionEvent,
   type CreateAgentSessionOptions,
   type PromptOptions,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import type { Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
+import { Type, type Credential, type CredentialInfo, type CredentialStore } from "@earendil-works/pi-ai";
+
+import type { ApiFamily, ModelCapability } from "@pi-roundtable/protocol";
 
 import type {
   RuntimeAdapter,
@@ -22,6 +25,7 @@ import type {
 } from "./runtime-adapter.js";
 import {
   McpClientManager,
+  type McpToolApprovalRequest,
   type ResolvedMcpServerRuntimeConfiguration,
 } from "./mcp-client-manager.js";
 
@@ -43,7 +47,13 @@ export interface PiSessionHandle {
 
 export interface PiSessionCreateOptions {
   providerId: string;
+  providerName: string;
+  apiFamily: ApiFamily;
+  endpoint?: string;
   modelId: string;
+  modelName: string;
+  modelCapabilities: readonly ModelCapability[];
+  contextWindow?: number;
   cwd: string;
   agentDir?: string;
   sessionId: string;
@@ -52,6 +62,8 @@ export interface PiSessionCreateOptions {
   systemPrompt: string;
   skillPaths: readonly string[];
   mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
+  approvalHandler?: (request: McpToolApprovalRequest) => Promise<boolean>;
+  customTools?: readonly ToolDefinition[];
 }
 
 export interface PiSessionFactory {
@@ -61,7 +73,13 @@ export interface PiSessionFactory {
 export interface PiRuntimeAdapterOptions {
   roleId: string;
   providerId: string;
+  providerName?: string;
+  apiFamily?: ApiFamily;
+  endpoint?: string;
   modelId: string;
+  modelName?: string;
+  modelCapabilities?: readonly ModelCapability[];
+  contextWindow?: number;
   credentialProvider: RuntimeCredentialProvider;
   runtimeId?: string;
   sessionId?: string;
@@ -71,6 +89,7 @@ export interface PiRuntimeAdapterOptions {
   systemPrompt?: string;
   skillPaths?: readonly string[];
   mcpServers?: readonly ResolvedMcpServerRuntimeConfiguration[];
+  subagentSpawner?: (task: string) => Promise<string>;
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
 }
@@ -123,14 +142,72 @@ class MemoryCredentialStore implements CredentialStore {
 
 const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
   async create(options): Promise<PiSessionHandle> {
-    const modelRuntime = await ModelRuntime.create({
-      credentials: new MemoryCredentialStore(),
-      allowModelNetwork: false,
-    });
-    await modelRuntime.setRuntimeApiKey(options.providerId, options.apiKey, {
-      allowNetwork: false,
-    });
-    const model = modelRuntime.getModel(options.providerId, options.modelId);
+    let modelRuntime: ModelRuntime;
+    try {
+      modelRuntime = await ModelRuntime.create({
+        credentials: new MemoryCredentialStore(),
+        allowModelNetwork: false,
+      });
+    } catch (error) {
+      throw toStageError("model_runtime_init_failed", error);
+    }
+    const endpoint = options.endpoint === undefined
+      ? undefined
+      : normalizeProviderEndpoint(options.endpoint);
+    let model;
+    try {
+      model = modelRuntime.getModel(options.providerId, options.modelId);
+      if (model === undefined) {
+        const api = mapApiFamily(options.apiFamily);
+        const existingProvider = modelRuntime.getProvider(options.providerId);
+        const baseUrl = endpoint ?? existingProvider?.baseUrl;
+        if (api === undefined || baseUrl === undefined) {
+          throw new PiRuntimeError(
+            "model_not_found",
+            `Pi model is not available: ${options.providerId}/${options.modelId}`,
+          );
+        }
+        const contextWindow = options.contextWindow ?? 128_000;
+        modelRuntime.registerProvider(options.providerId, {
+          name: options.providerName,
+          baseUrl,
+          apiKey: options.apiKey,
+          api,
+          models: [{
+            id: options.modelId,
+            name: options.modelName,
+            reasoning: options.modelCapabilities.includes("reasoning"),
+            input: options.modelCapabilities.includes("vision") ? ["text", "image"] : ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow,
+            maxTokens: Math.min(65_536, Math.max(4_096, Math.floor(contextWindow / 8))),
+            ...(options.providerId === "deepseek"
+              ? {
+                  compat: {
+                    supportsStore: false,
+                    supportsDeveloperRole: false,
+                    requiresReasoningContentOnAssistantMessages: true,
+                    thinkingFormat: "deepseek" as const,
+                  },
+                }
+              : {}),
+          }],
+        });
+        model = modelRuntime.getModel(options.providerId, options.modelId);
+      } else if (endpoint !== undefined) {
+        modelRuntime.registerProvider(options.providerId, { baseUrl: endpoint });
+        model = modelRuntime.getModel(options.providerId, options.modelId);
+      }
+    } catch (error) {
+      throw toStageError("model_registration_failed", error);
+    }
+    try {
+      await modelRuntime.setRuntimeApiKey(options.providerId, options.apiKey, {
+        allowNetwork: false,
+      });
+    } catch (error) {
+      throw toStageError("credential_install_failed", error);
+    }
     if (model === undefined) {
       throw new PiRuntimeError(
         "model_not_found",
@@ -138,9 +215,19 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       );
     }
 
-    const mcpManager = new McpClientManager(options.mcpServers);
+    const mcpManager = new McpClientManager(
+      options.mcpServers,
+      undefined,
+      options.approvalHandler,
+    );
     try {
-      const customTools = await mcpManager.connect();
+      let mcpTools;
+      try {
+        mcpTools = await mcpManager.connect();
+      } catch (error) {
+        throw toStageError("mcp_connect_failed", error);
+      }
+      const customTools = [...mcpTools, ...(options.customTools ?? [])];
       const createOptions: CreateAgentSessionOptions = {
         cwd: options.cwd,
         modelRuntime,
@@ -165,7 +252,12 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         createOptions.tools = toolNames;
       }
 
-      const { session } = await createAgentSession(createOptions);
+      let session;
+      try {
+        ({ session } = await createAgentSession(createOptions));
+      } catch (error) {
+        throw toStageError("session_create_failed", error);
+      }
       return {
         sessionId: session.sessionId,
         get isStreaming() {
@@ -192,6 +284,12 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
   },
 };
 
+function toStageError(code: string, error: unknown): PiRuntimeError {
+  return error instanceof PiRuntimeError
+    ? error
+    : new PiRuntimeError(code, `Pi runtime stage failed: ${code}`);
+}
+
 export class PiRuntimeAdapter implements RuntimeAdapter {
   readonly #options: PiRuntimeAdapterOptions;
   readonly #runtimeId: string;
@@ -208,8 +306,10 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnCancellationPending = false;
   #turnCancellationEmitted = false;
   #turnFailed = false;
+  #turnFailureErrorCode: string | undefined;
   #turnFailureTerminalEmitted = false;
   #activeTurnCommandId: string | undefined;
+  readonly #pendingToolApprovals = new Map<string, (approved: boolean) => void>();
 
   constructor(options: PiRuntimeAdapterOptions) {
     this.#options = options;
@@ -314,6 +414,25 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       });
     }
 
+    if (command.kind === "tool.approval.resolve") {
+      const resolve = this.#pendingToolApprovals.get(command.approvalId);
+      if (resolve === undefined) {
+        return remember({
+          commandId: command.commandId,
+          accepted: false,
+          errorCode: "approval_not_pending",
+          message: "The tool approval request is not pending",
+        });
+      }
+      this.#pendingToolApprovals.delete(command.approvalId);
+      resolve(command.approved);
+      this.#emit("tool.approval_resolved", {
+        approvalId: command.approvalId,
+        approved: command.approved,
+      }, this.#activeTurnCommandId);
+      return remember({ commandId: command.commandId, accepted: true });
+    }
+
     if (command.kind === "turn.cancel") {
       const previousCancellationPending = this.#turnCancellationPending;
       const previousCancellationEmitted = this.#turnCancellationEmitted;
@@ -409,7 +528,15 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       const factory = this.#options.sessionFactory ?? DEFAULT_PI_SESSION_FACTORY;
       const createOptions: PiSessionCreateOptions = {
         providerId: this.#options.providerId,
+        providerName: this.#options.providerName ?? this.#options.providerId,
+        apiFamily: this.#options.apiFamily ?? "custom",
+        ...(this.#options.endpoint === undefined ? {} : { endpoint: this.#options.endpoint }),
         modelId: this.#options.modelId,
+        modelName: this.#options.modelName ?? this.#options.modelId,
+        modelCapabilities: [...(this.#options.modelCapabilities ?? ["text"])],
+        ...(this.#options.contextWindow === undefined
+          ? {}
+          : { contextWindow: this.#options.contextWindow }),
         cwd: this.#options.cwd ?? process.cwd(),
         sessionId: this.#sessionId,
         tools: [...(this.#options.tools ?? [])],
@@ -417,6 +544,10 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         systemPrompt: this.#options.systemPrompt ?? "",
         skillPaths: [...(this.#options.skillPaths ?? [])],
         mcpServers: [...(this.#options.mcpServers ?? [])],
+        approvalHandler: (request) => this.#requestToolApproval(request),
+        customTools: this.#options.subagentSpawner === undefined
+          ? []
+          : [this.#createSubagentTool(this.#options.subagentSpawner)],
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;
@@ -492,6 +623,10 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#turnFailed = false;
     this.#turnFailureTerminalEmitted = false;
     this.#activeTurnCommandId = undefined;
+    for (const resolve of this.#pendingToolApprovals.values()) {
+      resolve(false);
+    }
+    this.#pendingToolApprovals.clear();
     try {
       if (shouldAbort) {
         await session.abort();
@@ -516,7 +651,51 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         followUp: true,
         cancellation: true,
         tools: session.getActiveToolNames().length > 0,
-        subagents: false,
+        subagents: this.#options.subagentSpawner !== undefined,
+      },
+    };
+  }
+
+  #requestToolApproval(request: McpToolApprovalRequest): Promise<boolean> {
+    if (this.#state !== "running" || this.#pendingToolApprovals.has(request.approvalId)) {
+      return Promise.resolve(false);
+    }
+    return new Promise<boolean>((resolve) => {
+      this.#pendingToolApprovals.set(request.approvalId, resolve);
+      this.#emit("tool.approval_requested", {
+        approvalId: request.approvalId,
+        toolCallId: request.toolCallId,
+        serverId: request.serverId,
+        serverDisplayName: request.serverDisplayName,
+        toolName: request.toolName,
+        toolLabel: request.toolLabel,
+      }, this.#activeTurnCommandId);
+    });
+  }
+
+  #createSubagentTool(spawnSubagent: (task: string) => Promise<string>): ToolDefinition {
+    return {
+      name: "spawn_subagent",
+      label: "Spawn SubAgent",
+      description: [
+        "Delegate one bounded task to an isolated Pi SubAgent.",
+        "The call returns immediately with an ID; the result is delivered privately back to this parent role.",
+        "At most two SubAgents may run concurrently for this role, and SubAgents cannot recurse.",
+      ].join(" "),
+      parameters: Type.Object({
+        task: Type.String({ minLength: 1, maxLength: 16_384 }),
+      }),
+      executionMode: "sequential",
+      execute: async (_toolCallId, parameters) => {
+        const task = (parameters as { task: string }).task;
+        const subagentId = await spawnSubagent(task);
+        return {
+          content: [{
+            type: "text",
+            text: `SubAgent ${subagentId} is running asynchronously. Continue without waiting for its result.`,
+          }],
+          details: { subagentId },
+        };
       },
     };
   }
@@ -529,6 +708,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     switch (event.type) {
       case "turn_start":
         this.#turnFailed = false;
+        this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
         this.#emit("turn.started", {}, this.#activeTurnCommandId);
         break;
@@ -541,10 +721,11 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
             this.#turnCancellationPending = true;
             if (!this.#turnCancellationEmitted) {
               this.#turnCancellationEmitted = true;
-              this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
+              this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
             }
           } else {
             this.#turnFailed = true;
+            this.#turnFailureErrorCode = "pi_response_error";
             this.#emit("runtime.failed", {
               errorCode: "pi_response_error",
               message: "Pi provider response failed",
@@ -556,18 +737,22 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       case "turn_end":
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
-            this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
+            this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
           }
         } else if (this.#turnFailed) {
           if (!this.#turnFailureTerminalEmitted) {
             this.#turnFailureTerminalEmitted = true;
-            this.#emit("turn.cancelled", {}, this.#activeTurnCommandId);
+            this.#emit("turn.cancelled", {
+              reason: "failed",
+              errorCode: this.#turnFailureErrorCode ?? "pi_runtime_error",
+            }, this.#activeTurnCommandId);
           }
         } else if (!this.#turnFailed) {
           this.#emit("turn.completed", {}, this.#activeTurnCommandId);
         }
         this.#clearCancellationOutcome();
         this.#turnFailed = false;
+        this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
         this.#activeTurnCommandId = undefined;
         break;
@@ -593,6 +778,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       case "auto_retry_end":
         if (!event.success) {
           this.#turnFailed = true;
+          this.#turnFailureErrorCode = "pi_retry_exhausted";
           this.#emit("runtime.failed", {
             errorCode: "pi_retry_exhausted",
             message: "Pi automatic retry was exhausted",
@@ -694,6 +880,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         return [command.kind, command.roleId].join("\u0000");
       case "subagent.subscription":
         return [command.kind, command.roleId, command.level].join("\u0000");
+      case "tool.approval.resolve":
+        return [
+          command.kind,
+          command.roleId,
+          command.approvalId,
+          command.approved ? "approved" : "denied",
+        ].join("\u0000");
     }
   }
 
@@ -707,4 +900,39 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#commandResults.set(result.commandId, { fingerprint, result });
     return result;
   }
+}
+
+function mapApiFamily(apiFamily: ApiFamily): string | undefined {
+  switch (apiFamily) {
+    case "openai_responses":
+      return "openai-responses";
+    case "openai_chat_completions":
+      return "openai-completions";
+    case "anthropic_messages":
+      return "anthropic-messages";
+    case "google_generate_content":
+      return "google-generative-ai";
+    case "custom":
+      return undefined;
+  }
+}
+
+export function normalizeProviderEndpoint(value: string): string {
+  const endpoint = new URL(value);
+  const hostname = endpoint.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback = hostname === "localhost" || hostname === "::1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(hostname);
+  if (
+    endpoint.username.length > 0 ||
+    endpoint.password.length > 0 ||
+    endpoint.search.length > 0 ||
+    endpoint.hash.length > 0 ||
+    (endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback))
+  ) {
+    throw new PiRuntimeError(
+      "invalid_provider_endpoint",
+      "Provider endpoint must use HTTPS or loopback HTTP without credentials, query, or fragment",
+    );
+  }
+  return endpoint.toString().replace(/\/$/u, "");
 }

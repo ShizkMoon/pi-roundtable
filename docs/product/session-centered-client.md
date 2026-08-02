@@ -2,7 +2,7 @@
 
 ## Product job
 
-Pi Roundtable is a native Windows deliberation workspace for one human host who conducts durable, multi-role Agent sessions. The primary task is to reopen a session, understand who is present and what each participant may do, then continue the discussion without rebuilding runtime configuration. The current milestone restores the session definition, participant manifests, and normalized public/private message projections. Full normalized event-log replay remains planned and must not be described as implemented.
+Pi Roundtable is a native Windows deliberation workspace for one human host who conducts durable, multi-role Agent sessions. The primary task is to reopen a session, understand who is present and what each participant may do, then continue the discussion without rebuilding runtime configuration. The current milestone restores the session definition and participant manifests, replays DPAPI-protected normalized public/private events through the deterministic core, then resumes the local Runtime Host under the next `runtimeGeneration`.
 
 ## Information architecture
 
@@ -33,7 +33,7 @@ The role editor follows the useful part of the supplied reference image: one sta
 - **MCP / tools**: server grants, exact tool allowlists, approval mode, and execution mode.
 - **Memory**: session working set, long-term write policy, and visible retention decision.
 
-The current Windows milestone edits provider/model routes, prompts, Skill references, MCP server attachments, invitation provenance, delegation mode, and retention. Imported MCP servers remain disabled until explicit catalog approval, then a role attachment authorizes that server for the participant snapshot. The Runtime Host executes discovered MCP tools with bounded input/output and transport checks. Per-tool allowlist/interactive approval editing and SubAgent-isolated execution remain planned; an empty tool allowlist currently exposes all tools from the explicitly approved and attached server.
+The current Windows milestone edits provider/model routes, prompts, Skill references, MCP server attachments, invitation provenance, delegation mode, and retention. Imported MCP servers remain disabled until explicit catalog approval, then a role attachment authorizes that server for the participant snapshot. The Runtime Host executes discovered MCP tools with bounded input/output and transport checks. `always` and first-use policies pause the tool before side effects and show the host only sanitized server/tool identity; arguments and results do not enter approval events. Exact per-tool allowlist editing remains planned, so an empty allowlist currently exposes all tools from the explicitly approved and attached server. Isolated Pi SubAgents are implemented without MCP tools or recursive delegation, with at most two concurrent children per parent role and private result return.
 
 Creating a temporary role uses the same editor as a required review sheet. “Invite to session” stays disabled until purpose, prompt, model route, and retention are complete. Skills/MCP may be empty, but absence must be explicit.
 
@@ -58,18 +58,19 @@ Segoe UI Variable carries interface text; Cascadia Mono is reserved for model ID
 - Provider/model changes are saved explicitly and reused; secrets are never displayed after storage.
 - Editing a long-term role affects future participant bindings, not frozen manifests in an active or closed session.
 - Grant changes during a live session are commands and normalized events, not silent local edits.
-- Network-heavy capabilities carry a `subagent_preferred` policy marker; isolated SubAgent execution with summary-and-citation return remains the next execution-layer milestone.
+- Network-heavy capabilities may carry a `subagent_preferred` or `subagent_required` policy marker. Isolated SubAgent execution is implemented; automatic citation validation and artifact-return contracts remain a later milestone.
 - Empty and error states name the missing configuration and link directly to the relevant editor.
 - A host message may mention one or more roles, but it remains public and is eventually available to every participant's public context.
+- Only mentioned roles enter that response queue. Each target receives an identity-bound turn prompt and answers only as itself; it may cite another public statement but must not draft another mentioned role's answer.
 - A private host message is visible only to the host and its selected role. It is never injected into another role's context.
 - The role inspector reports normalized status and activity summaries. Provider chain-of-thought and hidden reasoning are not a client surface.
 - At wide widths all three meeting columns are visible. Medium widths keep the session rail and move private context to an overlay; compact widths move both side panes to overlays.
 
 ## Milestone status
 
-- **Implemented:** session groups and session-click navigation; separate Role/Skill/MCP/Settings pages; compact public transcript with read-only participant list; public multi-mention and one-role private commands; safe role-detail/back flow; native adaptive side panes; durable provider/model/theme/sync settings; provider model-list discovery/import; Windows Credential Manager; bounded Git checkout, redacted LLM repository review, isolated atomic Skill/MCP install, catalog approval lifecycle; approved MCP tool discovery and execution.
-- **Scaffolded:** remote synchronization configuration and normalized local public/private projections.
-- **Planned:** per-tool interactive approval UI; SubAgent-isolated network/tool execution; authenticated/E2EE remote synchronization; durable long-term memory and prompt-revision execution; full normalized event-log persistence and replay; signed MSI packaging.
+- **Implemented:** session groups and session-click navigation; separate Role/Skill/MCP/Settings pages; compact public transcript with read-only participant list; public multi-mention with identity-bound, role-exclusive responses and one-role private commands; native safe Markdown, LaTeX-source fallback, throttled streaming render, automatic latest-follow with user-scroll escape; safe role-detail/back flow; native adaptive side panes; durable provider/model/theme/sync settings; provider model-list discovery/import; Windows Credential Manager; bounded Git checkout, redacted LLM repository review, isolated atomic Skill/MCP install, catalog approval lifecycle; approved MCP discovery/execution and private interactive approval; bounded non-recursive Pi SubAgents with activity UI; DPAPI-protected SQLite event persistence, deterministic replay, pause/resume and turn-boundary recovery; self-contained unsigned x64 MSI pipeline.
+- **Scaffolded:** remote synchronization configuration and the unauthenticated development sync server.
+- **Planned:** exact per-tool allowlist editor; full mathematical typesetting beyond the current safe LaTeX-source fallback; authenticated/E2EE remote synchronization; durable long-term memory and prompt-revision execution; citation/artifact validation for delegated work; signed MSI, real install/uninstall and upgrade/repair matrix; ARM64 packaging.
 
 ## Reference boundaries
 

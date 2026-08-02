@@ -1,4 +1,3 @@
-export { OmpRpcClient, OmpRpcError, type OmpRpcClientOptions } from "./omp-rpc-client.js";
 export {
   LOCAL_HOST_PROTOCOL_VERSION,
   LocalHostProtocolError,
@@ -29,7 +28,6 @@ export {
   type PiSessionHandle,
   type RuntimeCredentialProvider,
 } from "./pi-runtime-adapter.js";
-export { RpcFrameDecoder } from "./rpc-frame-decoder.js";
 export { StdioRuntimeHost } from "./stdio-runtime-host.js";
 export type {
   RuntimeAdapter,
@@ -43,12 +41,3 @@ export type {
   RuntimeEventListener,
   RuntimeSessionInfo,
 } from "./runtime-adapter.js";
-export type {
-  InterruptMode,
-  RpcFrameListener,
-  RpcReadyFrame,
-  RpcRecord,
-  RpcResponse,
-  StreamingBehavior,
-  SubagentSubscription,
-} from "./rpc-types.js";
