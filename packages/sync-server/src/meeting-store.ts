@@ -59,7 +59,7 @@ export interface AppendMeetingEventInput {
   payload?: JsonObject;
 }
 
-type EventListener = (event: MeetingEvent) => void;
+export type EventListener = (event: MeetingEvent) => void;
 
 interface MeetingRecord {
   runtimeGeneration: number;
@@ -74,7 +74,21 @@ export interface MeetingStoreOptions {
   nextId?: () => string;
 }
 
-export class InMemoryMeetingStore {
+export type StoreResult<T> = T | Promise<T>;
+
+export interface MeetingStore {
+  readonly persistence: "memory" | "postgres";
+  acquireLease(input: AcquireLeaseInput): StoreResult<AcquireLeaseResult>;
+  releaseLease(meetingId: string, ownerRuntimeId: string): StoreResult<MeetingEvent>;
+  append(input: AppendMeetingEventInput): StoreResult<MeetingEvent>;
+  eventsAfter(meetingId: string, sequence: number): StoreResult<MeetingEvent[]>;
+  subscribe(meetingId: string, listener: EventListener): () => void;
+  currentLease(meetingId: string): StoreResult<MeetingLease | null>;
+  close?(): StoreResult<void>;
+}
+
+export class InMemoryMeetingStore implements MeetingStore {
+  readonly persistence = "memory" as const;
   readonly #records = new Map<string, MeetingRecord>();
   readonly #now: () => Date;
   readonly #nextId: () => string;

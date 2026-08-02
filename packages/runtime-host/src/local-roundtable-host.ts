@@ -42,6 +42,7 @@ export interface LocalRoundtableHostOptions {
   catalogSkillRoot?: string;
   catalogMcpRoot?: string;
   now?: () => Date;
+  turnTimeoutMs?: number;
   adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
   subagentRunner?: SubagentRunner;
 }
@@ -56,6 +57,7 @@ export interface ResolvedRoleRuntimeConfiguration {
   modelName: string;
   modelCapabilities: ModelCapability[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   apiKey: string;
   systemPrompt: string;
   skillPaths: string[];
@@ -115,6 +117,11 @@ interface RememberedReceipt {
   receipt: CommandReceipt;
 }
 
+interface ActiveTurnTimeout {
+  commandId: string;
+  handle: ReturnType<typeof setTimeout>;
+}
+
 export type MeetingEventListener = (event: MeetingEvent) => void;
 export type HostDiagnosticListener = (errorCode: string, message: string) => void;
 export type LocalHostStopMode = "suspend" | "close";
@@ -124,6 +131,7 @@ export class LocalRoundtableHost {
   readonly #runtimeId: string;
   readonly #runtimeGeneration: number;
   readonly #now: () => Date;
+  readonly #turnTimeoutMs: number;
   readonly #roles = new Map<string, HostedRole>();
   readonly #receipts = new Map<string, RememberedReceipt>();
   readonly #eventListeners = new Set<MeetingEventListener>();
@@ -135,6 +143,8 @@ export class LocalRoundtableHost {
   readonly #subagentRunner: SubagentRunner;
   readonly #subagentRuns = new Map<string, ActiveSubagentRun>();
   readonly #pendingSubagentContinuations: PendingSubagentContinuation[] = [];
+  readonly #turnTimeouts = new Map<string, ActiveTurnTimeout>();
+  readonly #timedOutTurnCommands = new Set<string>();
   #phase: "created" | "live" | "closed" = "created";
   #sequence = 0;
   #leaseActive = false;
@@ -164,6 +174,11 @@ export class LocalRoundtableHost {
     }
     this.#runtimeGeneration = runtimeGeneration;
     this.#now = options.now ?? (() => new Date());
+    const turnTimeoutMs = options.turnTimeoutMs ?? 120_000;
+    if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1 || turnTimeoutMs > 900_000) {
+      throw new RangeError("turnTimeoutMs must be an integer between 1 and 900000");
+    }
+    this.#turnTimeoutMs = turnTimeoutMs;
     this.#subagentRunner = options.subagentRunner ?? new PiSubagentRunner();
   }
 
@@ -570,6 +585,9 @@ export class LocalRoundtableHost {
           ...(configuration.contextWindow === undefined
             ? {}
             : { contextWindow: configuration.contextWindow }),
+          ...(configuration.maxOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: configuration.maxOutputTokens }),
           apiKey: configuration.apiKey,
           cwd: this.#options.cwd ?? process.cwd(),
           systemPrompt: configuration.systemPrompt,
@@ -746,6 +764,7 @@ export class LocalRoundtableHost {
       this.#activeTurnCorrelationId = undefined;
     }
     this.#expectedTurns.delete(roleId);
+    this.#clearTurnTimeout(roleId);
     this.#rolePublicCursors.delete(roleId);
     role.unsubscribe();
     try {
@@ -787,6 +806,8 @@ export class LocalRoundtableHost {
     });
     if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
       this.#expectedTurns.delete(roleId);
+    } else if (result.accepted) {
+      this.#armTurnTimeout(roleId, command.commandId);
     }
     return this.#fromRuntimeResult(command, result);
   }
@@ -872,6 +893,8 @@ export class LocalRoundtableHost {
     if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
       this.#expectedTurns.delete(roleId);
       this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "The target role could not answer the private message");
+    } else if (result.accepted) {
+      this.#armTurnTimeout(roleId, command.commandId);
     }
     return this.#accepted(command);
   }
@@ -901,6 +924,7 @@ export class LocalRoundtableHost {
         delivery: "immediate",
       });
       if (result.accepted) {
+        this.#armTurnTimeout(next.roleId, next.commandId);
         return;
       }
       this.#expectedTurns.delete(next.roleId);
@@ -944,6 +968,7 @@ export class LocalRoundtableHost {
         delivery: "immediate",
       });
       if (result.accepted) {
+        this.#armTurnTimeout(next.parentRoleId, commandId);
         return;
       }
       this.#expectedTurns.delete(next.parentRoleId);
@@ -1066,6 +1091,9 @@ export class LocalRoundtableHost {
     });
     if (result.accepted) {
       this.#expectedTurns.delete(roleId);
+      if (this.#activeRoleId !== roleId) {
+        this.#clearTurnTimeout(roleId);
+      }
     }
     return this.#fromRuntimeResult(command, result);
   }
@@ -1099,6 +1127,8 @@ export class LocalRoundtableHost {
         this.#safeRuntimeErrorCode(result.errorCode ?? "handoff_failed"),
         "The interrupting role could not take the floor",
       );
+    } else {
+      this.#armTurnTimeout(handoff.interruptorId, handoff.commandId);
     }
   }
 
@@ -1143,6 +1173,11 @@ export class LocalRoundtableHost {
           return;
         }
         const kind = event.kind === "turn.completed" ? "speech.completed" : "speech.cancelled";
+        const correlationId = this.#activeTurnCorrelationId ?? event.correlationId ?? undefined;
+        const timedOut = correlationId === undefined
+          ? false
+          : this.#timedOutTurnCommands.delete(correlationId);
+        this.#clearTurnTimeout(roleId, correlationId);
         const handoff = this.#pendingHandoff;
         this.#emitActiveTurnEvent(
           kind,
@@ -1150,7 +1185,9 @@ export class LocalRoundtableHost {
             ? handoff.interruptorId
             : roleId,
           event,
-          event.payload,
+          timedOut
+            ? { ...event.payload, reason: "timeout", errorCode: "turn_timeout" }
+            : event.payload,
           event.kind === "turn.cancelled" ? roleId : null,
         );
         const completedVisibility = this.#activeTurnVisibility;
@@ -1242,6 +1279,9 @@ export class LocalRoundtableHost {
       ...(configuration.contextWindow === undefined
         ? {}
         : { contextWindow: configuration.contextWindow }),
+      ...(configuration.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: configuration.maxOutputTokens }),
       tools: [],
       systemPrompt: configuration.systemPrompt,
       skillPaths: configuration.skillPaths,
@@ -1445,6 +1485,9 @@ export class LocalRoundtableHost {
       modelName: model.displayName,
       modelCapabilities: [...model.capabilities],
       ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+      ...(participant.modelRouteSnapshot.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: participant.modelRouteSnapshot.maxOutputTokens }),
       apiKey,
       systemPrompt,
       skillPaths,
@@ -1567,6 +1610,63 @@ export class LocalRoundtableHost {
     );
   }
 
+  #armTurnTimeout(roleId: string, commandId: string): void {
+    const expected = this.#expectedTurns.get(roleId)?.commandId === commandId;
+    const active = this.#activeRoleId === roleId &&
+      (this.#activeTurnCorrelationId === undefined || this.#activeTurnCorrelationId === commandId);
+    if (!expected && !active) {
+      return;
+    }
+    this.#clearTurnTimeout(roleId);
+    const handle = setTimeout(() => {
+      this.#enqueueInternal(() => this.#expireTurn(roleId, commandId));
+    }, this.#turnTimeoutMs);
+    handle.unref();
+    this.#turnTimeouts.set(roleId, { commandId, handle });
+  }
+
+  #clearTurnTimeout(roleId: string, commandId?: string): void {
+    const timeout = this.#turnTimeouts.get(roleId);
+    if (timeout === undefined || (commandId !== undefined && timeout.commandId !== commandId)) {
+      return;
+    }
+    clearTimeout(timeout.handle);
+    this.#turnTimeouts.delete(roleId);
+  }
+
+  async #expireTurn(roleId: string, commandId: string): Promise<void> {
+    const timeout = this.#turnTimeouts.get(roleId);
+    if (timeout?.commandId !== commandId) {
+      return;
+    }
+    const expected = this.#expectedTurns.get(roleId)?.commandId === commandId;
+    const active = this.#activeRoleId === roleId &&
+      (this.#activeTurnCorrelationId === undefined || this.#activeTurnCorrelationId === commandId);
+    this.#clearTurnTimeout(roleId, commandId);
+    if (!expected && !active) {
+      return;
+    }
+    const role = this.#roles.get(roleId);
+    if (role === undefined) {
+      this.#expectedTurns.delete(roleId);
+      return;
+    }
+    this.#timedOutTurnCommands.add(commandId);
+    const result = await role.adapter.execute({
+      kind: "turn.cancel",
+      commandId: `${commandId}:timeout`,
+      roleId,
+    });
+    if (!result.accepted) {
+      this.#timedOutTurnCommands.delete(commandId);
+      this.#expectedTurns.delete(roleId);
+      this.#diagnose(
+        this.#safeRuntimeErrorCode(result.errorCode ?? "turn_timeout_cancel_failed"),
+        "The timed-out role runtime could not be cancelled",
+      );
+    }
+  }
+
   #enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.#operationTail.then(operation);
     this.#operationTail = result.then(
@@ -1587,6 +1687,11 @@ export class LocalRoundtableHost {
     this.#roles.clear();
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
+    for (const timeout of this.#turnTimeouts.values()) {
+      clearTimeout(timeout.handle);
+    }
+    this.#turnTimeouts.clear();
+    this.#timedOutTurnCommands.clear();
     await Promise.all(
       roles.map(async (role) => {
         role.unsubscribe();

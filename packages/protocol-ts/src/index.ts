@@ -2,6 +2,7 @@ export const PROTOCOL_VERSION = 1 as const;
 
 export * from "./configuration.js";
 export * from "./validation.js";
+export * from "./session-export.js";
 
 export type ProtocolVersion = typeof PROTOCOL_VERSION;
 export type JsonPrimitive = string | number | boolean | null;

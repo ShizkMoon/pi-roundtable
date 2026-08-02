@@ -18,4 +18,4 @@ A same-owner lease renewal retains the generation. A takeover after expiry or ex
 - Interruption and tool cancellation have one authoritative executor.
 - Clients can replay by sequence without merging competing model histories.
 - Offline mobile clients may queue commands, but the server must revalidate them against the current owner and meeting state.
-- Production deployment needs durable, atomic lease and event storage; the scaffold's in-memory store is only an executable reference.
+- The optional PostgreSQL store now provides durable transactional lease, generation, sequence, and event writes. The in-memory store remains only an executable development reference; multi-replica notification/coordination and production operations are still separate gates.

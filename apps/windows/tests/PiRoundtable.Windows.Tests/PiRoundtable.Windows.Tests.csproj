@@ -11,5 +11,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\PiRoundtable.Windows\PiRoundtable.Windows.csproj" />
+    <ProjectReference Include="..\..\PiRoundtable.Updater\PiRoundtable.Updater.csproj" />
   </ItemGroup>
 </Project>

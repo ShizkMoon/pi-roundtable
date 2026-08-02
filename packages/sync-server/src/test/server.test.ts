@@ -4,8 +4,37 @@ import { get, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { InMemoryMeetingStore } from "../meeting-store.js";
+import type { MeetingEvent } from "@pi-roundtable/protocol";
+
+import { createDeviceToken, DeviceTokenAuthenticator, type DeviceTokenPayload } from "../device-auth.js";
+import { InMemoryMeetingStore, type MeetingStore } from "../meeting-store.js";
 import { createSyncServer } from "../server.js";
+
+const AUTH_KEY = Buffer.alloc(32, 0x5a);
+const authenticator = new DeviceTokenAuthenticator(
+  new Map([["test-key", AUTH_KEY]]),
+  () => new Date("2026-08-02T00:00:00.000Z"),
+);
+
+function token(
+  meetingId: string,
+  options: { userId?: string; deviceId?: string; audienceIds?: string[]; runtimeIds?: string[] } = {},
+): string {
+  const payload: DeviceTokenPayload = {
+    version: 1,
+    userId: options.userId ?? "user.direct_host",
+    deviceId: options.deviceId ?? "device.windows",
+    meetingIds: [meetingId],
+    audienceIds: options.audienceIds ?? ["role.secretary"],
+    runtimeIds: options.runtimeIds ?? ["runtime.windows"],
+    expiresAt: "2026-08-03T00:00:00.000Z",
+  };
+  return createDeviceToken("test-key", AUTH_KEY, payload);
+}
+
+function bearer(value: string): { authorization: string } {
+  return { authorization: `Bearer ${value}` };
+}
 
 test("health endpoint advertises development persistence", async (context) => {
   const server = createSyncServer();
@@ -21,11 +50,12 @@ test("health endpoint advertises development persistence", async (context) => {
     service: "pi-roundtable-sync",
     protocolVersion: 1,
     persistence: "memory",
+    authentication: "device_token",
   });
 });
 
 test("event replay rejects a partially numeric cursor", async (context) => {
-  const server = createSyncServer();
+  const server = createSyncServer(new InMemoryMeetingStore(), authenticator);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   context.after(() => server.close());
@@ -33,14 +63,15 @@ test("event replay rejects a partially numeric cursor", async (context) => {
   const address = server.address() as AddressInfo;
   const response = await fetch(
     `http://127.0.0.1:${address.port}/v1/meetings/meeting-1/events?after=12junk`,
+    { headers: bearer(token("meeting-1")) },
   );
   assert.equal(response.status, 400);
   const body = (await response.json()) as { error: string };
   assert.equal(body.error, "bad_request");
 });
 
-test("development sync server rejects private events before authentication exists", async (context) => {
-  const server = createSyncServer();
+test("authenticated runtime can append a private event with an explicit audience", async (context) => {
+  const server = createSyncServer(new InMemoryMeetingStore(), authenticator);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   context.after(() => server.close());
@@ -50,7 +81,7 @@ test("development sync server rejects private events before authentication exist
     `http://127.0.0.1:${address.port}/v1/meetings/private-meeting/leases`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...bearer(token("private-meeting")) },
       body: JSON.stringify({ ownerRuntimeId: "runtime.windows", ttlMs: 30_000 }),
     },
   );
@@ -59,18 +90,21 @@ test("development sync server rejects private events before authentication exist
     `http://127.0.0.1:${address.port}/v1/meetings/private-meeting/events`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...bearer(token("private-meeting")) },
       body: JSON.stringify({
         ownerRuntimeId: "runtime.windows",
         runtimeGeneration: lease.lease.runtimeGeneration,
         kind: "message.direct_sent",
         visibility: "private",
+        audience: ["user.direct_host", "role.secretary"],
         payload: { message: "secret" },
       }),
     },
   );
-  assert.equal(response.status, 400);
-  assert.match(JSON.stringify(await response.json()), /private events require authenticated audience filtering/);
+  assert.equal(response.status, 201);
+  const event = (await response.json()) as { visibility: string; audience: string[] };
+  assert.equal(event.visibility, "private");
+  assert.deepEqual(event.audience, ["user.direct_host", "role.secretary"]);
 });
 
 test("development sync server never replays or streams private store events", async (context) => {
@@ -101,7 +135,13 @@ test("development sync server never replays or streams private store events", as
     payload: { message: "public-replay" },
   });
 
-  const server = createSyncServer(store);
+  const observerToken = token("private-replay", {
+    userId: "user.observer",
+    deviceId: "device.observer",
+    audienceIds: [],
+    runtimeIds: [],
+  });
+  const server = createSyncServer(store, authenticator);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   context.after(() => server.close());
@@ -110,6 +150,7 @@ test("development sync server never replays or streams private store events", as
 
   const replayResponse = await fetch(
     `${baseUrl}/events?after=${leaseResult.event?.sequence ?? 0}`,
+    { headers: bearer(observerToken) },
   );
   const replay = (await replayResponse.json()) as {
     events: Array<{ visibility: string; payload: { message?: string } }>;
@@ -119,7 +160,9 @@ test("development sync server never replays or streams private store events", as
 
   let streamRequest: ReturnType<typeof get> | undefined;
   const streamResponse = await new Promise<IncomingMessage>((resolve, reject) => {
-    streamRequest = get(`${baseUrl}/stream?after=${publicEvent.sequence}`, resolve);
+    streamRequest = get(`${baseUrl}/stream?after=${publicEvent.sequence}`, {
+      headers: bearer(observerToken),
+    }, resolve);
     streamRequest.once("error", reject);
   });
   context.after(() => streamRequest?.destroy());
@@ -159,4 +202,104 @@ test("development sync server never replays or streams private store events", as
   streamResponse.destroy();
   assert.equal(streamText.includes("live-secret"), false);
   assert.equal(streamText.includes("public-live"), true);
+});
+
+test("authenticated user or role audience receives private replay while unrelated devices do not", async (context) => {
+  const store = new InMemoryMeetingStore();
+  const lease = store.acquireLease({ meetingId: "audience-replay", ownerRuntimeId: "runtime.windows", ttlMs: 30_000 }).lease;
+  store.append({
+    meetingId: lease.meetingId,
+    ownerRuntimeId: lease.ownerRuntimeId,
+    runtimeGeneration: lease.runtimeGeneration,
+    kind: "message.direct_sent",
+    visibility: "private",
+    audience: ["user.direct_host", "role.secretary"],
+    payload: { message: "audience-secret" },
+  });
+  const server = createSyncServer(store, authenticator);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const response = await fetch(
+    `http://127.0.0.1:${address.port}/v1/meetings/audience-replay/events?after=0`,
+    { headers: bearer(token("audience-replay")) },
+  );
+  const body = (await response.json()) as { events: MeetingEvent[] };
+  assert.equal(body.events.some((event) => event.payload.message === "audience-secret"), true);
+});
+
+test("SSE buffers events appended while the initial cursor replay is in progress", async (context) => {
+  const store = new InMemoryMeetingStore();
+  const delayedStore: MeetingStore = store;
+  const originalEventsAfter = store.eventsAfter.bind(store);
+  let releaseReplay!: () => void;
+  const replayReleased = new Promise<void>((resolve) => { releaseReplay = resolve; });
+  let markReplayStarted!: () => void;
+  const replayStarted = new Promise<void>((resolve) => { markReplayStarted = resolve; });
+  delayedStore.eventsAfter = async (meetingId, sequence) => {
+    const snapshot = originalEventsAfter(meetingId, sequence);
+    markReplayStarted();
+    await replayReleased;
+    return snapshot;
+  };
+  const lease = store.acquireLease({
+    meetingId: "sse-gap",
+    ownerRuntimeId: "runtime.windows",
+    ttlMs: 30_000,
+  }).lease;
+  const server = createSyncServer(delayedStore, authenticator);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+
+  let streamRequest: ReturnType<typeof get> | undefined;
+  const streamResponsePromise = new Promise<IncomingMessage>((resolve, reject) => {
+    streamRequest = get(`http://127.0.0.1:${address.port}/v1/meetings/sse-gap/stream?after=0`, {
+      headers: bearer(token("sse-gap")),
+    }, resolve);
+    streamRequest.once("error", reject);
+  });
+  context.after(() => streamRequest?.destroy());
+  await replayStarted;
+  store.append({
+    meetingId: lease.meetingId,
+    ownerRuntimeId: lease.ownerRuntimeId,
+    runtimeGeneration: lease.runtimeGeneration,
+    kind: "message.published",
+    actorId: "user.direct_host",
+    payload: { message: "bridged-event" },
+  });
+  releaseReplay();
+
+  const streamResponse = await streamResponsePromise;
+  streamResponse.setEncoding("utf8");
+  let streamText = "";
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("timed out waiting for buffered SSE event")), 2_000);
+    streamResponse.on("data", (chunk: string) => {
+      streamText += chunk;
+      if (streamText.includes("bridged-event")) {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+    streamResponse.once("error", reject);
+  });
+  streamResponse.destroy();
+  assert.equal((streamText.match(/bridged-event/g) ?? []).length, 1);
+});
+
+test("device token rejects missing, tampered, and cross-meeting access", async (context) => {
+  const server = createSyncServer(new InMemoryMeetingStore(), authenticator);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const url = `http://127.0.0.1:${address.port}/v1/meetings/meeting-auth/events?after=0`;
+
+  assert.equal((await fetch(url)).status, 401);
+  assert.equal((await fetch(url, { headers: bearer(`${token("meeting-auth")}x`) })).status, 401);
+  assert.equal((await fetch(url, { headers: bearer(token("meeting-other")) })).status, 403);
 });

@@ -1,5 +1,7 @@
 using Markdig;
 using Markdig.Extensions.Mathematics;
+using Markdig.Extensions.Tables;
+using Markdig.Extensions.TaskLists;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
 
@@ -13,6 +15,7 @@ internal enum MarkdownBlockKind
     Quote,
     Code,
     Math,
+    Table,
     ThematicBreak,
 }
 
@@ -20,21 +23,35 @@ internal sealed record MarkdownInlinePresentation(
     string Text,
     bool Bold = false,
     bool Italic = false,
+    bool Strikethrough = false,
     bool Code = false,
     bool Math = false,
     string? SafeUrl = null,
     bool IsLineBreak = false);
+
+internal sealed record MarkdownTableRowPresentation(
+    bool IsHeader,
+    IReadOnlyList<IReadOnlyList<MarkdownInlinePresentation>> Cells);
 
 internal sealed record MarkdownBlockPresentation(
     MarkdownBlockKind Kind,
     IReadOnlyList<MarkdownInlinePresentation> Inlines,
     string? Text = null,
     int Level = 0,
-    string? Marker = null);
+    string? Marker = null,
+    string? Language = null,
+    IReadOnlyList<MarkdownTableRowPresentation>? Rows = null);
 
 internal static class SafeMarkdownParser
 {
+    internal const int MaxSourceCharacters = 131_072;
+    internal const int MaxBlocks = 512;
+    internal const int MaxTableRows = 50;
+    internal const int MaxTableColumns = 12;
+    private const string TruncationNotice = "内容过长，已为保持界面响应而截断显示。";
+
     private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder()
+        .UseAdvancedExtensions()
         .DisableHtml()
         .UseMathematics()
         .Build();
@@ -47,11 +64,32 @@ internal static class SafeMarkdownParser
             return [];
         }
 
+        var wasTruncated = source.Length > MaxSourceCharacters;
+        if (wasTruncated)
+        {
+            source = source[..MaxSourceCharacters];
+        }
+
         var document = Markdown.Parse(source, Pipeline);
         var result = new List<MarkdownBlockPresentation>();
         foreach (var block in document)
         {
+            if (result.Count >= MaxBlocks)
+            {
+                wasTruncated = true;
+                break;
+            }
             AppendBlock(result, block, source, 0);
+        }
+        if (wasTruncated)
+        {
+            if (result.Count >= MaxBlocks)
+            {
+                result.RemoveAt(result.Count - 1);
+            }
+            result.Add(new MarkdownBlockPresentation(
+                MarkdownBlockKind.Quote,
+                [new MarkdownInlinePresentation(TruncationNotice)]));
         }
         return result;
     }
@@ -77,6 +115,19 @@ internal static class SafeMarkdownParser
     {
         switch (block)
         {
+            case Table table:
+                var rows = ParseTable(table, out var tableTruncated);
+                output.Add(new MarkdownBlockPresentation(
+                    MarkdownBlockKind.Table,
+                    [],
+                    Rows: rows));
+                if (tableTruncated && output.Count < MaxBlocks)
+                {
+                    output.Add(new MarkdownBlockPresentation(
+                        MarkdownBlockKind.Quote,
+                        [new MarkdownInlinePresentation("表格过大，仅显示前 50 行、12 列。")]));
+                }
+                return;
             case MathBlock math:
                 output.Add(new MarkdownBlockPresentation(
                     MarkdownBlockKind.Math,
@@ -87,7 +138,8 @@ internal static class SafeMarkdownParser
                 output.Add(new MarkdownBlockPresentation(
                     MarkdownBlockKind.Code,
                     [],
-                    fenced.Lines.ToString()));
+                    fenced.Lines.ToString(),
+                    Language: fenced.Info?.Trim()));
                 return;
             case CodeBlock code:
                 output.Add(new MarkdownBlockPresentation(
@@ -138,7 +190,13 @@ internal static class SafeMarkdownParser
         var fallbackOrder = 1;
         foreach (var item in list.OfType<ListItemBlock>())
         {
-            var marker = list.IsOrdered
+            if (output.Count >= MaxBlocks)
+            {
+                return;
+            }
+            var marker = TryGetTaskState(item, out var isChecked)
+                ? isChecked ? "☑" : "☐"
+                : list.IsOrdered
                 ? $"{(item.Order > 0 ? item.Order : fallbackOrder)}."
                 : "•";
             var inlines = ParseDirectItemInlines(item);
@@ -171,7 +229,7 @@ internal static class SafeMarkdownParser
             {
                 result.Add(new MarkdownInlinePresentation(string.Empty, IsLineBreak: true));
             }
-            AppendInlines(result, leaf.Inline.FirstChild, false, false, null);
+            AppendInlines(result, leaf.Inline.FirstChild, false, false, false, null);
         }
         return result;
     }
@@ -187,7 +245,7 @@ internal static class SafeMarkdownParser
                 {
                     result.Add(new MarkdownInlinePresentation(string.Empty, IsLineBreak: true));
                 }
-                AppendInlines(result, leaf.Inline.FirstChild, false, false, null);
+                AppendInlines(result, leaf.Inline.FirstChild, false, false, false, null);
             }
             else if (child is ContainerBlock nested)
             {
@@ -205,7 +263,7 @@ internal static class SafeMarkdownParser
     private static IReadOnlyList<MarkdownInlinePresentation> ParseInlines(ContainerInline? container)
     {
         var result = new List<MarkdownInlinePresentation>();
-        AppendInlines(result, container?.FirstChild, false, false, null);
+        AppendInlines(result, container?.FirstChild, false, false, false, null);
         return result;
     }
 
@@ -214,6 +272,7 @@ internal static class SafeMarkdownParser
         Inline? current,
         bool bold,
         bool italic,
+        bool strikethrough,
         string? linkUrl)
     {
         while (current is not null)
@@ -225,6 +284,7 @@ internal static class SafeMarkdownParser
                         literal.Content.ToString(),
                         bold,
                         italic,
+                        strikethrough,
                         SafeUrl: linkUrl));
                     break;
                 case CodeInline code:
@@ -232,6 +292,7 @@ internal static class SafeMarkdownParser
                         code.Content,
                         bold,
                         italic,
+                        strikethrough,
                         Code: true,
                         SafeUrl: linkUrl));
                     break;
@@ -240,6 +301,7 @@ internal static class SafeMarkdownParser
                         math.Content.ToString(),
                         bold,
                         italic,
+                        strikethrough,
                         Math: true,
                         SafeUrl: linkUrl));
                     break;
@@ -250,24 +312,62 @@ internal static class SafeMarkdownParser
                     AppendInlines(
                         output,
                         emphasis.FirstChild,
-                        bold || emphasis.DelimiterCount >= 2,
-                        italic || emphasis.DelimiterCount == 1,
+                        bold || (emphasis.DelimiterChar != '~' && emphasis.DelimiterCount >= 2),
+                        italic || (emphasis.DelimiterChar != '~' && emphasis.DelimiterCount == 1),
+                        strikethrough || emphasis.DelimiterChar == '~',
                         linkUrl);
                     break;
                 case LinkInline link when !link.IsImage:
                     _ = TryNormalizeLink(link.Url, out var safeUrl);
-                    AppendInlines(output, link.FirstChild, bold, italic, safeUrl);
+                    AppendInlines(output, link.FirstChild, bold, italic, strikethrough, safeUrl);
                     break;
                 case LinkInline image:
-                    AppendInlines(output, image.FirstChild, bold, italic, null);
+                    AppendInlines(output, image.FirstChild, bold, italic, strikethrough, null);
                     output.Add(new MarkdownInlinePresentation(" [image hidden]", Italic: true));
                     break;
+                case TaskList:
+                    break;
                 case ContainerInline nested:
-                    AppendInlines(output, nested.FirstChild, bold, italic, linkUrl);
+                    AppendInlines(output, nested.FirstChild, bold, italic, strikethrough, linkUrl);
                     break;
             }
             current = current.NextSibling;
         }
+    }
+
+    private static bool TryGetTaskState(ListItemBlock item, out bool isChecked)
+    {
+        foreach (var leaf in item.OfType<LeafBlock>())
+        {
+            for (var inline = leaf.Inline?.FirstChild; inline is not null; inline = inline.NextSibling)
+            {
+                if (inline is TaskList task)
+                {
+                    isChecked = task.Checked;
+                    return true;
+                }
+            }
+        }
+        isChecked = false;
+        return false;
+    }
+
+    private static IReadOnlyList<MarkdownTableRowPresentation> ParseTable(Table table, out bool truncated)
+    {
+        var rows = new List<MarkdownTableRowPresentation>();
+        var sourceRows = table.OfType<TableRow>().ToArray();
+        truncated = sourceRows.Length > MaxTableRows ||
+            sourceRows.Any(row => row.OfType<TableCell>().Skip(MaxTableColumns).Any());
+        foreach (var row in sourceRows.Take(MaxTableRows))
+        {
+            var cells = row
+                .OfType<TableCell>()
+                .Take(MaxTableColumns)
+                .Select(cell => ParseContainerInlines(cell))
+                .ToArray();
+            rows.Add(new MarkdownTableRowPresentation(row.IsHeader, cells));
+        }
+        return rows;
     }
 
     private static string SliceSource(Block block, string source)

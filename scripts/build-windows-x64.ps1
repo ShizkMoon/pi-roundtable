@@ -1,10 +1,12 @@
 ﻿param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.1.0',
+    [string]$Version = '0.2.0',
 
     [string]$OutputRoot,
 
-    [switch]$SkipVerification
+    [switch]$SkipVerification,
+
+    [switch]$SuppressMsiValidation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +33,55 @@ function Invoke-Checked {
         }
     } finally {
         Pop-Location
+    }
+}
+
+function Invoke-CheckedWixBuild {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ArgumentList,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WorkingDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$ExpectedIce03FileIds
+    )
+
+    Write-Host "[dotnet] $($ArgumentList -join ' ')"
+    $lines = [System.Collections.Generic.List[string]]::new()
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        & dotnet @ArgumentList 2>&1 | ForEach-Object {
+            $line = $_.ToString()
+            $lines.Add($line)
+            Write-Host $line
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "dotnet WiX build failed with exit code $exitCode."
+    }
+
+    $seenFileIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $unexpectedWarnings = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $lines) {
+        if ($line -notmatch ':\s+warning\s+') {
+            continue
+        }
+        if ($line -match 'warning WIX1076: ICE03: String overflow .*Table: File, Column: Language, Key\(s\): (?<fileId>fil[0-9A-F]+)') {
+            [void]$seenFileIds.Add($Matches.fileId)
+        } else {
+            $unexpectedWarnings.Add($line)
+        }
+    }
+    $missingFileIds = @($ExpectedIce03FileIds | Where-Object { !$seenFileIds.Contains($_) })
+    $unknownFileIds = @($seenFileIds | Where-Object { $_ -notin $ExpectedIce03FileIds })
+    if ($unexpectedWarnings.Count -gt 0 -or $missingFileIds.Count -gt 0 -or $unknownFileIds.Count -gt 0) {
+        throw "WiX warning gate failed. Unexpected=$($unexpectedWarnings.Count), missing known ICE03=$($missingFileIds -join ','), unknown ICE03=$($unknownFileIds -join ',')."
     }
 }
 
@@ -116,7 +167,9 @@ function Write-WixFileManifest {
         $componentId = Get-StableWixId 'cmp' $relative
         $fileId = Get-StableWixId 'fil' $relative
         $source = ConvertTo-XmlAttribute $file.FullName
-        $defaultLanguage = if ($file.Extension -ieq '.mui') { ' DefaultLanguage="0"' } else { '' }
+        $ignoreInvalidEmbeddedLanguage = $file.Extension -ieq '.mui' -or
+            $file.Name -iin @('Microsoft.ui.xaml.dll', 'Microsoft.UI.Xaml.Phone.dll')
+        $defaultLanguage = if ($ignoreInvalidEmbeddedLanguage) { ' DefaultLanguage="0"' } else { '' }
         [void]$builder.AppendLine(('      <Component Id="{0}" Directory="{1}" Guid="*">' -f $componentId, $directoryId))
         [void]$builder.AppendLine(('        <File Id="{0}" Source="{1}" KeyPath="yes"{2} />' -f $fileId, $source, $defaultLanguage))
         [void]$builder.AppendLine('      </Component>')
@@ -141,6 +194,7 @@ try {
     }
 
     $appStage = Join-Path $packageRoot 'app'
+    $updaterStage = Join-Path $packageRoot 'updater'
     $runtimeHostStage = Join-Path $appStage 'runtime-host'
     $runtimeStage = Join-Path $appStage 'runtime'
     $installerOutput = Join-Path $repoRoot 'out\installer'
@@ -159,6 +213,11 @@ try {
     $nodeMajor = [int]($nodeVersion.Split('.')[0])
     if ($nodeMajor -lt 24) {
         throw "Windows packaging requires Node.js 24 or newer; found $nodeVersion."
+    }
+    $npmVersion = (& npm --version).Trim()
+    $npmMajor = [int]($npmVersion.Split('.')[0])
+    if ($npmMajor -lt 12) {
+        throw "Windows packaging requires npm 12 or newer to produce the verified production dependency layout; found $npmVersion."
     }
 
     Invoke-Checked 'npm' @('run', 'build') $repoRoot
@@ -185,6 +244,7 @@ try {
         '--self-contained', 'true',
         '--output', $appStage,
         '-p:Platform=x64',
+        "-p:Version=$Version",
         '-p:DebugType=None',
         '-p:DebugSymbols=false'
     ) $repoRoot
@@ -193,6 +253,25 @@ try {
             throw "Published WinUI resource is missing: $resourceName"
         }
     }
+
+    Invoke-Checked 'dotnet' @(
+        'publish',
+        'apps/windows/PiRoundtable.Updater/PiRoundtable.Updater.csproj',
+        '--configuration', 'Release',
+        '--runtime', 'win-x64',
+        '--self-contained', 'true',
+        '--output', $updaterStage,
+        "-p:Version=$Version",
+        '-p:PublishSingleFile=true',
+        '-p:DebugType=None',
+        '-p:DebugSymbols=false'
+    ) $repoRoot
+    $updaterExecutable = Join-Path $updaterStage 'PiRoundtable.Updater.exe'
+    if (!(Test-Path -LiteralPath $updaterExecutable -PathType Leaf)) {
+        throw 'Single-file updater helper was not produced.'
+    }
+    Copy-Item -LiteralPath $updaterExecutable -Destination (Join-Path $appStage 'PiRoundtable.Updater.exe') -Force
+    Remove-Item -LiteralPath $updaterStage -Recurse -Force
 
     $nativeCore = Join-Path $repoRoot 'out\build\release\core\pi_roundtable_core.dll'
     if (!(Test-Path -LiteralPath $nativeCore)) {
@@ -260,14 +339,25 @@ try {
     Write-WixFileManifest -SourceRoot $appStage -OutputPath $generatedWxs
 
     $wixProject = Join-Path $repoRoot 'packaging\windows-x64\PiRoundtable.Installer.wixproj'
-    Invoke-Checked 'dotnet' @(
+    $knownLanguageOverflowIds = @(
+        (Get-StableWixId 'fil' 'Microsoft.ui.xaml.dll'),
+        (Get-StableWixId 'fil' 'Microsoft.UI.Xaml.Phone.dll')
+    )
+    $wixBuildArguments = @(
         'build', $wixProject,
         '--configuration', 'Release',
         "-p:ProductVersion=$Version",
         "-p:PublishDir=$appStage",
         "-p:GeneratedWxs=$generatedWxs",
         "-p:OutputPath=$installerOutput"
-    ) $repoRoot
+    )
+    $expectedIce03FileIds = $knownLanguageOverflowIds
+    if ($SuppressMsiValidation) {
+        Write-Host 'WiX MSI validation is suppressed explicitly; use only after an equivalent release package passes validation.'
+        $wixBuildArguments += '-p:SuppressValidation=true'
+        $expectedIce03FileIds = @()
+    }
+    Invoke-CheckedWixBuild $wixBuildArguments $repoRoot $expectedIce03FileIds
 
     $msi = Get-ChildItem -LiteralPath $installerOutput -Filter '*.msi' -File |
         Sort-Object LastWriteTimeUtc -Descending |

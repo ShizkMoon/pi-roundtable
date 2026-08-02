@@ -13,12 +13,14 @@ import {
   MODEL_CAPABILITIES,
   PROTOCOL_VERSION,
   ROUNDTABLE_SESSION_VERSION,
+  SESSION_EXPORT_PACKAGE_VERSION,
   THINKING_LEVELS,
   validateRoundtableSession,
+  validateSessionExportPackage,
   validateWorkspaceProfile,
   WORKSPACE_CONFIGURATION_VERSION,
 } from "../index.js";
-import type { RoundtableSession, WorkspaceProfile } from "../index.js";
+import type { RoundtableSession, SessionExportPackage, WorkspaceProfile } from "../index.js";
 
 function createWorkspace(): WorkspaceProfile {
   return {
@@ -223,6 +225,34 @@ test("workspace validation resolves catalogs without exposing secret values", ()
   assert.equal(issues.some((issue) => issue.code === "duplicate_id"), true);
 });
 
+test("MCP grants are exact subsets of the reviewed workspace tool catalog", () => {
+  const workspace = createWorkspace();
+  workspace.mcpServers.push({
+    mcpServerId: "mcp.files",
+    displayName: "Files",
+    transport: "stdio",
+    command: "node",
+    toolCatalog: [
+      { name: "read_file", displayName: "Read file" },
+      { name: "write_file", displayName: "Write file" },
+    ],
+    enabled: true,
+  });
+  workspace.roles[0]!.capabilities.mcpGrants = [{
+    mcpServerId: "mcp.files",
+    toolAllowlist: ["read_file"],
+    approvalMode: "always",
+    executionMode: "direct",
+  }];
+  assert.deepEqual(validateWorkspaceProfile(workspace), []);
+
+  workspace.roles[0]!.capabilities.mcpGrants[0]!.toolAllowlist.push("delete_everything");
+  assert.equal(
+    validateWorkspaceProfile(workspace).some((issue) => issue.code === "unlisted_tool"),
+    true,
+  );
+});
+
 test("session validation enforces frozen role references and invitation provenance", () => {
   const workspace = createWorkspace();
   const session: RoundtableSession = {
@@ -345,6 +375,40 @@ test("draft sessions may persist before participant bindings are complete", () =
     validateRoundtableSession(session, workspace).some(
       (issue) => issue.code === "invalid_participant_count",
     ),
+    true,
+  );
+});
+
+test("validates normalized session export scope, ordering, and exact fields", () => {
+  const exported: SessionExportPackage = {
+    packageVersion: SESSION_EXPORT_PACKAGE_VERSION,
+    protocolVersion: PROTOCOL_VERSION,
+    sourceSessionId: "session.exported",
+    title: "Exported meeting",
+    exportedAt: "2026-08-02T00:00:00.000Z",
+    includesPrivateMessages: false,
+    messages: [{
+      messageId: "message.public-1",
+      kind: "host",
+      speakerId: "user.direct_host",
+      speakerName: "Host",
+      visibility: "public",
+      audienceRoleIds: [],
+      text: "Normalized public content",
+      state: "completed",
+      occurredAt: "2026-08-02T00:00:01.000Z",
+    }],
+  };
+
+  assert.deepEqual(validateSessionExportPackage(exported), []);
+  exported.messages[0]!.audienceRoleIds = ["role.secretary"];
+  assert.equal(
+    validateSessionExportPackage(exported).some((issue) => issue.code === "invalid_visibility"),
+    true,
+  );
+  const withSecretField = { ...exported, credentialRef: "wincred://must-not-export" };
+  assert.equal(
+    validateSessionExportPackage(withSecretField).some((issue) => issue.code === "invalid_shape"),
     true,
   );
 });

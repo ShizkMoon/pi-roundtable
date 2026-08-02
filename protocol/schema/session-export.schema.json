@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-roundtable.local/schema/config/v1/session-export.schema.json",
+  "title": "Pi Roundtable normalized session export",
+  "description": "Portable projection of normalized session messages. It never contains credentials, DPAPI ciphertext, raw Pi records, tool arguments/results, or hidden reasoning.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "packageVersion",
+    "protocolVersion",
+    "sourceSessionId",
+    "title",
+    "exportedAt",
+    "includesPrivateMessages",
+    "messages"
+  ],
+  "properties": {
+    "packageVersion": { "const": 1 },
+    "protocolVersion": { "const": 1 },
+    "sourceSessionId": { "$ref": "#/$defs/id" },
+    "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "exportedAt": { "type": "string", "format": "date-time" },
+    "includesPrivateMessages": { "type": "boolean" },
+    "messages": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/message" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "messageId",
+        "kind",
+        "speakerId",
+        "speakerName",
+        "visibility",
+        "audienceRoleIds",
+        "text",
+        "state",
+        "occurredAt"
+      ],
+      "properties": {
+        "messageId": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["host", "role", "system"] },
+        "speakerId": { "$ref": "#/$defs/id" },
+        "speakerName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "visibility": { "enum": ["public", "private"] },
+        "audienceRoleIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "text": { "type": "string", "maxLength": 1048576 },
+        "state": { "enum": ["submitted", "streaming", "completed", "cancelled"] },
+        "occurredAt": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "visibility": { "const": "private" } } },
+          "then": { "properties": { "audienceRoleIds": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "visibility": { "const": "public" } } },
+          "then": { "properties": { "audienceRoleIds": { "maxItems": 0 } } }
+        }
+      ]
+    }
+  }
+}

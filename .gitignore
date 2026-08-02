@@ -10,6 +10,7 @@ Thumbs.db
 # C++ / CMake
 out/
 build/
+artifacts/
 CMakeUserPresets.json
 compile_commands.json
 
@@ -42,3 +43,4 @@ Generated Files/
 data/
 *.session.jsonl
 *.omp
+*-private.pem

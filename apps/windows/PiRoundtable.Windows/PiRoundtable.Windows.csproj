@@ -17,6 +17,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version Condition="'$(Version)' == ''">0.2.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

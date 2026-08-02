@@ -31,7 +31,7 @@ public sealed class DependencyBoundaryTests
 
     private sealed class ThrowingRuntimeHostFactory : IRuntimeHostFactory
     {
-        public IRuntimeHostProcess Create() =>
+        public IRuntimeHostProcess Create(IMeetingEventStore eventStore) =>
             throw new AssertFailedException("Runtime creation is not expected during construction.");
     }
 
@@ -62,5 +62,26 @@ public sealed class DependencyBoundaryTests
             string meetingId,
             CancellationToken cancellationToken = default) =>
             throw new AssertFailedException("Checkpoint access is not expected during construction.");
+
+        public Task<CommandJournalReservation> ReserveCommandAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new AssertFailedException("Command journal access is not expected during construction.");
+
+        public Task CompleteCommandAsync(
+            string meetingId,
+            string fingerprint,
+            RuntimeCommandReceipt receipt,
+            CancellationToken cancellationToken = default) =>
+            throw new AssertFailedException("Command journal access is not expected during construction.");
+
+        public Task MarkCommandInterruptedAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default) =>
+            throw new AssertFailedException("Command journal access is not expected during construction.");
     }
 }

@@ -102,6 +102,43 @@ test("does not expose tools outside a non-empty MCP allowlist", async () => {
   }
 });
 
+test("an empty MCP allowlist exposes no tools and cannot be widened by approval", async () => {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = new Server(
+    { name: "empty-allowlist-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  let approvalRequests = 0;
+  let calls = 0;
+  server.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: [{ name: "write_anything", inputSchema: { type: "object", properties: {} } }],
+  }));
+  server.setRequestHandler(CallToolRequestSchema, () => {
+    calls += 1;
+    return { content: [{ type: "text", text: "unexpected" }] };
+  });
+  await server.connect(serverTransport);
+  const manager = new McpClientManager([{
+    serverId: "mcp.empty",
+    displayName: "Empty allowlist MCP",
+    transport: "stdio",
+    toolAllowlist: [],
+    approvalMode: "always",
+    executionMode: "direct",
+  }], () => clientTransport, async () => {
+    approvalRequests += 1;
+    return true;
+  });
+  try {
+    assert.deepEqual(await manager.connect(), []);
+    assert.equal(approvalRequests, 0);
+    assert.equal(calls, 0);
+  } finally {
+    await manager.close();
+    await server.close();
+  }
+});
+
 test("requires approval and remembers an approved first use without exposing arguments", async () => {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const server = new Server(
@@ -178,6 +215,49 @@ test("a denied approval prevents the MCP side effect", async () => {
       /not approved/,
     );
     assert.equal(calls, 0);
+  } finally {
+    await manager.close();
+    await server.close();
+  }
+});
+
+test("always approval is requested for every call and denial does not poison a later approval", async () => {
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const server = new Server(
+    { name: "retry-approval-mcp", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  let calls = 0;
+  server.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: [{ name: "write_once", inputSchema: { type: "object", properties: {} } }],
+  }));
+  server.setRequestHandler(CallToolRequestSchema, () => {
+    calls += 1;
+    return { content: [{ type: "text", text: "done" }] };
+  });
+  await server.connect(serverTransport);
+  const decisions = [false, true, true];
+  let approvals = 0;
+  const manager = new McpClientManager([{
+    serverId: "mcp.retry-approval",
+    displayName: "Retry approval MCP",
+    transport: "stdio",
+    toolAllowlist: ["write_once"],
+    approvalMode: "always",
+    executionMode: "direct",
+  }], () => clientTransport, async () => decisions[approvals++] ?? false);
+  try {
+    const [tool] = await manager.connect();
+    assert.ok(tool);
+    await assert.rejects(
+      tool.execute("call-denied", {}, undefined, undefined, {} as never),
+      /not approved/,
+    );
+    assert.equal(calls, 0);
+    await tool.execute("call-approved-1", {}, undefined, undefined, {} as never);
+    await tool.execute("call-approved-2", {}, undefined, undefined, {} as never);
+    assert.equal(approvals, 3);
+    assert.equal(calls, 2);
   } finally {
     await manager.close();
     await server.close();

@@ -14,6 +14,18 @@ internal sealed record MeetingStoreCheckpoint(
     bool IsClosed,
     DateTimeOffset UpdatedAt);
 
+internal enum CommandJournalReservationDisposition
+{
+    Reserved,
+    Duplicate,
+    Conflict,
+}
+
+internal sealed record CommandJournalReservation(
+    CommandJournalReservationDisposition Disposition,
+    string Status,
+    RuntimeCommandReceipt? Receipt);
+
 internal interface IMeetingEventStore
 {
     string DatabasePath { get; }
@@ -28,6 +40,24 @@ internal interface IMeetingEventStore
 
     Task<MeetingStoreCheckpoint?> GetCheckpointAsync(
         string meetingId,
+        CancellationToken cancellationToken = default);
+
+    Task<CommandJournalReservation> ReserveCommandAsync(
+        string meetingId,
+        string commandId,
+        string fingerprint,
+        CancellationToken cancellationToken = default);
+
+    Task CompleteCommandAsync(
+        string meetingId,
+        string fingerprint,
+        RuntimeCommandReceipt receipt,
+        CancellationToken cancellationToken = default);
+
+    Task MarkCommandInterruptedAsync(
+        string meetingId,
+        string commandId,
+        string fingerprint,
         CancellationToken cancellationToken = default);
 }
 
@@ -332,6 +362,209 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         return await ReadCheckpointAsync(connection, null, meetingId, cancellationToken);
     }
 
+    public async Task<CommandJournalReservation> ReserveCommandAsync(
+        string meetingId,
+        string commandId,
+        string fingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCommandJournalKeys(meetingId, commandId, fingerprint);
+        await InitializeAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            await using var readCommand = connection.CreateCommand();
+            readCommand.Transaction = transaction;
+            readCommand.CommandText = """
+                SELECT fingerprint, status, protected_receipt
+                FROM command_journal
+                WHERE meeting_id = $meeting_id AND command_id = $command_id
+                """;
+            readCommand.Parameters.AddWithValue("$meeting_id", meetingId);
+            readCommand.Parameters.AddWithValue("$command_id", commandId);
+            CommandJournalReservation? existingReservation = null;
+            await using (var reader = await readCommand.ExecuteReaderAsync(cancellationToken))
+            {
+                if (await reader.ReadAsync(cancellationToken))
+                {
+                    var storedFingerprint = reader.GetString(0);
+                    var status = reader.GetString(1);
+                    var receipt = reader.IsDBNull(2)
+                        ? null
+                        : DeserializeReceipt((byte[])reader[2]);
+                    existingReservation = new CommandJournalReservation(
+                        string.Equals(storedFingerprint, fingerprint, StringComparison.Ordinal)
+                            ? CommandJournalReservationDisposition.Duplicate
+                            : CommandJournalReservationDisposition.Conflict,
+                        status,
+                        receipt);
+                }
+            }
+            if (existingReservation is not null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return existingReservation;
+            }
+
+            await using var insertCommand = connection.CreateCommand();
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText = """
+                INSERT INTO command_journal(
+                    meeting_id, command_id, fingerprint, status,
+                    sequence, protected_receipt, updated_at)
+                VALUES(
+                    $meeting_id, $command_id, $fingerprint, 'pending',
+                    NULL, NULL, $updated_at)
+                """;
+            insertCommand.Parameters.AddWithValue("$meeting_id", meetingId);
+            insertCommand.Parameters.AddWithValue("$command_id", commandId);
+            insertCommand.Parameters.AddWithValue("$fingerprint", fingerprint);
+            insertCommand.Parameters.AddWithValue("$updated_at", DateTimeOffset.UtcNow.ToString("O"));
+            await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return new CommandJournalReservation(
+                CommandJournalReservationDisposition.Reserved,
+                "pending",
+                null);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    public async Task CompleteCommandAsync(
+        string meetingId,
+        string fingerprint,
+        RuntimeCommandReceipt receipt,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(receipt);
+        ValidateCommandJournalKeys(meetingId, receipt.CommandId, fingerprint);
+        if (receipt.Sequence is > long.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(receipt), "命令回执序号超出 SQLite INTEGER 范围。");
+        }
+        await InitializeAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var existing = await ReadCommandJournalAsync(
+                connection,
+                transaction,
+                meetingId,
+                receipt.CommandId,
+                cancellationToken);
+            if (existing is null)
+            {
+                throw new InvalidDataException("命令尚未写入持久日志，不能保存回执。");
+            }
+            if (!string.Equals(existing.Value.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("命令 ID 对应的指纹不一致。");
+            }
+            if (existing.Value.Receipt is not null)
+            {
+                if (existing.Value.Receipt != receipt)
+                {
+                    throw new InvalidDataException("同一命令 ID 携带了不一致的持久回执。");
+                }
+                await transaction.CommitAsync(cancellationToken);
+                return;
+            }
+
+            var protectedReceipt = _protector.Protect(
+                JsonSerializer.SerializeToUtf8Bytes(receipt, SerializerOptions));
+            await using var updateCommand = connection.CreateCommand();
+            updateCommand.Transaction = transaction;
+            updateCommand.CommandText = """
+                UPDATE command_journal
+                SET status = 'completed',
+                    sequence = $sequence,
+                    protected_receipt = $protected_receipt,
+                    updated_at = $updated_at
+                WHERE meeting_id = $meeting_id AND command_id = $command_id
+                """;
+            updateCommand.Parameters.AddWithValue("$sequence", receipt.Sequence is null
+                ? DBNull.Value
+                : checked((long)receipt.Sequence.Value));
+            updateCommand.Parameters.AddWithValue("$protected_receipt", protectedReceipt);
+            updateCommand.Parameters.AddWithValue("$updated_at", DateTimeOffset.UtcNow.ToString("O"));
+            updateCommand.Parameters.AddWithValue("$meeting_id", meetingId);
+            updateCommand.Parameters.AddWithValue("$command_id", receipt.CommandId);
+            await updateCommand.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    public async Task MarkCommandInterruptedAsync(
+        string meetingId,
+        string commandId,
+        string fingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCommandJournalKeys(meetingId, commandId, fingerprint);
+        await InitializeAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var existing = await ReadCommandJournalAsync(
+                connection,
+                transaction,
+                meetingId,
+                commandId,
+                cancellationToken);
+            if (existing is null)
+            {
+                throw new InvalidDataException("命令尚未写入持久日志，不能标记为中断。");
+            }
+            if (!string.Equals(existing.Value.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("命令 ID 对应的指纹不一致。");
+            }
+            if (existing.Value.Receipt is null && existing.Value.Status == "pending")
+            {
+                var receipt = new RuntimeCommandReceipt(
+                    commandId,
+                    "rejected",
+                    null,
+                    "command_outcome_unknown",
+                    "Runtime Host 在持久回执写入前中断；为避免重复副作用，该命令不会自动重放。");
+                var protectedReceipt = _protector.Protect(
+                    JsonSerializer.SerializeToUtf8Bytes(receipt, SerializerOptions));
+                await using var updateCommand = connection.CreateCommand();
+                updateCommand.Transaction = transaction;
+                updateCommand.CommandText = """
+                    UPDATE command_journal
+                    SET status = 'interrupted',
+                        protected_receipt = $protected_receipt,
+                        updated_at = $updated_at
+                    WHERE meeting_id = $meeting_id AND command_id = $command_id
+                    """;
+                updateCommand.Parameters.AddWithValue("$protected_receipt", protectedReceipt);
+                updateCommand.Parameters.AddWithValue("$updated_at", DateTimeOffset.UtcNow.ToString("O"));
+                updateCommand.Parameters.AddWithValue("$meeting_id", meetingId);
+                updateCommand.Parameters.AddWithValue("$command_id", commandId);
+                await updateCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
     private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
@@ -357,6 +590,61 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         catch (CryptographicException error)
         {
             throw new InvalidDataException("当前 Windows 用户无法解密本地会议历史。", error);
+        }
+    }
+
+    private RuntimeCommandReceipt DeserializeReceipt(byte[] ciphertext)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<RuntimeCommandReceipt>(
+                _protector.Unprotect(ciphertext),
+                SerializerOptions) ?? throw new InvalidDataException("本地命令回执为空。");
+        }
+        catch (CryptographicException error)
+        {
+            throw new InvalidDataException("当前 Windows 用户无法解密本地命令回执。", error);
+        }
+    }
+
+    private async Task<(string Fingerprint, string Status, RuntimeCommandReceipt? Receipt)?> ReadCommandJournalAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string meetingId,
+        string commandId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT fingerprint, status, protected_receipt
+            FROM command_journal
+            WHERE meeting_id = $meeting_id AND command_id = $command_id
+            """;
+        command.Parameters.AddWithValue("$meeting_id", meetingId);
+        command.Parameters.AddWithValue("$command_id", commandId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+        return (
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.IsDBNull(2) ? null : DeserializeReceipt((byte[])reader[2]));
+    }
+
+    private static void ValidateCommandJournalKeys(string meetingId, string commandId, string fingerprint)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(meetingId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(commandId);
+        if (commandId.Length > 128)
+        {
+            throw new ArgumentOutOfRangeException(nameof(commandId), "命令 ID 过长。");
+        }
+        if (fingerprint.Length != 64 || fingerprint.Any(character => !Uri.IsHexDigit(character)))
+        {
+            throw new ArgumentException("命令指纹必须是 64 位十六进制 SHA-256。", nameof(fingerprint));
         }
     }
 

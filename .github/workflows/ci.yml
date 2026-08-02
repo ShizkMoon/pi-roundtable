@@ -1,11 +1,17 @@
-name: Core CI
+name: Pi Roundtable CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   cpp-core:
@@ -30,3 +36,41 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  windows-client:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Pin verified packaging npm
+        run: |
+          npm install --global npm@12.0.1
+          npm --version
+      - run: npm ci
+      - run: npm run build
+      - name: Configure native core
+        run: cmake --preset dev
+      - name: Build native core
+        run: cmake --build --preset dev
+      - name: Test native core
+        run: ctest --preset dev
+      - name: Test Windows client
+        run: dotnet test apps/windows/tests/PiRoundtable.Windows.Tests/PiRoundtable.Windows.Tests.csproj --configuration Release
+      - name: Build self-contained Windows x64 MSI
+        shell: pwsh
+        # GitHub's Windows runner closes the WiX ICE validation pipe for this
+        # large self-contained package. Release builds keep validation on;
+        # CI still compiles the complete MSI after tests have passed.
+        run: ./scripts/build-windows-x64.ps1 -Version 0.2.0 -SkipVerification -SuppressMsiValidation
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PiRoundtable-0.2.0-win-x64
+          path: out/installer/PiRoundtable-0.2.0-win-x64.msi
+          if-no-files-found: error

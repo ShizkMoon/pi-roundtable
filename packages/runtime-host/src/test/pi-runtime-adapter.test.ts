@@ -99,6 +99,7 @@ function createAdapter(
   factory: FakePiSessionFactory,
   events: RuntimeEvent[],
   subagentSpawner?: (task: string) => Promise<string>,
+  toolApprovalTimeoutMs?: number,
 ): PiRuntimeAdapter {
   const adapter = new PiRuntimeAdapter({
     runtimeId: "runtime-pi-test",
@@ -114,6 +115,7 @@ function createAdapter(
     },
     sessionFactory: factory,
     now: () => new Date("2026-08-01T00:00:00.000Z"),
+    ...(toolApprovalTimeoutMs === undefined ? {} : { toolApprovalTimeoutMs }),
     ...(subagentSpawner === undefined ? {} : { subagentSpawner }),
   });
   adapter.subscribe((event) => events.push(event));
@@ -198,6 +200,31 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
   await adapter.stop();
   assert.equal(session.disposed, true);
   assert.equal(events.at(-1)?.kind, "runtime.stopped");
+});
+
+test("propagates the frozen role output-token limit into Pi session creation", async () => {
+  const factory = new FakePiSessionFactory();
+  const adapter = new PiRuntimeAdapter({
+    runtimeId: "runtime-token-limit",
+    sessionId: "session-token-limit",
+    roleId: "role.bounded",
+    providerId: "deepseek",
+    providerName: "DeepSeek",
+    apiFamily: "openai_chat_completions",
+    endpoint: "https://api.deepseek.com",
+    modelId: "deepseek-chat",
+    modelName: "DeepSeek Chat",
+    modelCapabilities: ["text"],
+    contextWindow: 65_536,
+    maxOutputTokens: 320,
+    tools: [],
+    credentialProvider: { resolveApiKey: async () => "bounded-test-key" },
+    sessionFactory: factory,
+  });
+
+  await adapter.start();
+  assert.equal(factory.lastOptions?.maxOutputTokens, 320);
+  await adapter.stop();
 });
 
 test("validates provider endpoints before they reach the Pi model runtime", () => {
@@ -299,6 +326,7 @@ test("normalizes tool approval without exposing tool arguments", async () => {
     serverDisplayName: "Notes",
     toolName: "write_note",
     toolLabel: "Write note",
+    expiresAt: "2026-08-01T00:02:00.000Z",
   });
   assert.equal("args" in (events.at(-1)?.payload ?? {}), false);
 
@@ -311,7 +339,48 @@ test("normalizes tool approval without exposing tool arguments", async () => {
   });
   assert.equal(receipt.accepted, true);
   assert.equal(await decision, true);
-  assert.deepEqual(events.at(-1)?.payload, { approvalId: "approval-1", approved: true });
+  assert.deepEqual(events.at(-1)?.payload, {
+    approvalId: "approval-1",
+    approved: true,
+    reason: "user",
+    expiresAt: "2026-08-01T00:02:00.000Z",
+  });
+  await adapter.stop();
+});
+
+test("expires tool approval, denies the tool, and rejects a late decision", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events, undefined, 20);
+  await adapter.start();
+  const requestApproval = factory.lastOptions?.approvalHandler;
+  assert.ok(requestApproval !== undefined);
+
+  const decision = requestApproval({
+    approvalId: "approval-expiring",
+    toolCallId: "tool-expiring",
+    serverId: "mcp.notes",
+    serverDisplayName: "Notes",
+    toolName: "write_note",
+    toolLabel: "Write note",
+  });
+
+  assert.equal(await decision, false);
+  assert.deepEqual(events.at(-1)?.payload, {
+    approvalId: "approval-expiring",
+    approved: false,
+    reason: "expired",
+    expiresAt: "2026-08-01T00:00:00.020Z",
+  });
+  const late = await adapter.execute({
+    kind: "tool.approval.resolve",
+    commandId: "late-approval",
+    roleId: "role.researcher",
+    approvalId: "approval-expiring",
+    approved: true,
+  });
+  assert.equal(late.accepted, false);
+  assert.equal(late.errorCode, "approval_not_pending");
   await adapter.stop();
 });
 
@@ -502,6 +571,33 @@ test("redacts raw provider failure details from runtime events", async () => {
   const terminal = events.find((event) => event.kind === "turn.cancelled");
   assert.equal(terminal?.payload.reason, "failed");
   assert.equal(terminal?.payload.errorCode, "pi_response_error");
+  await adapter.stop();
+});
+
+test("treats a final Pi assistant error as failed even without a streamed error update", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  await adapter.start();
+  const session = factory.session;
+  assert.ok(session !== undefined);
+
+  await adapter.execute({
+    kind: "turn.prompt",
+    commandId: "prompt-final-error",
+    roleId: "role.researcher",
+    message: "provider returns a terminal HTTP error",
+    delivery: "immediate",
+  });
+  session.emit({ type: "turn_start" });
+  const finalError = { role: "assistant", stopReason: "error" } as never;
+  session.emit({ type: "message_end", message: finalError });
+  session.emit({ type: "turn_end", message: finalError, toolResults: [] });
+
+  assert.equal(events.filter((event) => event.kind === "runtime.failed").length, 1);
+  assert.equal(events.filter((event) => event.kind === "turn.cancelled").length, 1);
+  assert.equal(events.some((event) => event.kind === "turn.completed"), false);
+  assert.equal(events.find((event) => event.kind === "turn.cancelled")?.payload.errorCode, "pi_response_error");
   await adapter.stop();
 });
 

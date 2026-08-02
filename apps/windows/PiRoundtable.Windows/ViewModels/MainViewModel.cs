@@ -63,6 +63,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private string _mcpSourceLocator = string.Empty;
     private string _mcpTransport = "stdio";
     private string _mcpCommandOrEndpoint = string.Empty;
+    private string _mcpToolCatalogText = string.Empty;
     private string _themeMode = "system";
     private string _remoteSyncEndpoint = string.Empty;
     private bool _remoteSyncEnabled;
@@ -157,6 +158,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public ObservableCollection<CapabilityGrantItem> AvailableCapabilities { get; } = [];
 
     public ObservableCollection<CapabilityGrantItem> InvitationCapabilities { get; } = [];
+
+    public ObservableCollection<McpToolGrantItem> AvailableMcpTools { get; } = [];
+
+    public ObservableCollection<McpToolGrantItem> InvitationMcpTools { get; } = [];
 
     public ObservableCollection<ToolApprovalItem> PendingToolApprovals { get; } = [];
 
@@ -515,6 +520,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         set => SetField(ref _mcpCommandOrEndpoint, value);
     }
 
+    public string McpToolCatalogText
+    {
+        get => _mcpToolCatalogText;
+        set => SetField(ref _mcpToolCatalogText, value);
+    }
+
     public string ThemeMode
     {
         get => _themeMode;
@@ -700,6 +711,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         ShowError(message);
     }
 
+    public void ReportClientStatus(string message)
+    {
+        StatusText = message;
+        ErrorMessage = string.Empty;
+    }
+
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
         if (_initialized)
@@ -767,8 +784,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         retentionPolicy: "retain_profile",
                         networkAccess: profile.Delegation.NetworkAccess);
                     role.SkillIds.UnionWith(profile.Capabilities.SkillIds);
-                    role.McpServerIds.UnionWith(
-                        profile.Capabilities.McpGrants.Select(grant => grant.McpServerId));
+                    foreach (var grant in profile.Capabilities.McpGrants)
+                    {
+                        role.SetMcpGrant(grant.McpServerId, grant.ToolAllowlist);
+                    }
                     LongTermRoles.Add(role);
                 }
                 Roles.Clear();
@@ -824,8 +843,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                             invitation.InvitationId,
                             invitation.CreatedAt);
                         role.SkillIds.UnionWith(participant.CapabilitiesSnapshot.SkillIds);
-                        role.McpServerIds.UnionWith(
-                            participant.CapabilitiesSnapshot.McpGrants.Select(grant => grant.McpServerId));
+                        foreach (var grant in participant.CapabilitiesSnapshot.McpGrants)
+                        {
+                            role.SetMcpGrant(grant.McpServerId, grant.ToolAllowlist);
+                        }
                         session.TemporaryRoles.Add(role);
                     }
                     foreach (var message in definition.Messages)
@@ -1275,6 +1296,72 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         await PersistSelectedSessionAsync(cancellationToken);
     }
 
+    public SessionExportPackage CreateSelectedSessionExport(bool includePrivateMessages)
+    {
+        var session = SelectedSession ?? throw new InvalidOperationException("当前没有可导出的会话。");
+        return SessionTransferService.CreatePackage(session, includePrivateMessages);
+    }
+
+    public async Task ImportSessionPackageAsync(
+        SessionImportPreflight preflight,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(preflight);
+        if (IsRunning || IsBusy)
+        {
+            ShowError("请先结束当前会话，再导入会话包。");
+            return;
+        }
+
+        var source = preflight.Package;
+        var session = new SessionItem(
+            $"session-{Guid.NewGuid():N}",
+            $"导入 · {source.Title}")
+        {
+            GroupId = SelectedSessionGroup?.GroupId ?? SessionGroups.First().GroupId,
+            Phase = "draft",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        foreach (var message in source.Messages)
+        {
+            var item = new TranscriptItem(
+                message.SpeakerId,
+                message.SpeakerName,
+                message.Text,
+                ToDisplayState(message.State),
+                message.Kind,
+                message.Visibility,
+                message.AudienceRoleIds,
+                message.MessageId,
+                message.OccurredAt);
+            if (message.Visibility == "private")
+            {
+                var privateRoleId = message.AudienceRoleIds.FirstOrDefault(value => value != "user.direct_host")
+                    ?? message.AudienceRoleIds[0];
+                session.GetPrivateThread(privateRoleId).Add(item);
+            }
+            else
+            {
+                session.Transcript.Add(item);
+            }
+        }
+
+        Sessions.Insert(0, session);
+        RefreshVisibleSessions();
+        SelectedSession = session;
+        Roles.Clear();
+        foreach (var role in LongTermRoles.Where(role => !role.IsArchived))
+        {
+            Roles.Add(role);
+        }
+        SelectedRole = Roles.FirstOrDefault();
+        await PersistSelectedSessionAsync(cancellationToken);
+        StatusText = $"已从预检包创建新草稿：{session.Title}";
+        ErrorMessage = string.Empty;
+        NotifySummary();
+    }
+
     public async Task CreateSessionGroupAsync(
         string displayName,
         string kind,
@@ -1551,6 +1638,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             Command = McpTransport == "stdio" ? McpCommandOrEndpoint.Trim() : null,
             Endpoint = McpTransport == "stdio" ? null : McpCommandOrEndpoint.Trim(),
             Arguments = McpTransport == "stdio" ? [] : null,
+            ToolCatalog = ParseMcpToolCatalog(McpToolCatalogText),
             Risk = "medium",
             ImportStatus = "review_required",
             AuditSummary = "手动登记，尚未经过 LLM 仓库审阅；必须由用户明确批准后才会进入角色能力列表。",
@@ -1574,7 +1662,58 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         RefreshInvitationCapabilities();
         McpDisplayName = string.Empty;
         McpCommandOrEndpoint = string.Empty;
+        McpToolCatalogText = string.Empty;
         StatusText = "MCP 已登记并保持禁用，等待人工审核";
+    }
+
+    public string GetMcpToolCatalogText(string mcpServerId)
+    {
+        var server = McpServers.FirstOrDefault(item => item.McpServerId == mcpServerId);
+        return server is null
+            ? string.Empty
+            : string.Join(Environment.NewLine, server.ToolCatalog
+                .OrderBy(tool => tool.Name, StringComparer.Ordinal)
+                .Select(tool => tool.Name));
+    }
+
+    public async Task UpdateMcpToolCatalogAsync(
+        string mcpServerId,
+        string toolNames,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed || IsRunning || IsBusy)
+        {
+            ShowError("请先暂停或结束当前会话，再修改 MCP 工具清单。");
+            return;
+        }
+        var server = McpServers.FirstOrDefault(item => item.McpServerId == mcpServerId);
+        if (server is null)
+        {
+            ShowError("找不到要编辑的 MCP 服务器。");
+            return;
+        }
+        var reviewedTools = ParseMcpToolCatalog(toolNames);
+        server.ToolCatalog = reviewedTools;
+        var reviewedNames = reviewedTools.Select(tool => tool.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var role in Roles.Concat(LongTermRoles).Distinct())
+        {
+            if (!role.McpServerIds.Contains(server.McpServerId))
+            {
+                continue;
+            }
+            role.SetMcpGrant(
+                server.McpServerId,
+                role.GetMcpToolAllowlist(server.McpServerId).Where(reviewedNames.Contains));
+        }
+        SynchronizeWorkspaceConfiguration();
+        await _workspaceStore.SaveAsync(_workspace, cancellationToken);
+        await PersistSelectedSessionAsync(cancellationToken);
+        RefreshCapabilityGrants();
+        RefreshInvitationCapabilities();
+        ErrorMessage = string.Empty;
+        StatusText = reviewedTools.Count == 0
+            ? $"{server.DisplayName} 当前授权零工具"
+            : $"{server.DisplayName} 已复核 {reviewedTools.Count} 个工具身份";
     }
 
     public async Task ApproveSkillAsync(string skillId, CancellationToken cancellationToken = default)
@@ -1692,7 +1831,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             IsBusy = true;
             ErrorMessage = string.Empty;
             StatusText = "正在启动 Runtime Host";
-            var runtime = _runtimeHostFactory.Create();
+            var runtime = _runtimeHostFactory.Create(_eventStore);
             _startingRuntime = runtime;
             runtime.MeetingEventReceived += OnMeetingEventReceived;
             runtime.DiagnosticReceived += OnDiagnosticReceived;
@@ -1828,12 +1967,21 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
         ErrorMessage = string.Empty;
         var normalizedMessage = message.Trim();
-        var mentions = Roles
-            .Where(role => !role.IsArchived &&
-                           normalizedMessage.Contains($"@{role.DisplayName}", StringComparison.OrdinalIgnoreCase))
-            .Select(role => role.RoleId)
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
+        var parsedMentions = RoleMentionParser.Parse(
+            normalizedMessage,
+            Roles,
+            MentionTargets.Where(target => target.IsMentioned).Select(target => target.RoleId));
+        if (parsedMentions.UnknownMentions.Count > 0)
+        {
+            ShowError($"未找到点名角色：{string.Join("、", parsedMentions.UnknownMentions.Select(name => $"@{name}"))}。请从下方回应者列表选择，或检查角色名。");
+            return false;
+        }
+        if (parsedMentions.AmbiguousMentions.Count > 0)
+        {
+            ShowError($"角色名不唯一：{string.Join("、", parsedMentions.AmbiguousMentions.Select(name => $"@{name}"))}。请先为重名角色设置不同名称。");
+            return false;
+        }
+        var mentions = parsedMentions.RoleIds.ToArray();
         var receipt = await runtime.SendCommandAsync(
             "speech.broadcast",
             "user.direct_host",
@@ -1849,6 +1997,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             ShowReceiptError(receipt);
             return false;
         }
+        foreach (var target in MentionTargets)
+        {
+            target.IsMentioned = false;
+        }
+        StatusText = mentions.Length == 0
+            ? "公开发言已发送；本轮由全部活跃角色依次回应"
+            : $"公开发言已发送；仅等待 {mentions.Length} 个被点名角色回应";
         NotifySummary();
         return true;
     }
@@ -2023,6 +2178,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
     }
 
+    public void RefreshToolApprovalDeadlines(DateTimeOffset? now = null)
+    {
+        var effectiveNow = now ?? DateTimeOffset.UtcNow;
+        foreach (var approval in PendingToolApprovals)
+        {
+            approval.RefreshDeadline(effectiveNow);
+        }
+    }
+
     public async Task AddTemporaryRoleAsync(
         string displayName,
         string purpose,
@@ -2055,9 +2219,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         role.SkillIds.UnionWith(
             InvitationCapabilities.Where(grant => grant.Kind == "Skill" && grant.IsGranted)
                 .Select(grant => grant.CapabilityId));
-        role.McpServerIds.UnionWith(
-            InvitationCapabilities.Where(grant => grant.Kind == "MCP" && grant.IsGranted)
-                .Select(grant => grant.CapabilityId));
+        foreach (var serverId in InvitationCapabilities
+                     .Where(grant => grant.Kind == "MCP" && grant.IsGranted)
+                     .Select(grant => grant.CapabilityId))
+        {
+            role.SetMcpGrant(
+                serverId,
+                InvitationMcpTools
+                    .Where(tool => tool.ServerId == serverId && tool.IsGranted)
+                    .Select(tool => tool.ToolName));
+        }
         Roles.Add(role);
         SelectedSession?.TemporaryRoles.Add(role);
         SelectedRole = role;
@@ -2089,6 +2260,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         {
             grant.IsGranted = false;
         }
+        InvitationMcpTools.Clear();
     }
 
     public async Task PromoteSelectedRoleAsync(CancellationToken cancellationToken = default)
@@ -2575,14 +2747,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     var toolName = meetingEvent.Payload.TryGetProperty("toolLabel", out var toolLabel)
                         ? toolLabel.GetString() ?? "工具"
                         : "工具";
+                    var expiresAt = meetingEvent.Payload.TryGetProperty("expiresAt", out var expiresAtElement) &&
+                        expiresAtElement.GetString() is { Length: > 0 } expiresAtText &&
+                        DateTimeOffset.TryParse(expiresAtText, out var parsedExpiresAt)
+                            ? parsedExpiresAt
+                            : meetingEvent.OccurredAt.AddMinutes(2);
                     PendingToolApprovals.Add(new ToolApprovalItem(
                         approvalId,
                         role.RoleId,
                         role.DisplayName,
                         serverName,
                         toolName,
-                        meetingEvent.OccurredAt));
-                    role.ActivitySummary = $"等待你审批 {serverName} · {toolName}；未显示参数或结果";
+                        meetingEvent.OccurredAt,
+                        expiresAt));
+                    role.ActivitySummary = $"等待你审批 {serverName} · {toolName}；到期自动拒绝，未显示参数或结果";
                     NotifyToolApprovals();
                 }
                 break;
@@ -2600,9 +2778,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     {
                         var approved = meetingEvent.Payload.TryGetProperty("approved", out var approvedElement) &&
                             approvedElement.ValueKind == System.Text.Json.JsonValueKind.True;
+                        var expired = meetingEvent.Payload.TryGetProperty("reason", out var reasonElement) &&
+                            reasonElement.GetString() == "expired";
                         role.ActivitySummary = approved
                             ? "工具调用已获批准；未显示参数或结果"
-                            : "工具调用已拒绝；没有执行外部副作用";
+                            : expired
+                                ? "工具审批已到期并由 Runtime 自动拒绝；没有执行外部副作用"
+                                : "工具调用已拒绝；没有执行外部副作用";
                     }
                 }
                 break;
@@ -2770,6 +2952,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private void RefreshCapabilityGrants()
     {
         AvailableCapabilities.Clear();
+        AvailableMcpTools.Clear();
         var role = SelectedRole;
         if (role is null)
         {
@@ -2791,11 +2974,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 "MCP",
                 role.McpServerIds.Contains(server.McpServerId)));
         }
+        RefreshMcpToolGrants();
     }
 
     private void RefreshInvitationCapabilities()
     {
         InvitationCapabilities.Clear();
+        InvitationMcpTools.Clear();
         foreach (var skill in Skills.Where(item => item.Enabled))
         {
             InvitationCapabilities.Add(new CapabilityGrantItem(
@@ -2806,11 +2991,67 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
         foreach (var server in McpServers.Where(item => item.Enabled))
         {
-            InvitationCapabilities.Add(new CapabilityGrantItem(
+            var grant = new CapabilityGrantItem(
                 server.McpServerId,
                 server.DisplayName,
                 "MCP",
-                false));
+                false);
+            grant.PropertyChanged += OnInvitationCapabilityChanged;
+            InvitationCapabilities.Add(grant);
+        }
+    }
+
+    private void RefreshMcpToolGrants()
+    {
+        AvailableMcpTools.Clear();
+        var role = SelectedRole;
+        if (role is null)
+        {
+            return;
+        }
+        foreach (var server in McpServers.Where(server =>
+                     server.Enabled && role.McpServerIds.Contains(server.McpServerId)))
+        {
+            var allowlist = role.GetMcpToolAllowlist(server.McpServerId);
+            foreach (var tool in server.ToolCatalog.OrderBy(tool => tool.Name, StringComparer.Ordinal))
+            {
+                var item = new McpToolGrantItem(
+                    server.McpServerId,
+                    server.DisplayName,
+                    tool.Name,
+                    tool.DisplayName,
+                    tool.Description,
+                    allowlist.Contains(tool.Name, StringComparer.Ordinal));
+                item.PropertyChanged += OnMcpToolGrantChanged;
+                AvailableMcpTools.Add(item);
+            }
+        }
+    }
+
+    private void RefreshInvitationMcpTools()
+    {
+        var selected = InvitationMcpTools
+            .Where(item => item.IsGranted)
+            .Select(item => $"{item.ServerId}\0{item.ToolName}")
+            .ToHashSet(StringComparer.Ordinal);
+        InvitationMcpTools.Clear();
+        var grantedServers = InvitationCapabilities
+            .Where(item => item.Kind == "MCP" && item.IsGranted)
+            .Select(item => item.CapabilityId)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var server in McpServers.Where(server =>
+                     server.Enabled && grantedServers.Contains(server.McpServerId)))
+        {
+            foreach (var tool in server.ToolCatalog.OrderBy(tool => tool.Name, StringComparer.Ordinal))
+            {
+                InvitationMcpTools.Add(new McpToolGrantItem(
+                    server.McpServerId,
+                    server.DisplayName,
+                    tool.Name,
+                    tool.DisplayName,
+                    tool.Description,
+                    selected.Contains($"{server.McpServerId}\0{tool.Name}")));
+            }
         }
     }
 
@@ -2875,16 +3116,58 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         {
             return;
         }
-        var target = grant.Kind == "Skill" ? role.SkillIds : role.McpServerIds;
+        if (grant.Kind == "Skill")
+        {
+            if (grant.IsGranted)
+            {
+                role.SkillIds.Add(grant.CapabilityId);
+            }
+            else
+            {
+                role.SkillIds.Remove(grant.CapabilityId);
+            }
+            role.NotifyCapabilitiesChanged();
+            return;
+        }
         if (grant.IsGranted)
         {
-            target.Add(grant.CapabilityId);
+            role.SetMcpGrant(grant.CapabilityId, []);
         }
         else
         {
-            target.Remove(grant.CapabilityId);
+            role.RemoveMcpGrant(grant.CapabilityId);
         }
-        role.NotifyCapabilitiesChanged();
+        RefreshMcpToolGrants();
+    }
+
+    private void OnMcpToolGrantChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (args.PropertyName != nameof(McpToolGrantItem.IsGranted) ||
+            sender is not McpToolGrantItem tool ||
+            SelectedRole is not { } role ||
+            !role.McpServerIds.Contains(tool.ServerId))
+        {
+            return;
+        }
+        var allowlist = role.GetMcpToolAllowlist(tool.ServerId).ToHashSet(StringComparer.Ordinal);
+        if (tool.IsGranted)
+        {
+            allowlist.Add(tool.ToolName);
+        }
+        else
+        {
+            allowlist.Remove(tool.ToolName);
+        }
+        role.SetMcpGrant(tool.ServerId, allowlist);
+    }
+
+    private void OnInvitationCapabilityChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (args.PropertyName == nameof(CapabilityGrantItem.IsGranted) &&
+            sender is CapabilityGrantItem { Kind: "MCP" })
+        {
+            RefreshInvitationMcpTools();
+        }
     }
 
     private void SynchronizeWorkspaceConfiguration()
@@ -2926,7 +3209,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                         .Select(id => new McpGrantConfiguration
                         {
                             McpServerId = id,
-                            ToolAllowlist = [],
+                            ToolAllowlist = role.GetMcpToolAllowlist(id)
+                                .Order(StringComparer.Ordinal)
+                                .ToList(),
                             ApprovalMode = "always",
                             ExecutionMode = "subagent_preferred",
                         })
@@ -3087,7 +3372,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         }
     }
 
-    private static ParticipantManifestConfiguration BuildParticipantManifest(RoleItem role)
+    internal static ParticipantManifestConfiguration BuildParticipantManifest(RoleItem role)
     {
         var isLongTerm = role.Scope == "long_term";
         var invitedAt = role.InvitedAt ?? DateTimeOffset.UtcNow;
@@ -3113,7 +3398,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     .Select(id => new McpGrantConfiguration
                     {
                         McpServerId = id,
-                        ToolAllowlist = [],
+                        ToolAllowlist = role.GetMcpToolAllowlist(id)
+                            .Order(StringComparer.Ordinal)
+                            .ToList(),
                         ApprovalMode = "always",
                         ExecutionMode = "subagent_preferred",
                     })
@@ -3308,6 +3595,31 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 : '-')
             .ToArray()).Trim('-');
         return string.IsNullOrEmpty(normalized) ? "item" : normalized[..Math.Min(normalized.Length, 96)];
+    }
+
+    private static List<McpToolProfileConfiguration> ParseMcpToolCatalog(string value)
+    {
+        var tools = value
+            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(name => name.Length > 0)
+            .ToArray();
+        if (tools.Length > 256)
+        {
+            throw new InvalidDataException("单个 MCP 服务器最多复核 256 个工具。");
+        }
+        if (tools.Any(name => name.Length > 256 || name.Any(char.IsControl)))
+        {
+            throw new InvalidDataException("MCP 工具名称必须为不超过 256 字符的单行文本。");
+        }
+        return tools
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(name => new McpToolProfileConfiguration
+            {
+                Name = name,
+                DisplayName = name,
+            })
+            .ToList();
     }
 
     private static void WriteEventIngestionTrace(string message)

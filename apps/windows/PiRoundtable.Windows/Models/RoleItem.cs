@@ -84,6 +84,9 @@ public sealed class RoleItem : INotifyPropertyChanged
 
     public HashSet<string> McpServerIds { get; } = new(StringComparer.Ordinal);
 
+    public Dictionary<string, HashSet<string>> McpToolAllowlists { get; } =
+        new(StringComparer.Ordinal);
+
     public string? InvitationId { get; }
 
     public string? InvitationPurpose { get; }
@@ -120,11 +123,34 @@ public sealed class RoleItem : INotifyPropertyChanged
 
     public string Summary => $"{ScopeLabel} · {Status}";
 
-    public string CapabilitiesSummary => $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP";
+    public string CapabilitiesSummary =>
+        $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP · {McpToolCount} 工具";
 
     public string CapabilityGrantSummary =>
         $"{(string.IsNullOrWhiteSpace(ModelProfileId) ? "未路由模型" : ModelProfileId)} · " +
-        $"{SkillIds.Count} Skill · {McpServerIds.Count} MCP · 工具逐次审批 · {NetworkAccessLabel}";
+        $"{SkillIds.Count} Skill · {McpServerIds.Count} MCP / {McpToolCount} 工具 · 工具逐次审批 · {NetworkAccessLabel}";
+
+    public int McpToolCount => McpToolAllowlists.Values.Sum(tools => tools.Count);
+
+    public IReadOnlyCollection<string> GetMcpToolAllowlist(string mcpServerId) =>
+        McpToolAllowlists.TryGetValue(mcpServerId, out var tools) ? tools : [];
+
+    public void SetMcpGrant(string mcpServerId, IEnumerable<string> toolAllowlist)
+    {
+        McpServerIds.Add(mcpServerId);
+        McpToolAllowlists[mcpServerId] = toolAllowlist
+            .Where(tool => !string.IsNullOrWhiteSpace(tool))
+            .Select(tool => tool.Trim())
+            .ToHashSet(StringComparer.Ordinal);
+        NotifyCapabilitiesChanged();
+    }
+
+    public void RemoveMcpGrant(string mcpServerId)
+    {
+        McpServerIds.Remove(mcpServerId);
+        McpToolAllowlists.Remove(mcpServerId);
+        NotifyCapabilitiesChanged();
+    }
 
     private string NetworkAccessLabel => NetworkAccess switch
     {
@@ -138,6 +164,7 @@ public sealed class RoleItem : INotifyPropertyChanged
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilitiesSummary)));
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilityGrantSummary)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(McpToolCount)));
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

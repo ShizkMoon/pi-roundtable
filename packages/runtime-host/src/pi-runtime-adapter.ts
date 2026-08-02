@@ -54,6 +54,7 @@ export interface PiSessionCreateOptions {
   modelName: string;
   modelCapabilities: readonly ModelCapability[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   cwd: string;
   agentDir?: string;
   sessionId: string;
@@ -80,6 +81,7 @@ export interface PiRuntimeAdapterOptions {
   modelName?: string;
   modelCapabilities?: readonly ModelCapability[];
   contextWindow?: number;
+  maxOutputTokens?: number;
   credentialProvider: RuntimeCredentialProvider;
   runtimeId?: string;
   sessionId?: string;
@@ -92,6 +94,7 @@ export interface PiRuntimeAdapterOptions {
   subagentSpawner?: (task: string) => Promise<string>;
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
+  toolApprovalTimeoutMs?: number;
 }
 
 export class PiRuntimeError extends Error {
@@ -109,6 +112,13 @@ type AdapterState = "stopped" | "starting" | "running" | "stopping";
 interface RememberedCommand {
   fingerprint: string;
   result: RuntimeCommandResult;
+}
+
+interface PendingToolApproval {
+  resolve: (approved: boolean) => void;
+  timeout: ReturnType<typeof setTimeout>;
+  expiresAt: string;
+  causationId?: string;
 }
 
 class MemoryCredentialStore implements CredentialStore {
@@ -142,6 +152,15 @@ class MemoryCredentialStore implements CredentialStore {
 
 const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
   async create(options): Promise<PiSessionHandle> {
+    if (
+      options.maxOutputTokens !== undefined &&
+      (!Number.isSafeInteger(options.maxOutputTokens) || options.maxOutputTokens < 1)
+    ) {
+      throw new PiRuntimeError(
+        "invalid_max_output_tokens",
+        "Pi max output tokens must be a positive safe integer",
+      );
+    }
     let modelRuntime: ModelRuntime;
     try {
       modelRuntime = await ModelRuntime.create({
@@ -180,7 +199,11 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
             input: options.modelCapabilities.includes("vision") ? ["text", "image"] : ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow,
-            maxTokens: Math.min(65_536, Math.max(4_096, Math.floor(contextWindow / 8))),
+            maxTokens: Math.min(
+              contextWindow,
+              65_536,
+              options.maxOutputTokens ?? Math.max(4_096, Math.floor(contextWindow / 8)),
+            ),
             ...(options.providerId === "deepseek"
               ? {
                   compat: {
@@ -213,6 +236,12 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         "model_not_found",
         `Pi model is not available: ${options.providerId}/${options.modelId}`,
       );
+    }
+    if (options.maxOutputTokens !== undefined) {
+      model = {
+        ...model,
+        maxTokens: Math.min(model.maxTokens, options.maxOutputTokens),
+      };
     }
 
     const mcpManager = new McpClientManager(
@@ -309,7 +338,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnFailureErrorCode: string | undefined;
   #turnFailureTerminalEmitted = false;
   #activeTurnCommandId: string | undefined;
-  readonly #pendingToolApprovals = new Map<string, (approved: boolean) => void>();
+  readonly #pendingToolApprovals = new Map<string, PendingToolApproval>();
 
   constructor(options: PiRuntimeAdapterOptions) {
     this.#options = options;
@@ -415,8 +444,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
 
     if (command.kind === "tool.approval.resolve") {
-      const resolve = this.#pendingToolApprovals.get(command.approvalId);
-      if (resolve === undefined) {
+      const pending = this.#pendingToolApprovals.get(command.approvalId);
+      if (pending === undefined) {
         return remember({
           commandId: command.commandId,
           accepted: false,
@@ -425,11 +454,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         });
       }
       this.#pendingToolApprovals.delete(command.approvalId);
-      resolve(command.approved);
+      clearTimeout(pending.timeout);
+      pending.resolve(command.approved);
       this.#emit("tool.approval_resolved", {
         approvalId: command.approvalId,
         approved: command.approved,
-      }, this.#activeTurnCommandId);
+        reason: "user",
+        expiresAt: pending.expiresAt,
+      }, pending.causationId);
       return remember({ commandId: command.commandId, accepted: true });
     }
 
@@ -537,6 +569,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         ...(this.#options.contextWindow === undefined
           ? {}
           : { contextWindow: this.#options.contextWindow }),
+        ...(this.#options.maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: this.#options.maxOutputTokens }),
         cwd: this.#options.cwd ?? process.cwd(),
         sessionId: this.#sessionId,
         tools: [...(this.#options.tools ?? [])],
@@ -623,8 +658,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#turnFailed = false;
     this.#turnFailureTerminalEmitted = false;
     this.#activeTurnCommandId = undefined;
-    for (const resolve of this.#pendingToolApprovals.values()) {
-      resolve(false);
+    for (const pending of this.#pendingToolApprovals.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve(false);
     }
     this.#pendingToolApprovals.clear();
     try {
@@ -661,7 +697,34 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       return Promise.resolve(false);
     }
     return new Promise<boolean>((resolve) => {
-      this.#pendingToolApprovals.set(request.approvalId, resolve);
+      const timeoutMs = this.#options.toolApprovalTimeoutMs ?? 120_000;
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 30 * 60_000) {
+        resolve(false);
+        return;
+      }
+      const expiresAt = new Date(this.#now().getTime() + timeoutMs).toISOString();
+      const causationId = this.#activeTurnCommandId;
+      const timeout = setTimeout(() => {
+        const pending = this.#pendingToolApprovals.get(request.approvalId);
+        if (pending === undefined) {
+          return;
+        }
+        this.#pendingToolApprovals.delete(request.approvalId);
+        pending.resolve(false);
+        this.#emit("tool.approval_resolved", {
+          approvalId: request.approvalId,
+          approved: false,
+          reason: "expired",
+          expiresAt: pending.expiresAt,
+        }, pending.causationId);
+      }, timeoutMs);
+      timeout.unref?.();
+      this.#pendingToolApprovals.set(request.approvalId, {
+        resolve,
+        timeout,
+        expiresAt,
+        ...(causationId === undefined ? {} : { causationId }),
+      });
       this.#emit("tool.approval_requested", {
         approvalId: request.approvalId,
         toolCallId: request.toolCallId,
@@ -669,7 +732,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         serverDisplayName: request.serverDisplayName,
         toolName: request.toolName,
         toolLabel: request.toolLabel,
-      }, this.#activeTurnCommandId);
+        expiresAt,
+      }, causationId);
     });
   }
 
@@ -718,23 +782,18 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
           this.#emit("turn.delta", { delta: update.delta }, this.#activeTurnCommandId);
         } else if (update.type === "error") {
           if (update.reason === "aborted") {
-            this.#turnCancellationPending = true;
-            if (!this.#turnCancellationEmitted) {
-              this.#turnCancellationEmitted = true;
-              this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
-            }
+            this.#markTurnCancelled();
           } else {
-            this.#turnFailed = true;
-            this.#turnFailureErrorCode = "pi_response_error";
-            this.#emit("runtime.failed", {
-              errorCode: "pi_response_error",
-              message: "Pi provider response failed",
-            }, this.#activeTurnCommandId);
+            this.#markTurnFailed("pi_response_error", "Pi provider response failed");
           }
         }
         break;
       }
+      case "message_end":
+        this.#observeFinalMessage(event.message);
+        break;
       case "turn_end":
+        this.#observeFinalMessage(event.message);
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
             this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
@@ -788,6 +847,38 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       default:
         break;
     }
+  }
+
+  #observeFinalMessage(message: unknown): void {
+    if (typeof message !== "object" || message === null) {
+      return;
+    }
+    const finalMessage = message as { role?: unknown; stopReason?: unknown };
+    if (finalMessage.role !== "assistant") {
+      return;
+    }
+    if (finalMessage.stopReason === "aborted") {
+      this.#markTurnCancelled();
+    } else if (finalMessage.stopReason === "error") {
+      this.#markTurnFailed("pi_response_error", "Pi provider response failed");
+    }
+  }
+
+  #markTurnCancelled(): void {
+    this.#turnCancellationPending = true;
+    if (!this.#turnCancellationEmitted) {
+      this.#turnCancellationEmitted = true;
+      this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
+    }
+  }
+
+  #markTurnFailed(errorCode: string, message: string): void {
+    if (this.#turnFailed && this.#turnFailureErrorCode === errorCode) {
+      return;
+    }
+    this.#turnFailed = true;
+    this.#turnFailureErrorCode = errorCode;
+    this.#emit("runtime.failed", { errorCode, message }, this.#activeTurnCommandId);
   }
 
   #emit(

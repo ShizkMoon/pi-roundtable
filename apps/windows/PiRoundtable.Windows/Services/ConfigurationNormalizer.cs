@@ -66,6 +66,16 @@ internal static class ConfigurationNormalizer
             server.Arguments = server.Arguments is null ? null : Strings(server.Arguments);
             server.EnvironmentCredentialRefs = CredentialReferences(server.EnvironmentCredentialRefs);
             server.HeaderCredentialRefs = CredentialReferences(server.HeaderCredentialRefs);
+            server.ToolCatalog = Items(server.ToolCatalog)
+                .Select(tool => new McpToolProfileConfiguration
+                {
+                    Name = ToolName(tool.Name),
+                    DisplayName = NonEmpty(tool.DisplayName, ToolName(tool.Name)),
+                    Description = OptionalText(tool.Description),
+                })
+                .Where(tool => tool.Name.Length > 0)
+                .DistinctBy(tool => tool.Name, StringComparer.Ordinal)
+                .ToList();
         }
 
         configuration.Roles = Items(configuration.Roles);
@@ -78,6 +88,7 @@ internal static class ConfigurationNormalizer
             role.Responsibilities = Strings(role.Responsibilities);
             role.ModelRoute = Normalize(role.ModelRoute);
             role.Capabilities = Normalize(role.Capabilities);
+            ValidateMcpToolAllowlists(role.Capabilities, configuration.McpServers, role.RoleProfileId);
             role.Delegation ??= new DelegationPolicyConfiguration();
             role.Memory ??= new MemoryPolicyConfiguration();
         }
@@ -246,6 +257,36 @@ internal static class ConfigurationNormalizer
         : "registered";
 
     private static string Identifier(string? value) => value?.Trim() ?? string.Empty;
+
+    private static string ToolName(string? value)
+    {
+        var normalized = value?.Trim() ?? string.Empty;
+        return normalized[..Math.Min(normalized.Length, 256)];
+    }
+
+    private static void ValidateMcpToolAllowlists(
+        CapabilityPolicyConfiguration policy,
+        IReadOnlyList<McpServerProfileConfiguration> servers,
+        string roleId)
+    {
+        var catalogs = servers.ToDictionary(
+            server => server.McpServerId,
+            server => server.ToolCatalog.Select(tool => tool.Name).ToHashSet(StringComparer.Ordinal),
+            StringComparer.Ordinal);
+        foreach (var grant in policy.McpGrants)
+        {
+            if (!catalogs.TryGetValue(grant.McpServerId, out var catalog))
+            {
+                continue;
+            }
+            var unlisted = grant.ToolAllowlist.FirstOrDefault(tool => !catalog.Contains(tool));
+            if (unlisted is not null)
+            {
+                throw new InvalidDataException(
+                    $"角色 {roleId} 的 MCP 工具 {unlisted} 不在服务器复核目录中。");
+            }
+        }
+    }
 
     private static string NonEmpty(string? value, string fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();

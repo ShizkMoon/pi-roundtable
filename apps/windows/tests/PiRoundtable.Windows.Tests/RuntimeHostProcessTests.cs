@@ -4,8 +4,45 @@ using PiRoundtable.Windows.Services;
 namespace PiRoundtable.Windows.Tests;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class RuntimeHostProcessTests
 {
+    [TestMethod]
+    public void Command_fingerprint_is_stable_across_dictionary_order_and_changes_with_content()
+    {
+        var first = RuntimeHostProcess.CreateCommandFingerprint(
+            "speech.broadcast",
+            "user.direct_host",
+            null,
+            new Dictionary<string, object?>
+            {
+                ["message"] = "hello",
+                ["mentions"] = new[] { "role.a" },
+            });
+        var same = RuntimeHostProcess.CreateCommandFingerprint(
+            "speech.broadcast",
+            "user.direct_host",
+            null,
+            new Dictionary<string, object?>
+            {
+                ["mentions"] = new[] { "role.a" },
+                ["message"] = "hello",
+            });
+        var changed = RuntimeHostProcess.CreateCommandFingerprint(
+            "speech.broadcast",
+            "user.direct_host",
+            null,
+            new Dictionary<string, object?>
+            {
+                ["message"] = "different",
+                ["mentions"] = new[] { "role.a" },
+            });
+
+        Assert.AreEqual(first, same);
+        Assert.AreEqual(64, first.Length);
+        Assert.AreNotEqual(first, changed);
+    }
+
     [TestMethod]
     public async Task Windows_supervisor_delivers_three_role_registration_events_in_order()
     {
@@ -111,6 +148,345 @@ public sealed class RuntimeHostProcessTests
         }
     }
 
+    [TestMethod]
+    public async Task Durable_command_receipt_is_returned_after_runtime_process_restart_without_reexecution()
+    {
+        var script = FindRuntimeHostScript();
+        Assert.IsTrue(File.Exists(script), "先运行 npm run build 生成 Runtime Host。 ");
+        var previous = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        var root = Path.Combine(Path.GetTempPath(), "PiRoundtable.Tests", Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        try
+        {
+            const string commandId = "durable-role-add";
+            var firstStore = new MeetingEventStore(root);
+            RuntimeCommandReceipt original;
+            await using (var firstRuntime = new RuntimeHostProcess(firstStore))
+            {
+                await firstRuntime.StartAsync(ThreeRoleOptions(initialSequence: 0), CancellationToken.None);
+                original = await firstRuntime.SendCommandAsync(
+                    "role.add",
+                    "role.architect",
+                    null,
+                    new Dictionary<string, object?>(),
+                    CancellationToken.None,
+                    commandId);
+                Assert.IsTrue(original.Accepted, original.ErrorCode);
+                await firstRuntime.StopAsync(RuntimeHostShutdownMode.Suspend, CancellationToken.None);
+            }
+
+            var replayedEvents = new List<RuntimeMeetingEvent>();
+            await using (var restartedRuntime = new RuntimeHostProcess(new MeetingEventStore(root)))
+            {
+                restartedRuntime.MeetingEventReceived += (_, meetingEvent) => replayedEvents.Add(meetingEvent);
+                await restartedRuntime.StartAsync(ThreeRoleOptions(initialSequence: 3), CancellationToken.None);
+                var duplicate = await restartedRuntime.SendCommandAsync(
+                    "role.add",
+                    "role.architect",
+                    null,
+                    new Dictionary<string, object?>(),
+                    CancellationToken.None,
+                    commandId);
+                Assert.AreEqual(original, duplicate);
+
+                var conflict = await restartedRuntime.SendCommandAsync(
+                    "role.add",
+                    "role.other",
+                    null,
+                    new Dictionary<string, object?>(),
+                    CancellationToken.None,
+                    commandId);
+                Assert.AreEqual("command_id_conflict", conflict.ErrorCode);
+                Assert.IsFalse(conflict.Accepted);
+                await restartedRuntime.StopAsync(RuntimeHostShutdownMode.Suspend, CancellationToken.None);
+            }
+
+            Assert.IsFalse(replayedEvents.Any(item => item.Kind == "role.registered"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previous);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task Command_cancelled_after_durable_reservation_is_terminal_and_not_replayed()
+    {
+        var script = FindRuntimeHostScript();
+        Assert.IsTrue(File.Exists(script), "先运行 npm run build 生成 Runtime Host。 ");
+        var previous = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        var root = Path.Combine(Path.GetTempPath(), "PiRoundtable.Tests", Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        try
+        {
+            const string commandId = "cancel-after-reserve";
+            using var cancellation = new CancellationTokenSource();
+            var journal = new CancellingCommandJournal(new MeetingEventStore(root), cancellation);
+            var events = new List<RuntimeMeetingEvent>();
+            await using var runtime = new RuntimeHostProcess(journal);
+            runtime.MeetingEventReceived += (_, meetingEvent) => events.Add(meetingEvent);
+            await runtime.StartAsync(ThreeRoleOptions(initialSequence: 0), CancellationToken.None);
+
+            try
+            {
+                await runtime.SendCommandAsync(
+                    "role.add",
+                    "role.architect",
+                    null,
+                    new Dictionary<string, object?>(),
+                    cancellation.Token,
+                    commandId);
+                Assert.Fail("The command should have been cancelled after durable reservation.");
+            }
+            catch (OperationCanceledException)
+            {
+                // TaskCanceledException is a valid concrete cancellation result.
+            }
+
+            var duplicate = await runtime.SendCommandAsync(
+                "role.add",
+                "role.architect",
+                null,
+                new Dictionary<string, object?>(),
+                CancellationToken.None,
+                commandId);
+            Assert.AreEqual("command_outcome_unknown", duplicate.ErrorCode);
+            Assert.IsFalse(duplicate.Accepted);
+            Assert.IsFalse(events.Any(item => item.Kind == "role.registered"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previous);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    [DataRow("before_model_request", 0)]
+    [DataRow("during_response", 1)]
+    [DataRow("before_event_persist", 1)]
+    [DataRow("after_event_persist", 1)]
+    public async Task Strong_kill_cutpoints_never_repeat_a_side_effect(
+        string cutpoint,
+        int expectedSideEffects)
+    {
+        var script = FindCutpointFixture();
+        Assert.IsTrue(File.Exists(script), "找不到 Runtime Host 强杀测试夹具。 ");
+        var previousScript = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        var previousSideEffect = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE");
+        var previousEventKind = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_TEST_EVENT_KIND");
+        var root = Path.Combine(Path.GetTempPath(), "PiRoundtable.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var sideEffectFile = Path.Combine(root, "side-effects.txt");
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE", sideEffectFile);
+        Environment.SetEnvironmentVariable(
+            "PI_ROUNDTABLE_TEST_EVENT_KIND",
+            cutpoint == "during_response" ? "speech.delta" : "message.published");
+        try
+        {
+            const string commandId = "cutpoint-stable-command";
+            var store = new MeetingEventStore(root);
+            var blockingJournal = new BlockingCommandJournal(store);
+            IMeetingEventStore journal = cutpoint == "before_model_request"
+                ? blockingJournal
+                : store;
+            var targetEvent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            await using (var runtime = new RuntimeHostProcess(journal))
+            {
+                runtime.MeetingEventReceived += (_, meetingEvent) =>
+                {
+                    if (meetingEvent.Kind == "runtime.lease_acquired")
+                    {
+                        store.AppendAsync(meetingEvent).GetAwaiter().GetResult();
+                        return;
+                    }
+                    if (meetingEvent.Kind is not ("message.published" or "speech.delta"))
+                    {
+                        return;
+                    }
+                    if (cutpoint is "during_response" or "after_event_persist")
+                    {
+                        store.AppendAsync(meetingEvent).GetAwaiter().GetResult();
+                    }
+                    runtime.Terminate();
+                    targetEvent.TrySetResult();
+                };
+                await runtime.StartAsync(ThreeRoleOptions(initialSequence: 0), CancellationToken.None);
+
+                var commandTask = runtime.SendCommandAsync(
+                    "test.side_effect",
+                    null,
+                    null,
+                    new Dictionary<string, object?> { ["value"] = "once" },
+                    CancellationToken.None,
+                    commandId);
+                if (cutpoint == "before_model_request")
+                {
+                    await blockingJournal.ReservationReached.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                    runtime.Terminate();
+                    blockingJournal.ReleaseReservation();
+                }
+                else
+                {
+                    await targetEvent.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                await AssertCommandInterruptedAsync(commandTask);
+            }
+
+            Assert.AreEqual(expectedSideEffects, CountSideEffects(sideEffectFile));
+
+            await using (var restarted = new RuntimeHostProcess(new MeetingEventStore(root)))
+            {
+                await restarted.StartAsync(ThreeRoleOptions(initialSequence: 100), CancellationToken.None);
+                var duplicate = await restarted.SendCommandAsync(
+                    "test.side_effect",
+                    null,
+                    null,
+                    new Dictionary<string, object?> { ["value"] = "once" },
+                    CancellationToken.None,
+                    commandId);
+                Assert.AreEqual("command_outcome_unknown", duplicate.ErrorCode);
+                Assert.IsFalse(duplicate.Accepted);
+                await restarted.StopAsync(RuntimeHostShutdownMode.Suspend, CancellationToken.None);
+            }
+
+            Assert.AreEqual(expectedSideEffects, CountSideEffects(sideEffectFile));
+            Assert.IsTrue(expectedSideEffects is 0 or 1);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previousScript);
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE", previousSideEffect);
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_TEST_EVENT_KIND", previousEventKind);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task Crash_recovery_advances_generation_preserves_private_audience_and_deduplicates_output()
+    {
+        var script = FindRecoveryFixture();
+        Assert.IsTrue(File.Exists(script), "找不到 Runtime Host 恢复测试夹具。");
+        var previousScript = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        var previousSideEffect = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE");
+        var root = Path.Combine(Path.GetTempPath(), "PiRoundtable.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var sideEffectFile = Path.Combine(root, "recovery-side-effects.txt");
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE", sideEffectFile);
+        try
+        {
+            const string stableCommandId = "recovery-private-stable";
+            var firstStore = new MeetingEventStore(root);
+            RuntimeCommandReceipt originalReceipt;
+            await using (var firstRuntime = new RuntimeHostProcess(firstStore))
+            {
+                firstRuntime.MeetingEventReceived += (_, meetingEvent) =>
+                    firstStore.AppendAsync(meetingEvent).GetAwaiter().GetResult();
+                await firstRuntime.StartAsync(
+                    ThreeRoleOptions(initialSequence: 0, runtimeGeneration: 1),
+                    CancellationToken.None);
+                originalReceipt = await firstRuntime.SendCommandAsync(
+                    "speech.direct",
+                    "user.direct_host",
+                    "role.ux",
+                    new Dictionary<string, object?> { ["message"] = "private recovery payload" },
+                    CancellationToken.None,
+                    stableCommandId);
+                Assert.IsTrue(originalReceipt.Accepted, originalReceipt.ErrorCode);
+                firstRuntime.Terminate();
+            }
+
+            var crashedCheckpoint = await firstStore.GetCheckpointAsync(
+                "meeting-windows-three-role-test",
+                CancellationToken.None);
+            Assert.IsNotNull(crashedCheckpoint);
+            Assert.AreEqual(2UL, crashedCheckpoint.LastSequence);
+            Assert.AreEqual(1UL, crashedCheckpoint.RuntimeGeneration);
+            Assert.IsFalse(crashedCheckpoint.CleanShutdown);
+            Assert.AreEqual(1, CountSideEffects(sideEffectFile));
+
+            var secondStore = new MeetingEventStore(root);
+            await using (var recoveredRuntime = new RuntimeHostProcess(secondStore))
+            {
+                recoveredRuntime.MeetingEventReceived += (_, meetingEvent) =>
+                    secondStore.AppendAsync(meetingEvent).GetAwaiter().GetResult();
+                await recoveredRuntime.StartAsync(
+                    ThreeRoleOptions(
+                        initialSequence: crashedCheckpoint.LastSequence,
+                        runtimeGeneration: 2),
+                    CancellationToken.None);
+
+                var duplicate = await recoveredRuntime.SendCommandAsync(
+                    "speech.direct",
+                    "user.direct_host",
+                    "role.ux",
+                    new Dictionary<string, object?> { ["message"] = "private recovery payload" },
+                    CancellationToken.None,
+                    stableCommandId);
+                Assert.AreEqual(originalReceipt, duplicate);
+                Assert.AreEqual(1, CountSideEffects(sideEffectFile));
+
+                var publicReceipt = await recoveredRuntime.SendCommandAsync(
+                    "test.public",
+                    "user.direct_host",
+                    null,
+                    new Dictionary<string, object?> { ["message"] = "generation two output" },
+                    CancellationToken.None,
+                    "recovery-public-new");
+                Assert.IsTrue(publicReceipt.Accepted, publicReceipt.ErrorCode);
+                await recoveredRuntime.StopAsync(RuntimeHostShutdownMode.Suspend, CancellationToken.None);
+            }
+
+            var events = await secondStore.LoadEventsAsync(
+                "meeting-windows-three-role-test",
+                CancellationToken.None);
+            CollectionAssert.AreEqual(
+                new ulong[] { 1, 2, 3, 4, 5 },
+                events.Select(meetingEvent => meetingEvent.Sequence).ToArray());
+            CollectionAssert.AreEqual(
+                new ulong[] { 1, 1, 2, 2, 2 },
+                events.Select(meetingEvent => meetingEvent.RuntimeGeneration).ToArray());
+            Assert.AreEqual(1, events.Count(meetingEvent => meetingEvent.Kind == "message.direct_sent"));
+            var privateEvent = events.Single(meetingEvent => meetingEvent.Kind == "message.direct_sent");
+            Assert.AreEqual("private", privateEvent.Visibility);
+            CollectionAssert.AreEqual(
+                new[] { "user.direct_host", "role.ux" },
+                privateEvent.Audience.ToArray());
+            Assert.IsFalse(events.Single(meetingEvent => meetingEvent.Kind == "message.published").Audience.Any());
+            Assert.AreEqual(2, CountSideEffects(sideEffectFile));
+
+            var recoveredCheckpoint = await secondStore.GetCheckpointAsync(
+                "meeting-windows-three-role-test",
+                CancellationToken.None);
+            Assert.IsNotNull(recoveredCheckpoint);
+            Assert.AreEqual(5UL, recoveredCheckpoint.LastSequence);
+            Assert.AreEqual(2UL, recoveredCheckpoint.RuntimeGeneration);
+            Assert.IsTrue(recoveredCheckpoint.CleanShutdown);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previousScript);
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_TEST_SIDE_EFFECT_FILE", previousSideEffect);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
     private static RuntimeHostStartOptions Options(ulong initialSequence)
     {
         var workspace = new WorkspaceConfiguration
@@ -183,7 +559,9 @@ public sealed class RuntimeHostProcessTests
             new Dictionary<string, string> { ["memory://provider.test"] = "test-only" });
     }
 
-    private static RuntimeHostStartOptions ThreeRoleOptions()
+    private static RuntimeHostStartOptions ThreeRoleOptions(
+        ulong initialSequence = 0,
+        ulong runtimeGeneration = 1)
     {
         var workspace = new WorkspaceConfiguration
         {
@@ -268,8 +646,8 @@ public sealed class RuntimeHostProcessTests
         return new RuntimeHostStartOptions(
             session.SessionId,
             "runtime-windows-three-role-test",
-            1,
-            0,
+            runtimeGeneration,
+            initialSequence,
             workspace,
             session,
             new Dictionary<string, string> { ["memory://provider.deepseek.test"] = "test-only" });
@@ -293,5 +671,188 @@ public sealed class RuntimeHostProcessTests
             }
         }
         return string.Empty;
+    }
+
+    private static string FindCutpointFixture()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "apps",
+                "windows",
+                "tests",
+                "fixtures",
+                "runtime-host-cutpoint.mjs");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return string.Empty;
+    }
+
+    private static string FindRecoveryFixture()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(
+                directory.FullName,
+                "apps",
+                "windows",
+                "tests",
+                "fixtures",
+                "runtime-host-recovery.mjs");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+        return string.Empty;
+    }
+
+    private static int CountSideEffects(string path) => File.Exists(path)
+        ? File.ReadLines(path).Count(line => !string.IsNullOrWhiteSpace(line))
+        : 0;
+
+    private static async Task AssertCommandInterruptedAsync(Task<RuntimeCommandReceipt> commandTask)
+    {
+        try
+        {
+            await commandTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Fail("The strong-killed command must not return a successful live receipt.");
+        }
+        catch (Exception error) when (
+            error is InvalidOperationException or IOException or TimeoutException or OperationCanceledException)
+        {
+            // The durable journal is asserted after the process-level failure.
+        }
+    }
+
+    private sealed class CancellingCommandJournal(
+        IMeetingEventStore inner,
+        CancellationTokenSource cancellation) : IMeetingEventStore
+    {
+        private int _cancelled;
+
+        public string DatabasePath => inner.DatabasePath;
+
+        public Task InitializeAsync(CancellationToken cancellationToken = default) =>
+            inner.InitializeAsync(cancellationToken);
+
+        public Task<bool> AppendAsync(
+            RuntimeMeetingEvent meetingEvent,
+            CancellationToken cancellationToken = default) =>
+            inner.AppendAsync(meetingEvent, cancellationToken);
+
+        public Task<IReadOnlyList<RuntimeMeetingEvent>> LoadEventsAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.LoadEventsAsync(meetingId, cancellationToken);
+
+        public Task<MeetingStoreCheckpoint?> GetCheckpointAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.GetCheckpointAsync(meetingId, cancellationToken);
+
+        public async Task<CommandJournalReservation> ReserveCommandAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            var reservation = await inner.ReserveCommandAsync(
+                meetingId,
+                commandId,
+                fingerprint,
+                cancellationToken);
+            if (reservation.Disposition == CommandJournalReservationDisposition.Reserved &&
+                Interlocked.Exchange(ref _cancelled, 1) == 0)
+            {
+                cancellation.Cancel();
+            }
+            return reservation;
+        }
+
+        public Task CompleteCommandAsync(
+            string meetingId,
+            string fingerprint,
+            RuntimeCommandReceipt receipt,
+            CancellationToken cancellationToken = default) =>
+            inner.CompleteCommandAsync(meetingId, fingerprint, receipt, cancellationToken);
+
+        public Task MarkCommandInterruptedAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default) =>
+            inner.MarkCommandInterruptedAsync(meetingId, commandId, fingerprint, cancellationToken);
+    }
+
+    private sealed class BlockingCommandJournal(IMeetingEventStore inner) : IMeetingEventStore
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReservationReached { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string DatabasePath => inner.DatabasePath;
+
+        public void ReleaseReservation() => _release.TrySetResult();
+
+        public Task InitializeAsync(CancellationToken cancellationToken = default) =>
+            inner.InitializeAsync(cancellationToken);
+
+        public Task<bool> AppendAsync(
+            RuntimeMeetingEvent meetingEvent,
+            CancellationToken cancellationToken = default) =>
+            inner.AppendAsync(meetingEvent, cancellationToken);
+
+        public Task<IReadOnlyList<RuntimeMeetingEvent>> LoadEventsAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.LoadEventsAsync(meetingId, cancellationToken);
+
+        public Task<MeetingStoreCheckpoint?> GetCheckpointAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.GetCheckpointAsync(meetingId, cancellationToken);
+
+        public async Task<CommandJournalReservation> ReserveCommandAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default)
+        {
+            var reservation = await inner.ReserveCommandAsync(
+                meetingId,
+                commandId,
+                fingerprint,
+                cancellationToken);
+            if (reservation.Disposition == CommandJournalReservationDisposition.Reserved)
+            {
+                ReservationReached.TrySetResult();
+                await _release.Task.WaitAsync(cancellationToken);
+            }
+            return reservation;
+        }
+
+        public Task CompleteCommandAsync(
+            string meetingId,
+            string fingerprint,
+            RuntimeCommandReceipt receipt,
+            CancellationToken cancellationToken = default) =>
+            inner.CompleteCommandAsync(meetingId, fingerprint, receipt, cancellationToken);
+
+        public Task MarkCommandInterruptedAsync(
+            string meetingId,
+            string commandId,
+            string fingerprint,
+            CancellationToken cancellationToken = default) =>
+            inner.MarkCommandInterruptedAsync(meetingId, commandId, fingerprint, cancellationToken);
     }
 }
