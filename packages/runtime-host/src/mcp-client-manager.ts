@@ -73,7 +73,7 @@ export class McpClientManager {
     try {
       for (const server of this.#servers) {
         const client = new Client(
-          { name: "pi-roundtable-runtime-host", version: "0.2.0" },
+          { name: "pi-roundtable-runtime-host", version: "0.2.1" },
           { capabilities: {} },
         );
         const transport = this.#transportFactory(server);

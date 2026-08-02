@@ -85,10 +85,10 @@ dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 生成未签名但可由签名清单安全分发的自包含 x64 MSI：
 
 ```powershell
-pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.2.0
+pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.2.1
 ```
 
-脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.2.0-win-x64.msi` 及 SHA-256。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256；当前 MSI 仍未做 Authenticode 签名，因此清单必须保持 `authenticodeRequired: false`。真实安装/卸载与 0.1→0.2 升级由发布验收执行；修复矩阵、代码签名和 ARM64 MSI 仍为 pending。
+脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.2.1-win-x64.msi` 及 SHA-256。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256；当前 MSI 仍未做 Authenticode 签名，因此清单必须保持 `authenticodeRequired: false`。真实安装/卸载与 0.1→0.2.1 升级由发布验收执行；修复矩阵、代码签名和 ARM64 MSI 仍为 pending。
 
 已有测试凭据时，可对发布目录执行一次不回显 Key 的真实 DeepSeek/Pi 三角色、两轮全链路验收：
 

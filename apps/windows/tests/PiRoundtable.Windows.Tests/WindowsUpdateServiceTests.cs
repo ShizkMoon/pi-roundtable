@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -124,6 +125,37 @@ public sealed class WindowsUpdateServiceTests
         Assert.IsFalse(InstallerExitCodes.IsSuccessful(1641));
         Assert.IsTrue(InstallerExitCodes.RestartWasInitiated(1641));
         Assert.IsFalse(InstallerExitCodes.IsSuccessful(1603));
+    }
+
+    [TestMethod]
+    public async Task Updater_accepts_a_verified_parent_that_already_exited_before_wait_registration()
+    {
+        using var parent = Process.Start(new ProcessStartInfo("cmd.exe", "/d /c timeout.exe /t 1 /nobreak > nul")
+        {
+            CreateNoWindow = true,
+            UseShellExecute = false,
+        }) ?? throw new InvalidOperationException("Unable to start updater parent fixture.");
+        var processId = parent.Id;
+        var startTimeUtcTicks = parent.StartTime.ToUniversalTime().Ticks;
+        await parent.WaitForExitAsync();
+
+        await ParentProcessFence.WaitForExitAsync(
+            processId,
+            startTimeUtcTicks,
+            TimeSpan.FromSeconds(1));
+    }
+
+    [TestMethod]
+    public async Task Updater_rejects_a_reused_parent_process_identity()
+    {
+        using var current = Process.GetCurrentProcess();
+        var wrongStartTime = current.StartTime.ToUniversalTime().Ticks + 1;
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+            ParentProcessFence.WaitForExitAsync(
+                current.Id,
+                wrongStartTime,
+                TimeSpan.FromSeconds(1)));
     }
 
     [TestMethod]
