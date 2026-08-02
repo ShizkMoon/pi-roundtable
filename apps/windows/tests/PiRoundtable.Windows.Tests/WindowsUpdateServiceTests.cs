@@ -167,8 +167,8 @@ public sealed class WindowsUpdateServiceTests
 
         Assert.AreEqual(new Version(0, 2, 0), verified.Version);
         Assert.AreEqual("stable-2026-08", verified.Document.Signature.KeyId);
-        Assert.AreEqual(158380344, verified.Document.Asset.Size);
-        Assert.AreEqual("7C2E477E43511DDD67B6C7ADBF501F090AE7056A862E9B412071D2A838CE2597", verified.Document.Asset.Sha256);
+        Assert.AreEqual(158339384, verified.Document.Asset.Size);
+        Assert.AreEqual("E1B707F971C7F29A49B8C5663FA215E602B53CDBE55A7238A802BDDEAC601DB3", verified.Document.Asset.Sha256);
     }
 
     private static async Task AssertManifestFailsAsync(UpdateFixture fixture, string json, Type expectedType)

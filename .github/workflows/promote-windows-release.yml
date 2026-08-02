@@ -1,0 +1,87 @@
+name: Promote Windows release artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful main-branch workflow run containing the Windows artifact
+        required: true
+        type: string
+      release_tag:
+        description: Existing draft release tag
+        required: true
+        default: v0.2.0
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  promote:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify successful main artifact source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $run = gh api "repos/$env:REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
+          if ($run.status -ne 'completed' -or $run.conclusion -ne 'success') {
+            throw "Run $env:RUN_ID is not a successful completed run."
+          }
+          if ($run.event -ne 'push' -or $run.head_branch -ne 'main') {
+            throw "Run $env:RUN_ID is not a main-branch push run."
+          }
+          git merge-base --is-ancestor $run.head_sha HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Run commit $($run.head_sha) is not an ancestor of the checked-out main commit."
+          }
+
+      - name: Download Windows artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -Raw 'packaging/windows-x64/update-manifest.json' | ConvertFrom-Json
+          $artifactName = [System.IO.Path]::GetFileNameWithoutExtension($manifest.asset.fileName)
+          gh run download $env:RUN_ID --name $artifactName --dir release-asset
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to download artifact $artifactName from run $env:RUN_ID."
+          }
+
+      - name: Verify manifest binding and upload draft asset
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content -Raw 'packaging/windows-x64/update-manifest.json' | ConvertFrom-Json
+          $expectedUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:RELEASE_TAG/$($manifest.asset.fileName)"
+          if ($manifest.asset.url -ne $expectedUrl) {
+            throw "Manifest URL does not bind to $env:RELEASE_TAG in $env:REPOSITORY."
+          }
+          $release = gh release view $env:RELEASE_TAG --json isDraft | ConvertFrom-Json
+          if (!$release.isDraft) {
+            throw "Release $env:RELEASE_TAG must remain a draft during artifact promotion."
+          }
+          $msiPath = Join-Path 'release-asset' $manifest.asset.fileName
+          $msi = Get-Item -LiteralPath $msiPath
+          $sha256 = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($msi.Length -ne [int64]$manifest.asset.size -or $sha256 -ne $manifest.asset.sha256) {
+            throw "Downloaded MSI does not match the signed manifest size and SHA-256."
+          }
+          gh release upload $env:RELEASE_TAG $msi.FullName --clobber
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to upload $($msi.Name) to release $env:RELEASE_TAG."
+          }
+          $asset = (gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json).assets |
+            Where-Object name -eq $msi.Name |
+            Select-Object -First 1
+          if ($null -eq $asset -or [int64]$asset.size -ne $msi.Length) {
+            throw 'Uploaded GitHub release asset size does not match the verified MSI.'
+          }

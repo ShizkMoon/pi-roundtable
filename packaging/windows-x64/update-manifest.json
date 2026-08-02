@@ -4,17 +4,17 @@
   "channel": "stable",
   "architecture": "x64",
   "version": "0.2.0",
-  "publishedAt": "2026-08-02T07:36:57.6836695+00:00",
+  "publishedAt": "2026-08-02T09:15:08.9018158+00:00",
   "asset": {
     "url": "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi",
     "fileName": "PiRoundtable-0.2.0-win-x64.msi",
-    "size": 158380344,
-    "sha256": "7C2E477E43511DDD67B6C7ADBF501F090AE7056A862E9B412071D2A838CE2597",
+    "size": 158339384,
+    "sha256": "E1B707F971C7F29A49B8C5663FA215E602B53CDBE55A7238A802BDDEAC601DB3",
     "authenticodeRequired": false
   },
   "signature": {
     "algorithm": "ECDSA_P256_SHA256",
     "keyId": "stable-2026-08",
-    "value": "H/ui+syomONKCL2aHblOHOYuNyiSTi6sO0RaLsv9BZ49IUyikHhcFPEDbQRWERC6esvOhQxM3kQZibsEsjhQoA=="
+    "value": "Z0+SqQin3Q0oRcWCtEI63VWvMML17M6ZvjcYU2Mka+w0qxn784GkGsBRGqRE/ndn2+Fa6gXvOavDdF1NG4QXyQ=="
   }
 }
