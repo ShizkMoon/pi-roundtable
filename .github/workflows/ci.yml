@@ -68,9 +68,9 @@ jobs:
         # GitHub's Windows runner closes the WiX ICE validation pipe for this
         # large self-contained package. Release builds keep validation on;
         # CI still compiles the complete MSI after tests have passed.
-        run: ./scripts/build-windows-x64.ps1 -Version 0.2.1 -SkipVerification -SuppressMsiValidation
+        run: ./scripts/build-windows-x64.ps1 -Version 0.2.2 -SkipVerification -SuppressMsiValidation
       - uses: actions/upload-artifact@v4
         with:
-          name: PiRoundtable-0.2.1-win-x64
-          path: out/installer/PiRoundtable-0.2.1-win-x64.msi
+          name: PiRoundtable-0.2.2-win-x64
+          path: out/installer/PiRoundtable-0.2.2-win-x64.msi
           if-no-files-found: error

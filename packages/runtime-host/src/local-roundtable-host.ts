@@ -110,7 +110,11 @@ interface PendingSubagentContinuation {
   parentRoleId: string;
   result: string;
   failed: boolean;
+  busyRetryCount: number;
 }
+
+const SUBAGENT_CONTINUATION_BUSY_RETRY_DELAY_MS = 25;
+const SUBAGENT_CONTINUATION_BUSY_RETRY_LIMIT = 40;
 
 interface RememberedReceipt {
   fingerprint: string;
@@ -145,6 +149,7 @@ export class LocalRoundtableHost {
   readonly #pendingSubagentContinuations: PendingSubagentContinuation[] = [];
   readonly #turnTimeouts = new Map<string, ActiveTurnTimeout>();
   readonly #timedOutTurnCommands = new Set<string>();
+  #subagentContinuationRetry: ReturnType<typeof setTimeout> | undefined;
   #phase: "created" | "live" | "closed" = "created";
   #sequence = 0;
   #leaseActive = false;
@@ -336,6 +341,7 @@ export class LocalRoundtableHost {
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
     this.#pendingSubagentContinuations.length = 0;
+    this.#clearSubagentContinuationRetry();
     const subagentRuns = [...this.#subagentRuns.values()];
     for (const run of subagentRuns) {
       run.controller.abort();
@@ -630,6 +636,7 @@ export class LocalRoundtableHost {
             parentRoleId,
             result,
             failed: false,
+            busyRetryCount: 0,
           });
           await this.#startNextSubagentContinuation();
         });
@@ -652,6 +659,7 @@ export class LocalRoundtableHost {
             parentRoleId,
             result: "The delegated SubAgent task failed without a usable result.",
             failed: true,
+            busyRetryCount: 0,
           });
           await this.#startNextSubagentContinuation();
         });
@@ -940,6 +948,7 @@ export class LocalRoundtableHost {
     ) {
       return;
     }
+    this.#clearSubagentContinuationRetry();
     while (this.#pendingSubagentContinuations.length > 0) {
       const next = this.#pendingSubagentContinuations.shift();
       if (next === undefined) {
@@ -949,7 +958,10 @@ export class LocalRoundtableHost {
       if (parent === undefined) {
         continue;
       }
-      const commandId = `subagent-result:${next.subagentId}`;
+      const baseCommandId = `subagent-result:${next.subagentId}`;
+      const commandId = next.busyRetryCount === 0
+        ? baseCommandId
+        : `${baseCommandId}:retry-${next.busyRetryCount}`;
       this.#expectedTurns.set(next.parentRoleId, {
         commandId,
         visibility: "public",
@@ -972,9 +984,22 @@ export class LocalRoundtableHost {
         return;
       }
       this.#expectedTurns.delete(next.parentRoleId);
+      if (
+        result.errorCode === "runtime_busy" &&
+        next.busyRetryCount < SUBAGENT_CONTINUATION_BUSY_RETRY_LIMIT &&
+        !this.#stopped &&
+        this.#phase === "live"
+      ) {
+        next.busyRetryCount += 1;
+        this.#pendingSubagentContinuations.unshift(next);
+        this.#scheduleSubagentContinuationRetry();
+        return;
+      }
       this.#diagnose(
         this.#safeRuntimeErrorCode(result.errorCode),
-        "A parent role could not continue after its SubAgent completed",
+        next.failed
+          ? "A parent role could not continue after its SubAgent failed"
+          : "A parent role could not continue after its SubAgent completed",
       );
     }
   }
@@ -1682,11 +1707,41 @@ export class LocalRoundtableHost {
     });
   }
 
+  #scheduleSubagentContinuationRetry(): void {
+    if (
+      this.#subagentContinuationRetry !== undefined ||
+      this.#stopped ||
+      this.#phase !== "live" ||
+      this.#pendingSubagentContinuations.length === 0
+    ) {
+      return;
+    }
+    const handle = setTimeout(() => {
+      if (this.#subagentContinuationRetry !== handle) {
+        return;
+      }
+      this.#subagentContinuationRetry = undefined;
+      this.#enqueueInternal(() => this.#startNextSubagentContinuation());
+    }, SUBAGENT_CONTINUATION_BUSY_RETRY_DELAY_MS);
+    handle.unref();
+    this.#subagentContinuationRetry = handle;
+  }
+
+  #clearSubagentContinuationRetry(): void {
+    if (this.#subagentContinuationRetry === undefined) {
+      return;
+    }
+    clearTimeout(this.#subagentContinuationRetry);
+    this.#subagentContinuationRetry = undefined;
+  }
+
   async #stopAllRoles(): Promise<void> {
     const roles = [...this.#roles.values()];
     this.#roles.clear();
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
+    this.#pendingSubagentContinuations.length = 0;
+    this.#clearSubagentContinuationRetry();
     for (const timeout of this.#turnTimeouts.values()) {
       clearTimeout(timeout.handle);
     }

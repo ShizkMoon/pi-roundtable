@@ -155,6 +155,7 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
 
   const session = factory.session;
   assert.ok(session !== undefined);
+  session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   session.emit({
     type: "message_update",
@@ -180,6 +181,8 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
     isError: false,
   });
   session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  assert.equal(events.some((event) => event.kind === "turn.completed"), false);
+  session.emit({ type: "agent_settled" });
 
   assert.deepEqual(
     events.map((event) => event.kind),
@@ -200,6 +203,64 @@ test("starts a direct Pi session and normalizes events without raw Pi records", 
   await adapter.stop();
   assert.equal(session.disposed, true);
   assert.equal(events.at(-1)?.kind, "runtime.stopped");
+});
+
+test("completes one runtime turn only after a multi-turn Pi tool run settles", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  await adapter.start();
+  const session = factory.session;
+  assert.ok(session !== undefined);
+
+  await adapter.execute({
+    kind: "turn.prompt",
+    commandId: "prompt-multi-turn-tool",
+    roleId: "role.researcher",
+    message: "use a tool and then answer",
+    delivery: "immediate",
+  });
+  session.emit({ type: "agent_start" });
+  session.emit({ type: "turn_start" });
+  session.emit({
+    type: "tool_execution_start",
+    toolCallId: "tool-multi-turn",
+    toolName: "read",
+    args: {},
+  });
+  session.emit({
+    type: "tool_execution_end",
+    toolCallId: "tool-multi-turn",
+    toolName: "read",
+    result: {} as never,
+    isError: false,
+  });
+  session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  assert.equal(events.filter((event) => event.kind === "turn.completed").length, 0);
+
+  session.emit({ type: "turn_start" });
+  session.emit({
+    type: "message_update",
+    message: {} as never,
+    assistantMessageEvent: {
+      type: "text_delta",
+      contentIndex: 0,
+      delta: "final answer",
+      partial: {} as never,
+    },
+  });
+  session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  session.emit({ type: "agent_end", messages: [], willRetry: false });
+  assert.equal(events.filter((event) => event.kind === "turn.completed").length, 0);
+  session.emit({ type: "agent_settled" });
+
+  assert.equal(events.filter((event) => event.kind === "turn.started").length, 1);
+  assert.equal(events.filter((event) => event.kind === "turn.completed").length, 1);
+  assert.equal(events.find((event) => event.kind === "turn.completed")?.correlationId,
+    "prompt-multi-turn-tool");
+  assert.equal(events.find((event) => event.kind === "turn.delta")?.correlationId,
+    "prompt-multi-turn-tool");
+  await adapter.stop();
 });
 
 test("propagates the frozen role output-token limit into Pi session creation", async () => {
@@ -553,6 +614,7 @@ test("redacts raw provider failure details from runtime events", async () => {
     message: "private prompt",
     delivery: "immediate",
   });
+  session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   session.emit({
     type: "message_update",
@@ -568,6 +630,7 @@ test("redacts raw provider failure details from runtime events", async () => {
   assert.equal(failure?.payload.message, "Pi provider response failed");
   assert.ok(!JSON.stringify(failure).includes("secret-value"));
   session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  session.emit({ type: "agent_settled" });
   const terminal = events.find((event) => event.kind === "turn.cancelled");
   assert.equal(terminal?.payload.reason, "failed");
   assert.equal(terminal?.payload.errorCode, "pi_response_error");
@@ -589,10 +652,12 @@ test("treats a final Pi assistant error as failed even without a streamed error 
     message: "provider returns a terminal HTTP error",
     delivery: "immediate",
   });
+  session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   const finalError = { role: "assistant", stopReason: "error" } as never;
   session.emit({ type: "message_end", message: finalError });
   session.emit({ type: "turn_end", message: finalError, toolResults: [] });
+  session.emit({ type: "agent_settled" });
 
   assert.equal(events.filter((event) => event.kind === "runtime.failed").length, 1);
   assert.equal(events.filter((event) => event.kind === "turn.cancelled").length, 1);
@@ -616,6 +681,7 @@ test("emits cancellation without a contradictory completion", async () => {
     roleId: "role.researcher",
   });
   assert.equal(cancelled.accepted, true);
+  session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   session.emit({
     type: "message_update",
@@ -627,6 +693,7 @@ test("emits cancellation without a contradictory completion", async () => {
     },
   });
   session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  session.emit({ type: "agent_settled" });
 
   assert.equal(events.filter((event) => event.kind === "turn.cancelled").length, 1);
   assert.equal(
@@ -672,8 +739,10 @@ test("does not leak a silent cancellation into the next turn", async () => {
     delivery: "immediate",
   });
   assert.equal(next.accepted, true);
+  session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   session.emit({ type: "turn_end", message: {} as never, toolResults: [] });
+  session.emit({ type: "agent_settled" });
   assert.equal(events.filter((event) => event.kind === "turn.cancelled").length, 0);
   assert.equal(events.filter((event) => event.kind === "turn.completed").length, 1);
   await adapter.stop();

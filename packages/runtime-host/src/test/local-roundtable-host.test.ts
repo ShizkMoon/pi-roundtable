@@ -246,6 +246,21 @@ async function waitFor(
   assert.fail(message);
 }
 
+async function waitForTimed(
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(message);
+}
+
 test("runs a local meeting with long-term and temporary roles", async () => {
   const { host, adapters } = createHost();
   const events: string[] = [];
@@ -1168,6 +1183,253 @@ test("runs at most two isolated SubAgents and returns results only to the parent
     await waitFor(() => runner.requests.length === 3, "a completed run should release its slot");
   } finally {
     runner.pending.slice(1).forEach((pending) => pending.reject(new Error("test cleanup")));
+    await host.stop();
+  }
+});
+
+test("retries a failed SubAgent continuation after the parent Pi dispatch settles", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const diagnostics: Array<{ errorCode: string; message: string }> = [];
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribe((event) => events.push(event));
+  host.subscribeDiagnostics((errorCode, message) => diagnostics.push({ errorCode, message }));
+
+  try {
+    host.start();
+    assert.equal((await host.execute(command("role.add", "add-retry-parent", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("meeting.open", "open-retry"))).status, "accepted");
+    const parent = adapters.get("participant.secretary");
+    assert.ok(parent !== undefined);
+    let continuationAttempts = 0;
+    parent.onExecute = (runtimeCommand) => {
+      if (
+        runtimeCommand.kind === "turn.prompt" &&
+        runtimeCommand.commandId.startsWith("subagent-result:")
+      ) {
+        continuationAttempts += 1;
+        if (continuationAttempts === 1) {
+          return {
+            commandId: runtimeCommand.commandId,
+            accepted: false,
+            errorCode: "runtime_busy",
+            message: "Parent prompt promise is still settling",
+          };
+        }
+      }
+      return undefined;
+    };
+
+    assert.equal((await host.execute(command("speech.prompt", "parent-active-turn", {
+      actorId: "participant.secretary",
+      payload: { message: "parent remains active while the SubAgent finishes" },
+    }))).status, "accepted");
+    parent.emit("turn.started", {}, "parent-active-turn");
+
+    assert.equal((await host.execute(command("subagent.spawn", "spawn-retry", {
+      actorId: "participant.secretary",
+      payload: { task: "task that fails before the parent dispatch settles" },
+    }))).status, "accepted");
+    await waitFor(() => runner.pending.length === 1, "the SubAgent should start");
+    runner.pending[0]!.reject(new Error("controlled SubAgent failure"));
+
+    await waitFor(
+      () => events.some((event) => event.kind === "subagent.failed"),
+      "the SubAgent failure should be emitted",
+    );
+    assert.equal(continuationAttempts, 0);
+    parent.emit("turn.completed", {}, "parent-active-turn");
+    await waitForTimed(
+      () => continuationAttempts === 2,
+      "the parent continuation should retry after runtime_busy",
+    );
+
+    const continuationCommands = parent.commands.filter((runtimeCommand) =>
+      runtimeCommand.kind === "turn.prompt" &&
+      runtimeCommand.commandId.startsWith("subagent-result:"));
+    assert.equal(continuationCommands.length, 2);
+    assert.notEqual(continuationCommands[0]?.commandId, continuationCommands[1]?.commandId);
+    assert.match(
+      continuationCommands[1]?.kind === "turn.prompt" ? continuationCommands[1].message : "",
+      /delegated task failed/i,
+    );
+    assert.deepEqual(diagnostics, []);
+
+    const acceptedCommandId = continuationCommands[1]!.commandId;
+    parent.emit("turn.started", {}, acceptedCommandId);
+    parent.emit("turn.completed", {}, acceptedCommandId);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(continuationAttempts, 2);
+    assert.equal(events.filter((event) => event.kind === "speech.completed").length, 2);
+  } finally {
+    await host.stop();
+  }
+});
+
+test("cancels a pending SubAgent continuation retry when the host stops", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+
+  try {
+    host.start();
+    assert.equal((await host.execute(command("role.add", "add-stopping-parent", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("meeting.open", "open-stopping-parent"))).status, "accepted");
+    const parent = adapters.get("participant.secretary");
+    assert.ok(parent !== undefined);
+    let continuationAttempts = 0;
+    parent.onExecute = (runtimeCommand) => {
+      if (
+        runtimeCommand.kind === "turn.prompt" &&
+        runtimeCommand.commandId.startsWith("subagent-result:")
+      ) {
+        continuationAttempts += 1;
+        return {
+          commandId: runtimeCommand.commandId,
+          accepted: false,
+          errorCode: "runtime_busy",
+          message: "Parent prompt promise is still settling",
+        };
+      }
+      return undefined;
+    };
+
+    assert.equal((await host.execute(command("speech.prompt", "stopping-parent-turn", {
+      actorId: "participant.secretary",
+      payload: { message: "parent is active" },
+    }))).status, "accepted");
+    parent.emit("turn.started", {}, "stopping-parent-turn");
+    assert.equal((await host.execute(command("subagent.spawn", "spawn-before-stop", {
+      actorId: "participant.secretary",
+      payload: { task: "fail before the host stops" },
+    }))).status, "accepted");
+    await waitFor(() => runner.pending.length === 1, "the SubAgent should start");
+    runner.pending[0]!.reject(new Error("controlled SubAgent failure"));
+    parent.emit("turn.completed", {}, "stopping-parent-turn");
+    await waitForTimed(
+      () => continuationAttempts === 1,
+      "the first continuation attempt should schedule a retry",
+    );
+
+    await host.stop();
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(continuationAttempts, 1);
+  } finally {
+    await host.stop();
+  }
+});
+
+test("bounds repeated runtime_busy responses while resuming a failed SubAgent", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const diagnostics: Array<{ errorCode: string; message: string }> = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribeDiagnostics((errorCode, message) => diagnostics.push({ errorCode, message }));
+
+  try {
+    host.start();
+    assert.equal((await host.execute(command("role.add", "add-bounded-parent", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("meeting.open", "open-bounded-parent"))).status, "accepted");
+    const parent = adapters.get("participant.secretary");
+    assert.ok(parent !== undefined);
+    let continuationAttempts = 0;
+    parent.onExecute = (runtimeCommand) => {
+      if (
+        runtimeCommand.kind === "turn.prompt" &&
+        runtimeCommand.commandId.startsWith("subagent-result:")
+      ) {
+        continuationAttempts += 1;
+        return {
+          commandId: runtimeCommand.commandId,
+          accepted: false,
+          errorCode: "runtime_busy",
+          message: "Parent remains busy",
+        };
+      }
+      return undefined;
+    };
+
+    assert.equal((await host.execute(command("speech.prompt", "bounded-parent-turn", {
+      actorId: "participant.secretary",
+      payload: { message: "parent is active" },
+    }))).status, "accepted");
+    parent.emit("turn.started", {}, "bounded-parent-turn");
+    assert.equal((await host.execute(command("subagent.spawn", "spawn-bounded", {
+      actorId: "participant.secretary",
+      payload: { task: "fail while the parent stays busy" },
+    }))).status, "accepted");
+    await waitFor(() => runner.pending.length === 1, "the SubAgent should start");
+    runner.pending[0]!.reject(new Error("controlled SubAgent failure"));
+    parent.emit("turn.completed", {}, "bounded-parent-turn");
+
+    await waitForTimed(
+      () => diagnostics.length === 1,
+      "runtime_busy retries should eventually produce one diagnostic",
+      2_500,
+    );
+    assert.equal(continuationAttempts, 41);
+    assert.deepEqual(diagnostics, [{
+      errorCode: "runtime_busy",
+      message: "A parent role could not continue after its SubAgent failed",
+    }]);
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(continuationAttempts, 41);
+  } finally {
     await host.stop();
   }
 });

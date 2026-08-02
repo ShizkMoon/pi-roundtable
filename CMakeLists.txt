@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(
     PiRoundtable
-    VERSION 0.2.1
+    VERSION 0.2.2
     DESCRIPTION "Deterministic meeting state core for Pi Roundtable"
     LANGUAGES CXX
 )

@@ -1,5 +1,8 @@
-import type { RuntimeEvent } from "./runtime-adapter.js";
-import { PiRuntimeAdapter } from "./pi-runtime-adapter.js";
+import type { RuntimeAdapter, RuntimeEvent } from "./runtime-adapter.js";
+import {
+  PiRuntimeAdapter,
+  type PiRuntimeAdapterOptions,
+} from "./pi-runtime-adapter.js";
 import type { ApiFamily, ModelCapability } from "@pi-roundtable/protocol";
 
 export interface SubagentRunRequest {
@@ -33,16 +36,28 @@ export interface SubagentRunner {
   ): Promise<string>;
 }
 
+export type SubagentRuntimeAdapterFactory = (
+  options: PiRuntimeAdapterOptions,
+) => RuntimeAdapter;
+
 export class PiSubagentRunner implements SubagentRunner {
+  readonly #adapterFactory: SubagentRuntimeAdapterFactory;
+
+  constructor(
+    adapterFactory: SubagentRuntimeAdapterFactory = (options) => new PiRuntimeAdapter(options),
+  ) {
+    this.#adapterFactory = adapterFactory;
+  }
+
   async run(
     request: SubagentRunRequest,
     onProgress: (progress: SubagentRunProgress) => void,
     signal: AbortSignal,
   ): Promise<string> {
-    const adapter = new PiRuntimeAdapter({
+    const adapter = this.#adapterFactory({
       roleId: request.parentRoleId,
       runtimeId: `subagent-runtime:${request.subagentId}`,
-      sessionId: `subagent-session:${request.subagentId}`,
+      sessionId: `subagent-session.${request.subagentId}`,
       providerId: request.providerId,
       providerName: request.providerName,
       apiFamily: request.apiFamily,
@@ -76,6 +91,10 @@ export class PiSubagentRunner implements SubagentRunner {
       terminalResolve = resolve;
       terminalReject = reject;
     });
+    // Startup failures emit runtime.failed before adapter.start() rejects. Attach
+    // a handler immediately so that this early terminal rejection cannot become
+    // an unhandled rejection while run() is still awaiting adapter.start().
+    void terminal.catch(() => undefined);
     const unsubscribe = adapter.subscribe((event: RuntimeEvent) => {
       if (event.kind === "turn.delta" && typeof event.payload.delta === "string") {
         output = (output + event.payload.delta).slice(-32_768);

@@ -1,6 +1,6 @@
 {
   "name": "@pi-roundtable/sync-server",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "test:postgres": "npm run build && node --test dist/test/postgres-e2e.test.js"
   },
   "dependencies": {
-    "@pi-roundtable/protocol": "0.2.1",
+    "@pi-roundtable/protocol": "0.2.2",
     "pg": "8.22.0"
   },
   "devDependencies": {
