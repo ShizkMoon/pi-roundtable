@@ -214,6 +214,11 @@ try {
     if ($nodeMajor -lt 24) {
         throw "Windows packaging requires Node.js 24 or newer; found $nodeVersion."
     }
+    $npmVersion = (& npm --version).Trim()
+    $npmMajor = [int]($npmVersion.Split('.')[0])
+    if ($npmMajor -lt 12) {
+        throw "Windows packaging requires npm 12 or newer to produce the verified production dependency layout; found $npmVersion."
+    }
 
     Invoke-Checked 'npm' @('run', 'build') $repoRoot
     Invoke-Checked 'cmake' @('--preset', 'release') $repoRoot

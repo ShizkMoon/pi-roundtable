@@ -44,11 +44,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.16.0
           cache: npm
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - name: Pin verified packaging npm
+        run: |
+          npm install --global npm@12.0.1
+          npm --version
       - run: npm ci
       - run: npm run build
       - name: Configure native core
@@ -62,7 +66,7 @@ jobs:
       - name: Build self-contained Windows x64 MSI
         shell: pwsh
         # GitHub's Windows runner closes the WiX ICE validation pipe for this
-        # 38k-file self-contained package. Release builds keep validation on;
+        # large self-contained package. Release builds keep validation on;
         # CI still compiles the complete MSI after tests have passed.
         run: ./scripts/build-windows-x64.ps1 -Version 0.2.0 -SkipVerification -SuppressMsiValidation
       - uses: actions/upload-artifact@v4
