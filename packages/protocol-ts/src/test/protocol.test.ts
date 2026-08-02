@@ -5,6 +5,9 @@ import test from "node:test";
 import {
   API_FAMILIES,
   canObserveMeetingEvent,
+  DISCUSSION_MODES,
+  DISCUSSION_PROGRESS_KINDS,
+  FLOOR_REQUEST_KINDS,
   isMeetingCommandKind,
   isMeetingEventKind,
   isRoleScope,
@@ -16,6 +19,8 @@ import {
   SESSION_EXPORT_PACKAGE_VERSION,
   THINKING_LEVELS,
   validateRoundtableSession,
+  validateMeetingCommand,
+  validateMeetingEvent,
   validateSessionExportPackage,
   validateWorkspaceProfile,
   WORKSPACE_CONFIGURATION_VERSION,
@@ -88,6 +93,43 @@ function createWorkspace(): WorkspaceProfile {
   };
 }
 
+test("runtime event validation enforces private audiences and public omission", () => {
+  const privateEvent = {
+    protocolVersion: 1,
+    meetingId: "meeting.validation",
+    eventId: "event.private",
+    sequence: 1,
+    runtimeGeneration: 1,
+    kind: "message.direct_sent",
+    occurredAt: "2026-08-03T00:00:00.000Z",
+    actorId: "user.direct_host",
+    targetId: "role.secretary",
+    visibility: "private",
+    audience: ["user.direct_host", "role.secretary"],
+    payload: {},
+  };
+  assert.deepEqual(validateMeetingEvent(privateEvent), []);
+  assert.ok(validateMeetingEvent({ ...privateEvent, audience: [] }).some((issue) => issue.path === "audience"));
+  assert.ok(validateMeetingEvent({ ...privateEvent, visibility: "public" }).some((issue) => issue.path === "audience"));
+  assert.ok(validateMeetingEvent({ ...privateEvent, runtimeGeneration: 0 }).some((issue) => issue.path === "runtimeGeneration"));
+});
+
+test("runtime command validation rejects unknown fields and invalid generations", () => {
+  const command = {
+    protocolVersion: 1,
+    meetingId: "meeting.validation",
+    commandId: "command.open",
+    kind: "meeting.open",
+    issuedAt: "2026-08-03T00:00:00.000Z",
+    runtimeGeneration: 1,
+    payload: {},
+  };
+  assert.deepEqual(validateMeetingCommand(command), []);
+  const issues = validateMeetingCommand({ ...command, runtimeGeneration: 0, secret: "not allowed" });
+  assert.ok(issues.some((issue) => issue.path === "runtimeGeneration"));
+  assert.ok(issues.some((issue) => issue.code === "additional_property"));
+});
+
 test("role lifecycle event kinds are part of protocol v1", () => {
   for (const kind of [
     "role.temporary_registered",
@@ -132,6 +174,42 @@ test("conversation visibility and routing commands are explicit", () => {
   };
   assert.equal(canObserveMeetingEvent(privateEvent, "role.secretary"), true);
   assert.equal(canObserveMeetingEvent(privateEvent, "role.host"), false);
+});
+
+test("facilitated discussion commands, events, and stable enums are explicit", () => {
+  for (const kind of [
+    "discussion.configure",
+    "discussion.mode.set",
+    "discussion.resume",
+    "agenda.advance",
+    "floor.request",
+    "floor.grant",
+    "floor.reject",
+    "convergence.record",
+  ]) {
+    assert.equal(isMeetingCommandKind(kind), true);
+  }
+  for (const kind of [
+    "discussion.configured",
+    "discussion.mode_changed",
+    "agenda.item_changed",
+    "floor.requested",
+    "floor.granted",
+    "floor.rejected",
+    "discussion.budget_updated",
+    "convergence.recorded",
+  ]) {
+    assert.equal(isMeetingEventKind(kind), true);
+  }
+  assert.deepEqual(DISCUSSION_MODES, [
+    "agenda", "free_discussion", "convergence", "paused", "completed",
+  ]);
+  assert.deepEqual(FLOOR_REQUEST_KINDS, [
+    "host", "critical", "facilitator", "reply", "normal",
+  ]);
+  assert.deepEqual(DISCUSSION_PROGRESS_KINDS, [
+    "decision", "objection", "evidence_request", "action",
+  ]);
 });
 
 test("meeting event schema requires explicit visibility and a private audience", () => {

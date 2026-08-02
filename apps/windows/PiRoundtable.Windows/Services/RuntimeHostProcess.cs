@@ -16,7 +16,8 @@ internal sealed record RuntimeHostStartOptions(
     ulong InitialSequence,
     WorkspaceConfiguration Workspace,
     RoundtableSessionConfiguration Session,
-    IReadOnlyDictionary<string, string> Credentials);
+    IReadOnlyDictionary<string, string> Credentials,
+    DiscussionSchedulerStateConfiguration? DiscussionState = null);
 
 internal sealed record RuntimeCommandReceipt(
     string CommandId,
@@ -108,6 +109,10 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             WindowStyle = ProcessWindowStyle.Hidden,
             WorkingDirectory = AppContext.BaseDirectory,
         };
+        // Node 24 does not use HTTP_PROXY/HTTPS_PROXY for fetch unless this opt-in
+        // is present. Older development runtimes ignore the environment variable.
+        startInfo.Environment["NODE_USE_ENV_PROXY"] = "1";
+        startInfo.ArgumentList.Add("--use-env-proxy");
         startInfo.ArgumentList.Add(scriptPath);
         startInfo.Environment["PI_ROUNDTABLE_MEETING_ID"] = options.MeetingId;
         startInfo.Environment["PI_ROUNDTABLE_RUNTIME_ID"] = options.RuntimeId;
@@ -143,6 +148,7 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             session = options.Session,
             credentials = options.Credentials,
             initialSequence = options.InitialSequence,
+            discussionState = options.DiscussionState,
         }, cancellationToken);
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -735,16 +741,19 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 
     private static string ResolveHostScript()
     {
-        var configured = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
-        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
-        {
-            return Path.GetFullPath(configured);
-        }
-
         var packaged = Path.Combine(AppContext.BaseDirectory, "runtime-host", "host-main.js");
         if (File.Exists(packaged))
         {
             return packaged;
+        }
+
+        // Overrides exist for tests and source checkouts only. A packaged app
+        // always prefers its colocated, reviewed runtime even if the parent
+        // process inherited untrusted PI_ROUNDTABLE_* environment values.
+        var configured = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
+        {
+            return Path.GetFullPath(configured);
         }
 
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
@@ -768,14 +777,18 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 
     private static string ResolveNodeExecutable()
     {
+        var packaged = Path.Combine(AppContext.BaseDirectory, "runtime", "node.exe");
+        if (File.Exists(packaged))
+        {
+            return packaged;
+        }
+
         var configured = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_NODE_PATH");
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured))
         {
             return Path.GetFullPath(configured);
         }
-
-        var packaged = Path.Combine(AppContext.BaseDirectory, "runtime", "node.exe");
-        return File.Exists(packaged) ? packaged : "node";
+        return "node";
     }
 
     private static async Task IgnoreFailureAsync(Task task)

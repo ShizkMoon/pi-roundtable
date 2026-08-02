@@ -4,6 +4,8 @@
 
     [string]$OutputRoot,
 
+    [string]$NuGetConfigFile,
+
     [switch]$SkipVerification,
 
     [switch]$SuppressMsiValidation
@@ -11,6 +13,7 @@
 
 $ErrorActionPreference = 'Stop'
 $dependencyStage = $null
+$temporaryWixNuGetConfig = $null
 
 function Invoke-Checked {
     param(
@@ -192,6 +195,14 @@ try {
     if (!(Test-PathIsStrictChild -Path $packageRoot -Root $approvedOutputRoot)) {
         throw "OutputRoot must remain inside $approvedOutputRoot."
     }
+    $restoreConfigArgument = @()
+    if (![string]::IsNullOrWhiteSpace($NuGetConfigFile)) {
+        $resolvedNuGetConfig = [System.IO.Path]::GetFullPath($NuGetConfigFile)
+        if (!(Test-Path -LiteralPath $resolvedNuGetConfig -PathType Leaf)) {
+            throw "NuGetConfigFile does not exist: $resolvedNuGetConfig"
+        }
+        $restoreConfigArgument = @("-p:RestoreConfigFile=$resolvedNuGetConfig")
+    }
 
     $appStage = Join-Path $packageRoot 'app'
     $updaterStage = Join-Path $packageRoot 'updater'
@@ -228,15 +239,16 @@ try {
         Invoke-Checked 'cmake' @('--build', '--preset', 'dev') $repoRoot
         Invoke-Checked 'ctest' @('--preset', 'dev') $repoRoot
         Invoke-Checked 'npm' @('test') $repoRoot
-        Invoke-Checked 'dotnet' @(
+        $windowsTestArguments = @(
             'test',
             'apps/windows/tests/PiRoundtable.Windows.Tests/PiRoundtable.Windows.Tests.csproj',
             '--configuration', 'Release'
-        ) $repoRoot
+        ) + $restoreConfigArgument
+        Invoke-Checked 'dotnet' $windowsTestArguments $repoRoot
     }
 
     New-Item -ItemType Directory -Force -Path $appStage | Out-Null
-    Invoke-Checked 'dotnet' @(
+    $windowsPublishArguments = @(
         'publish',
         'apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj',
         '--configuration', 'Release',
@@ -247,14 +259,15 @@ try {
         "-p:Version=$Version",
         '-p:DebugType=None',
         '-p:DebugSymbols=false'
-    ) $repoRoot
+    ) + $restoreConfigArgument
+    Invoke-Checked 'dotnet' $windowsPublishArguments $repoRoot
     foreach ($resourceName in @('App.xbf', 'MainWindow.xbf', 'PiRoundtable.Windows.pri')) {
         if (!(Test-Path -LiteralPath (Join-Path $appStage $resourceName) -PathType Leaf)) {
             throw "Published WinUI resource is missing: $resourceName"
         }
     }
 
-    Invoke-Checked 'dotnet' @(
+    $updaterPublishArguments = @(
         'publish',
         'apps/windows/PiRoundtable.Updater/PiRoundtable.Updater.csproj',
         '--configuration', 'Release',
@@ -265,7 +278,8 @@ try {
         '-p:PublishSingleFile=true',
         '-p:DebugType=None',
         '-p:DebugSymbols=false'
-    ) $repoRoot
+    ) + $restoreConfigArgument
+    Invoke-Checked 'dotnet' $updaterPublishArguments $repoRoot
     $updaterExecutable = Join-Path $updaterStage 'PiRoundtable.Updater.exe'
     if (!(Test-Path -LiteralPath $updaterExecutable -PathType Leaf)) {
         throw 'Single-file updater helper was not produced.'
@@ -290,29 +304,36 @@ try {
     Copy-Item -Path (Join-Path $repoRoot 'packages\protocol-ts\dist') -Destination $protocolStage -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $repoRoot 'packages\protocol-ts\package.json') -Destination $protocolStage -Force
 
-    $runtimePackage = [ordered]@{
-        name = 'pi-roundtable-packaged-runtime'
-        private = $true
-        type = 'module'
-        dependencies = [ordered]@{
-            '@earendil-works/pi-ai' = '0.83.0'
-            '@earendil-works/pi-coding-agent' = '0.83.0'
-            '@modelcontextprotocol/sdk' = '1.30.0'
-            '@pi-roundtable/protocol' = 'file:./protocol'
+    $runtimeDependencyRoot = Join-Path $repoRoot 'packaging\windows-runtime'
+    $runtimeDependencyManifest = Join-Path $runtimeDependencyRoot 'package.json'
+    $runtimeDependencyLock = Join-Path $runtimeDependencyRoot 'package-lock.json'
+    foreach ($requiredDependencyFile in @($runtimeDependencyManifest, $runtimeDependencyLock)) {
+        if (!(Test-Path -LiteralPath $requiredDependencyFile -PathType Leaf)) {
+            throw "The committed Windows Runtime dependency lock is incomplete: $requiredDependencyFile"
         }
-    } | ConvertTo-Json -Depth 5
-    [System.IO.File]::WriteAllText(
-        (Join-Path $runtimeHostStage 'package.json'),
-        $runtimePackage,
-        [System.Text.UTF8Encoding]::new($false))
+    }
+    $protocolVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'packages\protocol-ts\package.json') -Raw | ConvertFrom-Json).version
+    $lockedProtocolVersion = (Get-Content -LiteralPath (Join-Path $runtimeDependencyRoot 'protocol\package.json') -Raw | ConvertFrom-Json).version
+    if ($protocolVersion -ne $lockedProtocolVersion) {
+        throw "The Windows Runtime dependency lock targets protocol $lockedProtocolVersion, but the workspace builds $protocolVersion."
+    }
+    Copy-Item -LiteralPath $runtimeDependencyManifest -Destination (Join-Path $runtimeHostStage 'package.json') -Force
     $dependencyStage = Join-Path ([System.IO.Path]::GetTempPath()) "pi-roundtable-runtime-deps-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Force -Path $dependencyStage | Out-Null
-    [System.IO.File]::WriteAllText(
-        (Join-Path $dependencyStage 'package.json'),
-        $runtimePackage,
-        [System.Text.UTF8Encoding]::new($false))
+    Copy-Item -LiteralPath $runtimeDependencyManifest -Destination (Join-Path $dependencyStage 'package.json') -Force
+    Copy-Item -LiteralPath $runtimeDependencyLock -Destination (Join-Path $dependencyStage 'package-lock.json') -Force
     Copy-Item -LiteralPath $protocolStage -Destination (Join-Path $dependencyStage 'protocol') -Recurse -Force
-    Invoke-Checked 'npm' @('install', '--omit=dev', '--no-audit', '--no-fund') $dependencyStage
+    $npmCache = Join-Path $packageRoot '.npm-cache'
+    New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
+    Invoke-Checked 'npm' @(
+        'ci',
+        '--omit=dev',
+        '--ignore-scripts',
+        '--no-audit',
+        '--no-fund',
+        '--prefer-offline',
+        '--cache', $npmCache
+    ) $dependencyStage
     Copy-Item -LiteralPath (Join-Path $dependencyStage 'node_modules') -Destination $runtimeHostStage -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $dependencyStage 'package-lock.json') -Destination $runtimeHostStage -Force
     Remove-Item -LiteralPath $dependencyStage -Recurse -Force
@@ -334,11 +355,34 @@ try {
     $packagedNode = Join-Path $runtimeStage 'node.exe'
     $packagedHost = Join-Path $runtimeHostStage 'host-main.js'
     Invoke-Checked $packagedNode @('--check', $packagedHost) $appStage
+    # Syntax checks do not resolve imports. Exercise the staged file dependency
+    # so a missing protocol dist cannot survive until first application run.
+    Invoke-Checked $packagedNode @(
+        '--input-type=module',
+        '--eval',
+        "await import('@pi-roundtable/protocol')"
+    ) $runtimeHostStage
 
     $generatedWxs = Join-Path $packageRoot 'GeneratedFiles.wxs'
     Write-WixFileManifest -SourceRoot $appStage -OutputPath $generatedWxs
 
     $wixProject = Join-Path $repoRoot 'packaging\windows-x64\PiRoundtable.Installer.wixproj'
+    if (![string]::IsNullOrWhiteSpace($NuGetConfigFile)) {
+        # MSBuild resolves a project SDK before evaluating RestoreConfigFile. Place the
+        # requested config beside the WiX project for that early resolver phase, then
+        # remove it after the build so local restore bridges never become repository state.
+        $wixProjectDirectory = Split-Path -Parent $wixProject
+        $wixNuGetConfig = Join-Path $wixProjectDirectory 'NuGet.Config'
+        if (![System.IO.Path]::GetFullPath($wixNuGetConfig).Equals(
+                $resolvedNuGetConfig,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            if (Test-Path -LiteralPath $wixNuGetConfig) {
+                throw "Refusing to replace the existing WiX NuGet.Config: $wixNuGetConfig"
+            }
+            Copy-Item -LiteralPath $resolvedNuGetConfig -Destination $wixNuGetConfig
+            $temporaryWixNuGetConfig = $wixNuGetConfig
+        }
+    }
     $knownLanguageOverflowIds = @(
         (Get-StableWixId 'fil' 'Microsoft.ui.xaml.dll'),
         (Get-StableWixId 'fil' 'Microsoft.UI.Xaml.Phone.dll')
@@ -350,7 +394,7 @@ try {
         "-p:PublishDir=$appStage",
         "-p:GeneratedWxs=$generatedWxs",
         "-p:OutputPath=$installerOutput"
-    )
+    ) + $restoreConfigArgument
     $expectedIce03FileIds = $knownLanguageOverflowIds
     if ($SuppressMsiValidation) {
         Write-Host 'WiX MSI validation is suppressed explicitly; use only after an equivalent release package passes validation.'
@@ -358,6 +402,10 @@ try {
         $expectedIce03FileIds = @()
     }
     Invoke-CheckedWixBuild $wixBuildArguments $repoRoot $expectedIce03FileIds
+    if ($null -ne $temporaryWixNuGetConfig) {
+        Remove-Item -LiteralPath $temporaryWixNuGetConfig -Force
+        $temporaryWixNuGetConfig = $null
+    }
 
     $msi = Get-ChildItem -LiteralPath $installerOutput -Filter '*.msi' -File |
         Sort-Object LastWriteTimeUtc -Descending |
@@ -369,6 +417,10 @@ try {
     Write-Host "MSI: $($msi.FullName)"
     Write-Host "SHA256: $($hash.Hash)"
 } catch {
+    if ($null -ne $temporaryWixNuGetConfig) {
+        Remove-Item -LiteralPath $temporaryWixNuGetConfig -Force -ErrorAction SilentlyContinue
+        $temporaryWixNuGetConfig = $null
+    }
     if ($null -ne $dependencyStage) {
         $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
         $resolvedDependencyStage = [System.IO.Path]::GetFullPath($dependencyStage)

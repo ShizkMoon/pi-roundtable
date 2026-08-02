@@ -51,7 +51,15 @@
         "subagent.spawned",
         "subagent.progress",
         "subagent.completed",
-        "subagent.failed"
+        "subagent.failed",
+        "discussion.configured",
+        "discussion.mode_changed",
+        "agenda.item_changed",
+        "floor.requested",
+        "floor.granted",
+        "floor.rejected",
+        "discussion.budget_updated",
+        "convergence.recorded"
       ]
     },
     "occurredAt": { "type": "string", "format": "date-time" },

@@ -525,35 +525,52 @@
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
                                     <RowDefinition Height="*" />
                                     <RowDefinition Height="Auto" />
                                 </Grid.RowDefinitions>
 
-                                <Grid Padding="16,8,8,6" ColumnSpacing="8">
+                                <Grid
+                                    x:Name="MeetingHeaderGrid"
+                                    Padding="16,8,8,6"
+                                    AutomationProperties.Name="会议标题与主要操作"
+                                    ColumnSpacing="8">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <StackPanel VerticalAlignment="Center" Spacing="0">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <StackPanel
+                                        x:Name="MeetingTitleStack"
+                                        VerticalAlignment="Center"
+                                        Spacing="0">
                                         <TextBlock
                                             x:Name="MeetingHeaderLabel"
                                             FontSize="11"
                                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                             Text="当前圆桌" />
                                         <TextBox
+                                            x:Name="MeetingTitleBox"
                                             MinWidth="120"
+                                            MaxHeight="52"
                                             Padding="0,2"
                                             AutomationProperties.Name="会话名称"
                                             Background="Transparent"
                                             BorderThickness="0"
                                             FontSize="20"
                                             FontWeight="SemiBold"
+                                            VerticalAlignment="Top"
                                             PlaceholderText="会话名称"
-                                            Text="{Binding MeetingTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                            Text="{Binding MeetingTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                            TextWrapping="Wrap" />
                                     </StackPanel>
                                     <CommandBar
                                         x:Name="MeetingCommandBar"
                                         Grid.Column="1"
+                                        HorizontalAlignment="Right"
                                         Background="Transparent"
                                         DefaultLabelPosition="Right">
                                         <AppBarButton AutomationProperties.Name="邀请临时角色" Click="OpenInvitationPane_Click" Label="邀请角色" Icon="AddFriend" ToolTipService.ToolTip="邀请临时角色" />
@@ -666,8 +683,91 @@
                                     </Grid>
                                 </Border>
 
-                                <InfoBar
+                                <Border
+                                    x:Name="DiscussionControlStrip"
                                     Grid.Row="2"
+                                    Padding="12,7"
+                                    Background="{ThemeResource LayerFillColorAltBrush}"
+                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                    BorderThickness="0,0,0,1"
+                                    Visibility="{Binding DiscussionStripVisibility}">
+                                    <Grid ColumnSpacing="10">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <Border
+                                            Padding="9,3"
+                                            VerticalAlignment="Center"
+                                            Background="{ThemeResource AccentFillColorTertiaryBrush}"
+                                            CornerRadius="9">
+                                            <TextBlock
+                                                AutomationProperties.Name="当前讨论模式"
+                                                FontSize="11"
+                                                FontWeight="SemiBold"
+                                                Text="{Binding DiscussionModeLabel}" />
+                                        </Border>
+                                        <TextBlock
+                                            x:Name="DiscussionAgendaText"
+                                            Grid.Column="1"
+                                            MaxWidth="460"
+                                            VerticalAlignment="Center"
+                                            FontSize="12"
+                                            FontWeight="SemiBold"
+                                            Text="{Binding DiscussionAgendaSummary}"
+                                            TextTrimming="CharacterEllipsis"
+                                            ToolTipService.ToolTip="{Binding DiscussionAgendaSummary}" />
+                                        <TextBlock
+                                            x:Name="DiscussionBudgetText"
+                                            Grid.Column="2"
+                                            VerticalAlignment="Center"
+                                            FontFamily="Cascadia Mono"
+                                            FontSize="10"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="{Binding DiscussionBudgetSummary}" />
+                                        <TextBlock
+                                            x:Name="DiscussionQueueText"
+                                            Grid.Column="3"
+                                            VerticalAlignment="Center"
+                                            FontSize="11"
+                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                            Text="{Binding DiscussionQueueSummary}" />
+                                        <StackPanel Grid.Column="4" Orientation="Horizontal" Spacing="6">
+                                            <Button
+                                                AutomationProperties.Name="切换讨论模式"
+                                                Content="模式"
+                                                IsEnabled="{Binding CanControlDiscussion}">
+                                                <Button.Flyout>
+                                                    <MenuFlyout>
+                                                        <MenuFlyoutItem Click="SetAgendaMode_Click" Text="议程模式" />
+                                                        <MenuFlyoutItem Click="SetFreeDiscussionMode_Click" Text="自由讨论" />
+                                                        <MenuFlyoutItem Click="SetConvergenceMode_Click" Text="开始收敛" />
+                                                        <MenuFlyoutSeparator />
+                                                        <MenuFlyoutItem Click="PauseDiscussion_Click" Text="暂停自动主持" />
+                                                    </MenuFlyout>
+                                                </Button.Flyout>
+                                            </Button>
+                                            <Button
+                                                AutomationProperties.Name="进入下一议题"
+                                                Click="AdvanceAgenda_Click"
+                                                Content="下一议题"
+                                                IsEnabled="{Binding CanAdvanceAgenda}" />
+                                            <Button
+                                                AutomationProperties.Name="继续自动主持"
+                                                Click="ResumeDiscussion_Click"
+                                                Content="继续"
+                                                IsEnabled="{Binding CanResumeDiscussion}"
+                                                Style="{StaticResource AccentButtonStyle}"
+                                                Visibility="{Binding DiscussionResumeVisibility}" />
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+
+                                <InfoBar
+                                    Grid.Row="3"
                                     Margin="12,8,12,0"
                                     IsClosable="False"
                                     IsOpen="{Binding IsPaused}"
@@ -679,7 +779,7 @@
                                     </InfoBar.ActionButton>
                                 </InfoBar>
 
-                                <Grid Grid.Row="3">
+                                <Grid Grid.Row="4">
                                     <StackPanel
                                         HorizontalAlignment="Center"
                                         MaxWidth="390"
@@ -780,13 +880,12 @@
                                 </Grid>
 
                                 <Grid
-                                    Grid.Row="4"
+                                    Grid.Row="5"
                                     Padding="14,8,14,10"
                                     BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                                     BorderThickness="0,1,0,0"
                                     RowSpacing="6">
                                     <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
@@ -795,53 +894,15 @@
                                         MinHeight="68"
                                         AcceptsReturn="True"
                                         AutomationProperties.Name="公开发言输入"
-                                        AutomationProperties.HelpText="按 Ctrl+Enter 发送公开发言；Enter 换行"
+                                        AutomationProperties.HelpText="直接描述要求、分工和依赖，用 @角色名 指定涉及角色；发送后自动理解和安排；按 Ctrl+Enter 发送，Enter 换行"
                                         Header="我 · 公开发言"
-                                        PlaceholderText="表达意见或输入 @角色名 指定回应者；发言始终对全体参会者可见……"
+                                        PlaceholderText="直接描述共同要求、各自任务和协作关系；用 @角色名 指定涉及角色"
                                         TextWrapping="Wrap">
                                         <TextBox.KeyboardAccelerators>
                                             <KeyboardAccelerator Invoked="SendPromptAccelerator_Invoked" Key="Enter" Modifiers="Control" />
                                         </TextBox.KeyboardAccelerators>
                                     </TextBox>
-                                    <Grid Grid.Row="1" ColumnSpacing="8">
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="Auto" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock
-                                            VerticalAlignment="Center"
-                                            FontSize="11"
-                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                                            Text="本轮回应者" />
-                                        <ScrollViewer
-                                            Grid.Column="1"
-                                            HorizontalScrollBarVisibility="Auto"
-                                            HorizontalScrollMode="Enabled"
-                                            VerticalScrollBarVisibility="Disabled"
-                                            VerticalScrollMode="Disabled">
-                                            <ItemsRepeater ItemsSource="{Binding MentionTargets}">
-                                                <ItemsRepeater.Layout>
-                                                    <StackLayout Orientation="Horizontal" Spacing="6" />
-                                                </ItemsRepeater.Layout>
-                                                <ItemsRepeater.ItemTemplate>
-                                                    <DataTemplate x:DataType="models:MentionTargetItem">
-                                                        <ToggleButton
-                                                            MinHeight="30"
-                                                            Padding="9,3"
-                                                            AutomationProperties.Name="{x:Bind DisplayName}"
-                                                            AutomationProperties.HelpText="选中后只有被点名角色参与本轮回应"
-                                                            IsChecked="{x:Bind IsMentioned, Mode=TwoWay}">
-                                                            <StackPanel Orientation="Horizontal" Spacing="1">
-                                                                <TextBlock Text="@" />
-                                                                <TextBlock Text="{x:Bind DisplayName}" />
-                                                            </StackPanel>
-                                                        </ToggleButton>
-                                                    </DataTemplate>
-                                                </ItemsRepeater.ItemTemplate>
-                                            </ItemsRepeater>
-                                        </ScrollViewer>
-                                    </Grid>
-                                    <Grid Grid.Row="2">
+                                    <Grid Grid.Row="1">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
@@ -851,7 +912,7 @@
                                             FontSize="11"
                                             Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                             MaxLines="2"
-                                            Text="不点名时全员依次回应；点名时仅被点名角色回应 · Ctrl+Enter 发送"
+                                            Text="未写 @：全员参与；多个 @：仅点名角色参与，自动理解分工与顺序 · Ctrl+Enter 发送"
                                             TextWrapping="Wrap" />
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
                                             <Button Click="Interrupt_Click" Content="打断并接管" IsEnabled="{Binding CanOperate}" />
@@ -973,8 +1034,8 @@
                                                 </StackPanel>
                                             </Border>
                                             <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
-                                                <Button Click="ArchiveRole_Click" Content="归档" IsEnabled="{Binding CanArchiveSelectedRole}" />
-                                                <Button Click="SaveRole_Click" Content="保存角色配置" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
+                                                <Button AutomationProperties.Name="归档当前角色" Click="ArchiveRole_Click" Content="归档" IsEnabled="{Binding CanArchiveSelectedRole}" />
+                                                <Button AutomationProperties.Name="保存当前角色配置" Click="SaveRole_Click" Content="保存角色配置" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
                                             </StackPanel>
                                         </StackPanel>
                                     </Border>
@@ -1043,7 +1104,7 @@
                                     <ComboBox AutomationProperties.Name="MCP 导入审阅模型" Header="LLM 审阅模型" ItemsSource="{Binding Models}" SelectedItem="{Binding SelectedImportModel, Mode=TwoWay}" />
                                     <TextBox Header="名称（可选，留空由 LLM 建议）" Text="{Binding McpDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                     <TextBox Header="GitHub / Git HTTPS 地址" PlaceholderText="https://github.com/org/repo" Text="{Binding McpSourceLocator, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                                    <Button HorizontalAlignment="Right" Click="ImportMcp_Click" Content="LLM 审阅并隔离导入" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
+                                    <Button HorizontalAlignment="Right" AutomationProperties.Name="LLM 审阅并隔离导入 MCP" Click="ImportMcp_Click" Content="LLM 审阅并隔离导入" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />
                                     <Expander Header="手动登记 MCP 服务器">
                                         <StackPanel Padding="0,8,0,0" Spacing="10">
                                             <ComboBox AutomationProperties.Name="MCP 传输方式" Header="传输" ItemsSource="{Binding McpTransports}" SelectedItem="{Binding McpTransport, Mode=TwoWay}" />
@@ -1057,7 +1118,7 @@
                                                 ScrollViewer.HorizontalScrollMode="Enabled"
                                                 Text="{Binding McpToolCatalogText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                                 TextWrapping="NoWrap" />
-                                            <Button HorizontalAlignment="Right" Click="SaveMcp_Click" Content="登记并保持禁用" IsEnabled="{Binding IsRoleConfigurationEditable}" />
+                                            <Button HorizontalAlignment="Right" AutomationProperties.Name="登记 MCP 并保持禁用" Click="SaveMcp_Click" Content="登记并保持禁用" IsEnabled="{Binding IsRoleConfigurationEditable}" />
                                         </StackPanel>
                                     </Expander>
                                 </StackPanel>
@@ -1083,8 +1144,8 @@
                                                 </StackPanel>
                                                 <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind AuditSummary}" TextWrapping="Wrap" />
                                                 <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
-                                                    <Button Click="EditMcpTools_Click" Content="编辑工具清单" Tag="{x:Bind McpServerId}" />
-                                                    <Button Click="ApproveMcp_Click" Content="审核并启用" Tag="{x:Bind McpServerId}" />
+                                                    <Button AutomationProperties.Name="编辑 MCP 工具清单" Click="EditMcpTools_Click" Content="编辑工具清单" Tag="{x:Bind McpServerId}" />
+                                                    <Button AutomationProperties.Name="审核并启用 MCP" Click="ApproveMcp_Click" Content="审核并启用" Tag="{x:Bind McpServerId}" />
                                                 </StackPanel>
                                             </StackPanel>
                                         </Border>
@@ -1134,7 +1195,7 @@
                                             <ColumnDefinition Width="Auto" />
                                         </Grid.ColumnDefinitions>
                                         <ComboBox AutomationProperties.Name="提供商选择" ItemsSource="{Binding Providers}" SelectedItem="{Binding SelectedProvider, Mode=TwoWay}" />
-                                        <Button Grid.Column="1" Click="BeginNewProvider_Click" Content="新建" IsEnabled="{Binding IsRoleConfigurationEditable}" />
+                                        <Button Grid.Column="1" AutomationProperties.Name="新建提供商" Click="BeginNewProvider_Click" Content="新建" IsEnabled="{Binding IsRoleConfigurationEditable}" />
                                     </Grid>
                                     <TextBox x:Name="ProviderDisplayNameBox" AutomationProperties.Name="提供商显示名称" Header="显示名称" Text="{Binding ProviderDisplayName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                     <TextBox Header="Runtime Provider ID" PlaceholderText="openai / anthropic / google" Text="{Binding RuntimeProviderId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
@@ -1142,8 +1203,8 @@
                                     <TextBox Header="可选端点" PlaceholderText="HTTPS 或回环 HTTP" Text="{Binding ProviderEndpoint, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                     <PasswordBox x:Name="ProviderApiKeyBox" Header="API Key（留空则保留现有值）" PasswordRevealMode="Peek" />
                                     <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
-                                        <Button Click="FetchProviderModels_Click" Content="获取模型列表" />
-                                        <Button Click="SaveProvider_Click" Content="保存提供商与凭据" Style="{StaticResource AccentButtonStyle}" />
+                                        <Button AutomationProperties.Name="获取提供商模型列表" Click="FetchProviderModels_Click" Content="获取模型列表" />
+                                        <Button AutomationProperties.Name="保存提供商与凭据" Click="SaveProvider_Click" Content="保存提供商与凭据" Style="{StaticResource AccentButtonStyle}" />
                                     </StackPanel>
                                     <Border Padding="12" Background="{ThemeResource LayerFillColorDefaultBrush}" CornerRadius="10">
                                         <StackPanel Spacing="8">
@@ -1154,8 +1215,8 @@
                                                 </Grid.RowDefinitions>
                                                 <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding DiscoveredModelSummary}" TextWrapping="Wrap" />
                                                 <StackPanel Grid.Row="1" HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
-                                                    <Button Click="SelectAllProviderModels_Click" Content="全选" />
-                                                    <Button Click="ImportProviderModels_Click" Content="导入已选" Style="{StaticResource AccentButtonStyle}" />
+                                                    <Button AutomationProperties.Name="全选发现的模型" Click="SelectAllProviderModels_Click" Content="全选" />
+                                                    <Button AutomationProperties.Name="导入已选模型" Click="ImportProviderModels_Click" Content="导入已选" Style="{StaticResource AccentButtonStyle}" />
                                                 </StackPanel>
                                             </Grid>
                                             <ListView MaxHeight="260" ItemsSource="{Binding DiscoveredModels}" SelectionMode="None">

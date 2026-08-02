@@ -9,6 +9,8 @@ public sealed class RoleItem : INotifyPropertyChanged
     private string _status = "未连接";
     private string _systemPrompt;
     private string _modelProfileId = string.Empty;
+    private string _thinkingLevel = "medium";
+    private int? _maxOutputTokens;
     private string _retentionPolicy;
     private string _networkAccess;
     private bool _isArchived;
@@ -25,13 +27,19 @@ public sealed class RoleItem : INotifyPropertyChanged
         string? retentionPolicy = null,
         string? networkAccess = null,
         string? invitationId = null,
-        DateTimeOffset? invitedAt = null)
+        DateTimeOffset? invitedAt = null,
+        ModelRouteConfiguration? modelRoute = null)
     {
         RoleId = roleId;
         DisplayName = displayName;
         _scope = scope;
         _systemPrompt = systemPrompt ?? $"你是圆桌会议中的{displayName}。只在职责范围内工作，并明确说明不确定性。";
-        _modelProfileId = modelProfileId ?? string.Empty;
+        _modelProfileId = modelProfileId ?? modelRoute?.PrimaryModelProfileId ?? string.Empty;
+        _thinkingLevel = string.IsNullOrWhiteSpace(modelRoute?.ThinkingLevel)
+            ? "medium"
+            : modelRoute.ThinkingLevel;
+        _maxOutputTokens = modelRoute?.MaxOutputTokens;
+        FallbackModelProfileIds.AddRange(modelRoute?.FallbackModelProfileIds ?? []);
         _retentionPolicy = retentionPolicy ?? (scope == "long_term" ? "retain_profile" : "review_at_close");
         _networkAccess = networkAccess ?? "subagent_required";
         InvitationId = scope == "temporary" ? invitationId ?? $"invite.{Guid.NewGuid():N}" : null;
@@ -60,6 +68,20 @@ public sealed class RoleItem : INotifyPropertyChanged
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(CapabilityGrantSummary)));
             }
         }
+    }
+
+    public List<string> FallbackModelProfileIds { get; } = [];
+
+    public string ThinkingLevel
+    {
+        get => _thinkingLevel;
+        set => SetField(ref _thinkingLevel, value);
+    }
+
+    public int? MaxOutputTokens
+    {
+        get => _maxOutputTokens;
+        set => SetField(ref _maxOutputTokens, value);
     }
 
     public string RetentionPolicy

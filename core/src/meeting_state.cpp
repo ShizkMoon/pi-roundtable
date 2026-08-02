@@ -1,5 +1,7 @@
 #include "pi_roundtable/core/meeting_state.hpp"
 
+#include <unordered_set>
+
 namespace pi_roundtable::core {
 
 namespace {
@@ -40,6 +42,27 @@ bool is_private_role_activity(EventKind kind) {
         default:
             return false;
     }
+}
+
+bool has_valid_audience(const MeetingEvent& event) {
+    if (event.visibility == EventVisibility::Public) {
+        return event.audience.empty();
+    }
+    if (event.audience.empty()) {
+        return false;
+    }
+
+    std::unordered_set<std::string> unique;
+    for (const auto& principal_id : event.audience) {
+        if (principal_id.empty() || !unique.insert(principal_id).second) {
+            return false;
+        }
+    }
+    // A private event must remain visible to every principal named by its
+    // routing fields. This prevents the C ABI from accepting an audience that
+    // silently hides the event from its sender or recipient.
+    return (event.actor_id.empty() || unique.contains(event.actor_id)) &&
+        (event.target_id.empty() || unique.contains(event.target_id));
 }
 
 }  // namespace
@@ -95,6 +118,9 @@ void MeetingState::clear_role_activity(const std::string& role_id) {
 ApplyResult MeetingState::apply(const MeetingEvent& event) {
     if (event.sequence != last_sequence_ + 1) {
         return reject(ApplyError::OutOfOrderSequence);
+    }
+    if (!has_valid_audience(event)) {
+        return reject(ApplyError::InvalidAudience);
     }
 
     if (event.kind == EventKind::RuntimeLeaseAcquired) {
@@ -217,6 +243,62 @@ ApplyResult MeetingState::apply(const MeetingEvent& event) {
 
         case EventKind::MessageDirectSent:
             return reject(ApplyError::InvalidTransition);
+
+        case EventKind::DiscussionConfigured:
+        case EventKind::DiscussionModeChanged:
+        case EventKind::AgendaItemChanged:
+            if (phase_ != MeetingPhase::Live) {
+                return reject(ApplyError::InvalidTransition);
+            }
+            if (event.actor_id != "user.direct_host" &&
+                (!runtime_owner_id_.has_value() || event.actor_id != *runtime_owner_id_)) {
+                return reject(ApplyError::InvalidActor);
+            }
+            break;
+
+        case EventKind::FloorRequested:
+            if (phase_ != MeetingPhase::Live) {
+                return reject(ApplyError::InvalidTransition);
+            }
+            if (!is_known_role(event.actor_id)) {
+                return reject(is_role_archived(event.actor_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
+            }
+            if (!event.target_id.empty() && !is_known_role(event.target_id)) {
+                return reject(is_role_archived(event.target_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
+            }
+            break;
+
+        case EventKind::FloorGranted:
+        case EventKind::FloorRejected:
+        case EventKind::DiscussionBudgetUpdated:
+            if (phase_ != MeetingPhase::Live) {
+                return reject(ApplyError::InvalidTransition);
+            }
+            if (event.actor_id != "user.direct_host" &&
+                (!runtime_owner_id_.has_value() || event.actor_id != *runtime_owner_id_)) {
+                return reject(ApplyError::InvalidActor);
+            }
+            if (!event.target_id.empty() && !is_known_role(event.target_id)) {
+                return reject(is_role_archived(event.target_id)
+                    ? ApplyError::RoleArchived
+                    : ApplyError::UnknownRole);
+            }
+            break;
+
+        case EventKind::ConvergenceRecorded:
+            if (phase_ != MeetingPhase::Live) {
+                return reject(ApplyError::InvalidTransition);
+            }
+            if (event.actor_id != "user.direct_host" &&
+                (!runtime_owner_id_.has_value() || event.actor_id != *runtime_owner_id_) &&
+                !is_known_role(event.actor_id)) {
+                return reject(ApplyError::InvalidActor);
+            }
+            break;
 
         case EventKind::RoleRegistered:
         case EventKind::RoleTemporaryRegistered:

@@ -32,6 +32,16 @@ import type {
   SubagentRunRequest,
   SubagentRunner,
 } from "../subagent-runner.js";
+import type {
+  PublicMessagePlan,
+  PublicMessagePlanner,
+  PublicMessagePlanningRequest,
+} from "../public-message-planner.js";
+import type {
+  DiscussionObservationDecision,
+  DiscussionObservationRequest,
+  DiscussionObserver,
+} from "../discussion-observer.js";
 import { StdioRuntimeHost } from "../stdio-runtime-host.js";
 
 class FakeRuntimeAdapter implements RuntimeAdapter {
@@ -108,6 +118,52 @@ class ControlledSubagentRunner implements SubagentRunner {
       this.pending.push({ resolve, reject });
     });
   }
+}
+
+class ControlledPublicMessagePlanner implements PublicMessagePlanner {
+  readonly requests: PublicMessagePlanningRequest[] = [];
+
+  constructor(readonly outcome: PublicMessagePlan | Error) {}
+
+  async plan(request: PublicMessagePlanningRequest): Promise<PublicMessagePlan> {
+    this.requests.push(request);
+    if (this.outcome instanceof Error) {
+      throw this.outcome;
+    }
+    return structuredClone(this.outcome);
+  }
+}
+
+class ControlledDiscussionObserver implements DiscussionObserver {
+  readonly requests: DiscussionObservationRequest[] = [];
+
+  constructor(readonly decision: DiscussionObservationDecision) {}
+
+  async observe(request: DiscussionObservationRequest): Promise<DiscussionObservationDecision> {
+    this.requests.push(structuredClone(request));
+    return structuredClone(this.decision);
+  }
+}
+
+function createObservedWorkspaceAndSession(): {
+  workspace: WorkspaceProfile;
+  session: RoundtableSession;
+} {
+  const workspace = structuredClone(RESUME_WORKSPACE);
+  const riskProfile = structuredClone(workspace.roles[0]!);
+  riskProfile.roleProfileId = "role.risk";
+  riskProfile.displayName = "Risk reviewer";
+  riskProfile.description = "Find factual and process errors";
+  riskProfile.systemPrompt = "Correct factual, requirement, safety, and meeting-process errors.";
+  workspace.roles.push(riskProfile);
+  const session = structuredClone(RESUME_SESSION);
+  const riskParticipant = structuredClone(session.participants[0]!);
+  riskParticipant.participantId = "participant.risk";
+  riskParticipant.roleProfileId = "role.risk";
+  riskParticipant.displayName = "Risk reviewer";
+  riskParticipant.systemPromptSnapshot = riskProfile.systemPrompt;
+  session.participants.push(riskParticipant);
+  return { workspace, session };
 }
 
 function command(
@@ -212,7 +268,10 @@ const RESUME_SESSION = structuredClone(TEST_SESSION);
 RESUME_SESSION.phase = "live";
 RESUME_SESSION.participants[0]!.capabilitiesSnapshot.skillIds = [];
 
-function createHost(turnTimeoutMs?: number): {
+function createHost(
+  turnTimeoutMs?: number,
+  publicMessagePlanner?: PublicMessagePlanner,
+): {
   host: LocalRoundtableHost;
   adapters: Map<string, FakeRuntimeAdapter>;
 } {
@@ -223,6 +282,7 @@ function createHost(turnTimeoutMs?: number): {
     runtimeGeneration: 1,
     now: () => new Date("2026-08-01T00:00:00.000Z"),
     ...(turnTimeoutMs === undefined ? {} : { turnTimeoutMs }),
+    ...(publicMessagePlanner === undefined ? {} : { publicMessagePlanner }),
     adapterFactory: (roleId) => {
       const adapter = new FakeRuntimeAdapter(roleId);
       adapters.set(roleId, adapter);
@@ -319,7 +379,7 @@ test("runs a local meeting with long-term and temporary roles", async () => {
   assert.equal(adapters.get("role.critic")?.stopCount, 1);
 });
 
-test("broadcasts public host messages sequentially with a role-exclusive prompt and isolates direct replies", async () => {
+test("broadcasts shared and per-role assignments sequentially with a role-exclusive prompt", async () => {
   const { host, adapters } = createHost();
   const events: import("@pi-roundtable/protocol").MeetingEvent[] = [];
   host.subscribe((event) => events.push(event));
@@ -338,33 +398,44 @@ test("broadcasts public host messages sequentially with a role-exclusive prompt 
   }));
   await host.execute(command("meeting.open", "open"));
 
+  const publicMessage = [
+    "Shared requirement: give one acceptance criterion.",
+    "@Architect: identify the architecture boundary.",
+    "@Experience reviewer: inspect the interaction.",
+    "@Risk reviewer: identify the failure mode.",
+  ].join("\n");
   const broadcast = await host.execute(command("speech.broadcast", "broadcast", {
     actorId: "user.direct_host",
-    payload: { message: "Review the proposal", mentions: ["role.a", "role.b", "role.c"] },
+    payload: { message: publicMessage, mentions: ["role.a", "role.b", "role.c"] },
   }));
   assert.equal(broadcast.status, "accepted");
   assert.equal(events.at(-1)?.kind, "message.published");
   assert.equal(events.at(-1)?.visibility, "public");
   const firstPrompt = adapters.get("role.a")?.commands.at(-1);
   assert.equal(firstPrompt?.kind, "turn.prompt");
-  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /Review the proposal/);
+  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /Shared requirement: give one acceptance criterion/);
+  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /@Experience reviewer: inspect the interaction/);
   assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /Architect \(role\.a\)/);
   assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /only role answering this turn/i);
   assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /Do not draft, simulate, summarize as/);
+  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /shared requirements plus separate @role assignments/i);
+  assert.match(firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "", /only the assignment addressed to your display name/i);
 
   adapters.get("role.a")?.emit("turn.started", {}, "broadcast:1");
   adapters.get("role.a")?.emit("turn.completed", {}, "broadcast:1");
   await new Promise<void>((resolve) => setImmediate(resolve));
   const secondPrompt = adapters.get("role.b")?.commands.at(-1);
   assert.equal(secondPrompt?.kind, "turn.prompt");
-  assert.match(secondPrompt?.kind === "turn.prompt" ? secondPrompt.message : "", /Review the proposal/);
+  assert.match(secondPrompt?.kind === "turn.prompt" ? secondPrompt.message : "", /Shared requirement: give one acceptance criterion/);
+  assert.match(secondPrompt?.kind === "turn.prompt" ? secondPrompt.message : "", /@Experience reviewer: inspect the interaction/);
   assert.match(secondPrompt?.kind === "turn.prompt" ? secondPrompt.message : "", /Experience reviewer \(role\.b\)/);
   adapters.get("role.b")?.emit("turn.started", {}, "broadcast:2");
   adapters.get("role.b")?.emit("turn.completed", {}, "broadcast:2");
   await new Promise<void>((resolve) => setImmediate(resolve));
   const thirdPrompt = adapters.get("role.c")?.commands.at(-1);
   assert.equal(thirdPrompt?.kind, "turn.prompt");
-  assert.match(thirdPrompt?.kind === "turn.prompt" ? thirdPrompt.message : "", /Review the proposal/);
+  assert.match(thirdPrompt?.kind === "turn.prompt" ? thirdPrompt.message : "", /Shared requirement: give one acceptance criterion/);
+  assert.match(thirdPrompt?.kind === "turn.prompt" ? thirdPrompt.message : "", /@Risk reviewer: identify the failure mode/);
   assert.match(thirdPrompt?.kind === "turn.prompt" ? thirdPrompt.message : "", /Risk reviewer \(role\.c\)/);
   adapters.get("role.c")?.emit("turn.started", {}, "broadcast:3");
   adapters.get("role.c")?.emit("turn.completed", {}, "broadcast:3");
@@ -387,6 +458,104 @@ test("broadcasts public host messages sequentially with a role-exclusive prompt 
   assert.equal(privateSpeech.length, 3);
   assert.equal(privateSpeech.every((event) => event.visibility === "private"), true);
   assert.equal(privateSpeech.every((event) => event.audience?.includes("role.a") !== true), true);
+  await host.stop();
+});
+
+test("uses an invisible semantic plan to route arbitrary-order shared, individual, and group tasks", async () => {
+  const publicMessage = [
+    "@Risk reviewer：先指出会阻塞上线的风险。",
+    "共同要求：每项建议都给出验收标准。",
+    "@Architect：在风险之后给出系统边界。",
+    "@Experience reviewer：最后检查用户是否能理解流程。",
+    "@Architect 和 @Risk reviewer：共同确认恢复路径。",
+  ].join("\n");
+  const semanticPlan: PublicMessagePlan = {
+    sharedRequirements: ["共同要求：每项建议都给出验收标准。"],
+    roleTasks: {
+      "role.a": ["@Architect：在风险之后给出系统边界。"],
+      "role.b": ["@Experience reviewer：最后检查用户是否能理解流程。"],
+      "role.c": ["@Risk reviewer：先指出会阻塞上线的风险。"],
+    },
+    groupTasks: [{
+      roleIds: ["role.a", "role.c"],
+      task: "@Architect 和 @Risk reviewer：共同确认恢复路径。",
+    }],
+    speakerOrder: ["role.c", "role.a", "role.b"],
+  };
+  const planner = new ControlledPublicMessagePlanner(semanticPlan);
+  const { host, adapters } = createHost(undefined, planner);
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+  await host.execute(command("role.add", "add-a", {
+    actorId: "role.a",
+    payload: { displayName: "Architect" },
+  }));
+  await host.execute(command("role.add", "add-b", {
+    actorId: "role.b",
+    payload: { displayName: "Experience reviewer" },
+  }));
+  await host.execute(command("role.add", "add-c", {
+    actorId: "role.c",
+    payload: { displayName: "Risk reviewer" },
+  }));
+  await host.execute(command("meeting.open", "open"));
+
+  const receipt = await host.execute(command("speech.broadcast", "semantic-broadcast", {
+    actorId: "user.direct_host",
+    payload: { message: publicMessage, mentions: ["role.a", "role.b", "role.c"] },
+  }));
+
+  assert.equal(receipt.status, "accepted");
+  assert.equal(planner.requests.length, 1);
+  assert.equal(planner.requests[0]?.message, publicMessage);
+  assert.deepEqual(
+    planner.requests[0]?.roles.map((role) => role.roleId),
+    ["role.a", "role.b", "role.c"],
+  );
+  const published = events.find((event) => event.kind === "message.published");
+  assert.deepEqual(published?.payload, {
+    message: publicMessage,
+    mentions: ["role.a", "role.b", "role.c"],
+  });
+  const firstPrompt = adapters.get("role.c")?.commands.at(-1);
+  assert.equal(firstPrompt?.kind, "turn.prompt");
+  const firstMessage = firstPrompt?.kind === "turn.prompt" ? firstPrompt.message : "";
+  const hiddenRouting = firstMessage.split("[Hidden semantic routing;")[1] ?? "";
+  assert.match(hiddenRouting, /共同要求：每项建议都给出验收标准/);
+  assert.match(hiddenRouting, /先指出会阻塞上线的风险/);
+  assert.match(hiddenRouting, /共同确认恢复路径/);
+  assert.doesNotMatch(hiddenRouting, /最后检查用户是否能理解流程/);
+
+  adapters.get("role.c")?.emit("turn.started", {}, "semantic-broadcast:1");
+  adapters.get("role.c")?.emit("turn.completed", {}, "semantic-broadcast:1");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(adapters.get("role.a")?.commands.at(-1)?.kind, "turn.prompt");
+  await host.stop();
+});
+
+test("falls back to explicit mention order when invisible semantic planning fails", async () => {
+  const planner = new ControlledPublicMessagePlanner(new Error("planner unavailable"));
+  const { host, adapters } = createHost(undefined, planner);
+  host.start();
+  await host.execute(command("role.add", "add-a", {
+    actorId: "role.a",
+    payload: { displayName: "A" },
+  }));
+  await host.execute(command("role.add", "add-b", {
+    actorId: "role.b",
+    payload: { displayName: "B" },
+  }));
+  await host.execute(command("meeting.open", "open"));
+
+  const receipt = await host.execute(command("speech.broadcast", "fallback-broadcast", {
+    actorId: "user.direct_host",
+    payload: { message: "@A 与 @B 分别检查。", mentions: ["role.b", "role.a"] },
+  }));
+
+  assert.equal(receipt.status, "accepted");
+  assert.equal(adapters.get("role.b")?.commands.at(-1)?.kind, "turn.prompt");
+  assert.equal(adapters.get("role.a")?.commands.length, 0);
   await host.stop();
 });
 
@@ -421,6 +590,283 @@ test("dispatches an explicitly mentioned public turn only to that role", async (
     mentionedPrompt?.kind === "turn.prompt" ? mentionedPrompt.message : "",
     /only role answering this turn/i,
   );
+  await host.stop();
+});
+
+test("lets an isolated role observer request a budgeted critical interruption in free discussion", async () => {
+  const { workspace, session } = createObservedWorkspaceAndSession();
+
+  const observer = new ControlledDiscussionObserver({
+    action: "interrupt",
+    kind: "critical",
+    reason: "同步服务器直接执行所有模型调用",
+    prompt: "纠正执行边界，并说明为什么模型执行应保留在本地 Runtime。",
+  });
+  const planner = new ControlledPublicMessagePlanner({
+    sharedRequirements: [],
+    roleTasks: { "participant.secretary": [] },
+    groupTasks: [],
+    speakerOrder: ["participant.secretary"],
+  });
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    publicMessagePlanner: planner,
+    discussionObserver: observer,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(workspace, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  await host.execute(command("role.add", "add-secretary", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("role.add", "add-risk", {
+    actorId: "participant.risk",
+  }));
+  await host.execute(command("meeting.open", "open-observed"));
+  await host.execute(command("discussion.configure", "configure-observed", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["Runtime ownership"],
+      limits: {
+        softTurnLimit: 8,
+        hardTurnLimit: 12,
+        softRoundLimit: 2,
+        hardRoundLimit: 3,
+        maxConsecutiveTurnsPerRole: 2,
+        maxInterruptionsPerSegment: 2,
+        maxInterruptionsPerRole: 1,
+        noProgressTurnLimit: 2,
+        maxObserverProbesPerSegment: 4,
+      },
+    },
+  }));
+  await host.execute(command("discussion.mode.set", "free-observed", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "test" },
+  }));
+  await host.execute(command("speech.broadcast", "broadcast-observed", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "请讨论模型执行边界。",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const speaker = adapters.get("participant.secretary");
+  assert.ok(speaker !== undefined);
+  const turn = speaker.commands.at(-1);
+  assert.equal(turn?.kind, "turn.prompt");
+  const correlationId = turn?.commandId;
+  assert.ok(correlationId !== undefined);
+  speaker.emit("turn.started", {}, correlationId);
+  speaker.emit("turn.delta", {
+    delta: `同步服务器直接执行所有模型调用。${"这是一段仍在继续的公开发言。".repeat(20)}`,
+  }, correlationId);
+
+  await waitFor(
+    () => events.some((event) => event.kind === "interruption.requested"),
+    "observer should request a critical interruption before the speech completes",
+  );
+
+  assert.equal(observer.requests.length, 1);
+  assert.equal(observer.requests[0]?.candidateRoleId, "participant.risk");
+  assert.equal(observer.requests[0]?.speechComplete, false);
+  const floorIndex = events.findIndex((event) => event.kind === "floor.requested");
+  const interruptionIndex = events.findIndex((event) => event.kind === "interruption.requested");
+  assert.ok(floorIndex >= 0 && interruptionIndex > floorIndex);
+  assert.equal(events[floorIndex]?.actorId, "participant.risk");
+  assert.equal(events[floorIndex]?.payload.kind, "critical");
+  assert.ok(events.some((event) =>
+    event.kind === "discussion.budget_updated" && event.payload.observerProbes === 1));
+  assert.equal(speaker.commands.at(-1)?.kind, "turn.cancel");
+  await host.stop();
+});
+
+test("runs one final observer probe when a completed speech adds no new text", async () => {
+  const { workspace, session } = createObservedWorkspaceAndSession();
+  const observer = new ControlledDiscussionObserver({ action: "none" });
+  const planner = new ControlledPublicMessagePlanner({
+    sharedRequirements: [],
+    roleTasks: { "participant.secretary": [] },
+    groupTasks: [],
+    speakerOrder: ["participant.secretary"],
+  });
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    publicMessagePlanner: planner,
+    discussionObserver: observer,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(workspace, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  await host.execute(command("role.add", "add-final-secretary", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("role.add", "add-final-risk", {
+    actorId: "participant.risk",
+  }));
+  await host.execute(command("meeting.open", "open-final-observer"));
+  await host.execute(command("discussion.configure", "configure-final-observer", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["Runtime ownership"],
+      limits: { maxObserverProbesPerSegment: 4 },
+    },
+  }));
+  await host.execute(command("discussion.mode.set", "free-final-observer", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "test" },
+  }));
+  await host.execute(command("speech.broadcast", "broadcast-final-observer", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "请讨论模型执行边界。",
+      mentions: ["participant.secretary"],
+    },
+  }));
+
+  const speaker = adapters.get("participant.secretary");
+  const turn = speaker?.commands.at(-1);
+  assert.equal(turn?.kind, "turn.prompt");
+  const correlationId = turn?.commandId;
+  assert.ok(correlationId !== undefined);
+  speaker?.emit("turn.started", {}, correlationId);
+  speaker?.emit("turn.delta", {
+    delta: "这是一段足以触发流式观察、但完成帧不会追加任何字符的公开发言。".repeat(12),
+  }, correlationId);
+  await waitFor(() => observer.requests.length === 1, "streaming observer probe should run");
+  speaker?.emit("turn.completed", {}, correlationId);
+  await waitFor(() => observer.requests.length === 2, "final observer probe should run");
+
+  assert.equal(observer.requests[0]?.speechComplete, false);
+  assert.equal(observer.requests[1]?.speechComplete, true);
+  const probeCounters = events
+    .filter((event) => event.kind === "discussion.budget_updated")
+    .map((event) => event.payload.observerProbes);
+  assert.deepEqual(probeCounters.slice(-2), [1, 2]);
+  await host.stop();
+});
+
+test("automatically converges a no-progress discussion and completes after one facilitator turn", async () => {
+  const { host, adapters } = createHost();
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+  await host.execute(command("role.add", "add-facilitator", {
+    actorId: "role.host",
+    payload: { displayName: "主持人" },
+  }));
+  await host.execute(command("role.add", "add-expert", {
+    actorId: "role.expert",
+    payload: { displayName: "专家" },
+  }));
+  await host.execute(command("meeting.open", "open-convergence"));
+  await host.execute(command("discussion.configure", "configure-convergence", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["确定边界"],
+      limits: {
+        softTurnLimit: 3,
+        hardTurnLimit: 4,
+        softRoundLimit: 2,
+        hardRoundLimit: 3,
+        maxConsecutiveTurnsPerRole: 2,
+        maxInterruptionsPerSegment: 2,
+        maxInterruptionsPerRole: 1,
+        noProgressTurnLimit: 1,
+        maxObserverProbesPerSegment: 0,
+      },
+    },
+  }));
+
+  const completeExpertTurn = async (commandId: string, output: string): Promise<void> => {
+    const receipt = await host.execute(command("speech.broadcast", commandId, {
+      actorId: "user.direct_host",
+      payload: { message: "请继续。", mentions: ["role.expert"] },
+    }));
+    assert.equal(receipt.status, "accepted");
+    const expert = adapters.get("role.expert");
+    const turn = expert?.commands.at(-1);
+    assert.equal(turn?.kind, "turn.prompt");
+    const correlationId = turn?.commandId;
+    assert.ok(correlationId !== undefined);
+    expert?.emit("turn.started", {}, correlationId);
+    expert?.emit("turn.delta", { delta: output }, correlationId);
+    expert?.emit("turn.completed", {}, correlationId);
+    await waitFor(
+      () => events.some((event) =>
+        event.kind === "discussion.budget_updated" && event.causationId === correlationId),
+      "discussion budget should be updated after a public turn",
+    );
+  };
+
+  await completeExpertTurn("round-one", "我暂时没有新增结论。");
+  assert.equal(events.some((event) =>
+    event.kind === "discussion.mode_changed" && event.payload.mode === "free_discussion"), false);
+  assert.equal((await host.execute(command("agenda.advance", "advance-agenda", {
+    actorId: "user.direct_host",
+    payload: { reason: "host_completed_item" },
+  }))).status, "accepted");
+  await waitFor(
+    () => events.some((event) =>
+      event.kind === "discussion.mode_changed" && event.payload.mode === "free_discussion"),
+    "the host should explicitly advance the single agenda item into free discussion",
+  );
+  await completeExpertTurn("round-two", "我仍然没有新增结论。");
+  await waitFor(
+    () => events.some((event) =>
+      event.kind === "discussion.mode_changed" && event.payload.mode === "convergence"),
+    "the configured free-discussion no-progress limit should trigger convergence",
+  );
+
+  const facilitator = adapters.get("role.host");
+  await waitFor(
+    () => facilitator?.commands.at(-1)?.kind === "turn.prompt",
+    "the facilitator should receive one automatic convergence turn",
+  );
+  const convergenceTurn = facilitator?.commands.at(-1);
+  assert.match(
+    convergenceTurn?.kind === "turn.prompt" ? convergenceTurn.message : "",
+    /已有决策、未解决异议/,
+  );
+  const convergenceCorrelationId = convergenceTurn?.commandId;
+  assert.ok(convergenceCorrelationId !== undefined);
+  facilitator?.emit("turn.started", {}, convergenceCorrelationId);
+  facilitator?.emit("turn.delta", { delta: "决策：停止重复讨论并记录当前边界。" }, convergenceCorrelationId);
+  facilitator?.emit("turn.completed", {}, convergenceCorrelationId);
+  await waitFor(
+    () => events.some((event) =>
+      event.kind === "discussion.mode_changed" && event.payload.mode === "completed"),
+    "one convergence turn should complete the bounded discussion",
+  );
+
+  assert.ok(events.some((event) =>
+    event.kind === "convergence.recorded" && event.payload.complete === true));
+  assert.equal(events.filter((event) =>
+    event.kind === "floor.requested" && event.payload.automatic === true).length, 1);
   await host.stop();
 });
 
@@ -704,10 +1150,10 @@ test("accepts dynamic temporary invitations only from an active long-term invite
   }
 });
 
-test("hands the floor to an interrupting role after cancellation", async () => {
+test("publishes the interruption reason and hands the floor to an interrupting role after cancellation", async () => {
   const { host, adapters } = createHost();
-  const events: string[] = [];
-  host.subscribe((event) => events.push(event.kind));
+  const events: import("@pi-roundtable/protocol").MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
   host.start();
   await host.execute(
     command("role.add", "add-a", { actorId: "role.a", payload: { displayName: "A" } }),
@@ -738,7 +1184,11 @@ test("hands the floor to an interrupting role after cancellation", async () => {
   const handoff = adapters.get("role.b")?.commands.at(-1);
   assert.equal(handoff?.kind, "turn.prompt");
   assert.equal(handoff?.commandId, "interrupt-b");
-  assert.deepEqual(events.slice(-2), ["interruption.requested", "speech.cancelled"]);
+  assert.deepEqual(events.slice(-2).map((event) => event.kind), ["interruption.requested", "speech.cancelled"]);
+  const interruption = events.find((event) => event.kind === "interruption.requested");
+  assert.equal(interruption?.actorId, "role.b");
+  assert.equal(interruption?.targetId, "role.a");
+  assert.equal(interruption?.payload.message, "B takes the floor");
   await host.stop();
 });
 
@@ -1521,10 +1971,90 @@ test("local host parser requires recovery sequence and explicit shutdown mode", 
   );
 });
 
+test("local host parser carries a complete discussion snapshot across Windows recovery", () => {
+  const discussionState = {
+    configured: true,
+    mode: "paused",
+    resumeMode: "free_discussion",
+    agendaItems: [{ agendaItemId: "agenda.1", title: "恢复议题", status: "completed" }],
+    participantCount: 2,
+    limits: {
+      softTurnLimit: 8,
+      hardTurnLimit: 12,
+      softRoundLimit: 2,
+      hardRoundLimit: 3,
+      maxConsecutiveTurnsPerRole: 2,
+      maxInterruptionsPerSegment: 2,
+      maxInterruptionsPerRole: 1,
+      noProgressTurnLimit: 2,
+      maxObserverProbesPerSegment: 12,
+    },
+    counters: {
+      publicTurns: 4,
+      rounds: 2,
+      noProgressTurns: 2,
+      interruptions: 1,
+      observerProbes: 3,
+      consecutiveRoleId: "participant.risk",
+      consecutiveTurns: 1,
+      interruptionsByRole: { "participant.risk": 1 },
+    },
+    pendingRequests: [{
+      requestId: "request.restore",
+      roleId: "participant.risk",
+      kind: "reply",
+      reason: "恢复后继续回应",
+      prompt: "继续说明未解决风险。",
+      requestedAtSequence: 19,
+      respondsToRoleId: "participant.secretary",
+    }],
+    pauseReason: "hard_limit",
+  } as const;
+  const frame = parseLocalHostInput(JSON.stringify({
+    type: "initialize",
+    requestId: "restore-discussion",
+    workspace: RESUME_WORKSPACE,
+    session: RESUME_SESSION,
+    credentials: { "memory://provider.test": "memory-only" },
+    initialSequence: 20,
+    discussionState,
+  }));
+
+  assert.equal(frame.type, "initialize");
+  assert.deepEqual(frame.type === "initialize" ? frame.discussionState : undefined, discussionState);
+  assert.throws(
+    () => parseLocalHostInput(JSON.stringify({
+      type: "initialize",
+      requestId: "invalid-discussion",
+      workspace: RESUME_WORKSPACE,
+      session: RESUME_SESSION,
+      credentials: {},
+      initialSequence: 20,
+      discussionState: [],
+    })),
+    (error: unknown) => error instanceof LocalHostProtocolError && error.code === "invalid_frame",
+  );
+});
+
 test("local host parser rejects oversized frames", () => {
   assert.throws(
     () => parseLocalHostInput("x".repeat(MAX_LOCAL_HOST_LINE_BYTES + 1)),
     (error: unknown) =>
       error instanceof LocalHostProtocolError && error.code === "frame_too_large",
+  );
+});
+
+test("local host parser validates untrusted commands against protocol v1", () => {
+  assert.throws(
+    () => parseLocalHostInput(JSON.stringify({
+      type: "command",
+      command: {
+        ...command("meeting.open", "invalid-generation"),
+        runtimeGeneration: 0,
+        unexpected: true,
+      },
+    })),
+    (error: unknown) =>
+      error instanceof LocalHostProtocolError && error.code === "invalid_command",
   );
 });

@@ -6,6 +6,7 @@ import {
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type AgentSessionEvent,
   type CreateAgentSessionOptions,
   type PromptOptions,
@@ -13,7 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Credential, type CredentialInfo, type CredentialStore } from "@earendil-works/pi-ai";
 
-import type { ApiFamily, ModelCapability } from "@pi-roundtable/protocol";
+import type { ApiFamily, ModelCapability, ThinkingLevel } from "@pi-roundtable/protocol";
 
 import type {
   RuntimeAdapter,
@@ -28,6 +29,10 @@ import {
   type McpToolApprovalRequest,
   type ResolvedMcpServerRuntimeConfiguration,
 } from "./mcp-client-manager.js";
+import {
+  createProviderTransport,
+  type ProviderTransport,
+} from "./provider-transport.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
@@ -55,6 +60,12 @@ export interface PiSessionCreateOptions {
   modelCapabilities: readonly ModelCapability[];
   contextWindow?: number;
   maxOutputTokens?: number;
+  thinkingLevel?: ThinkingLevel;
+  /**
+   * Provider transport owned by the local host. Supplying it explicitly keeps
+   * Pi/OpenAI-compatible SDKs on Node's proxy-aware global fetch path.
+   */
+  providerFetch?: typeof globalThis.fetch;
   cwd: string;
   agentDir?: string;
   sessionId: string;
@@ -82,6 +93,7 @@ export interface PiRuntimeAdapterOptions {
   modelCapabilities?: readonly ModelCapability[];
   contextWindow?: number;
   maxOutputTokens?: number;
+  thinkingLevel?: ThinkingLevel;
   credentialProvider: RuntimeCredentialProvider;
   runtimeId?: string;
   sessionId?: string;
@@ -91,6 +103,8 @@ export interface PiRuntimeAdapterOptions {
   systemPrompt?: string;
   skillPaths?: readonly string[];
   mcpServers?: readonly ResolvedMcpServerRuntimeConfiguration[];
+  /** Internal, host-defined tools; never populated from meeting message content. */
+  customTools?: readonly ToolDefinition[];
   subagentSpawner?: (task: string) => Promise<string>;
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
@@ -162,6 +176,7 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       );
     }
     let modelRuntime: ModelRuntime;
+    let providerTransport: ProviderTransport | undefined;
     try {
       modelRuntime = await ModelRuntime.create({
         credentials: new MemoryCredentialStore(),
@@ -257,16 +272,24 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         throw toStageError("mcp_connect_failed", error);
       }
       const customTools = [...mcpTools, ...(options.customTools ?? [])];
+      const settingsManager = createIsolatedSettingsManager(options.thinkingLevel ?? "off");
       const createOptions: CreateAgentSessionOptions = {
         cwd: options.cwd,
         modelRuntime,
         model,
+        thinkingLevel: options.thinkingLevel ?? "off",
         customTools,
+        settingsManager,
         sessionManager: SessionManager.inMemory(options.cwd, { id: options.sessionId }),
         resourceLoader: new DefaultResourceLoader({
           cwd: options.cwd,
           agentDir: options.agentDir ?? getAgentDir(),
+          settingsManager,
+          noExtensions: true,
           noSkills: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          noContextFiles: true,
           additionalSkillPaths: [...options.skillPaths],
           systemPromptOverride: () => options.systemPrompt,
         }),
@@ -281,12 +304,24 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         createOptions.tools = toolNames;
       }
 
+      const activeProviderTransport = createProviderTransport({
+        ...(options.providerFetch === undefined
+          ? {}
+          : { providerFetch: options.providerFetch }),
+      });
+      providerTransport = activeProviderTransport;
       let session;
       try {
         ({ session } = await createAgentSession(createOptions));
       } catch (error) {
         throw toStageError("session_create_failed", error);
       }
+      const piStreamFunction = session.agent.streamFunction;
+      session.agent.streamFunction = (streamModel, context, streamOptions) =>
+        piStreamFunction(streamModel, context, {
+          ...streamOptions,
+          fetch: activeProviderTransport.fetch,
+        });
       return {
         sessionId: session.sessionId,
         get isStreaming() {
@@ -300,14 +335,14 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         abort: () => session.abort(),
         dispose: async () => {
           try {
-            session.dispose();
+            await session.dispose();
           } finally {
-            await mcpManager.close();
+            await Promise.all([mcpManager.close(), activeProviderTransport.close()]);
           }
         },
       };
     } catch (error) {
-      await mcpManager.close();
+      await Promise.all([mcpManager.close(), providerTransport?.close()]);
       throw error;
     }
   },
@@ -576,6 +611,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         ...(this.#options.maxOutputTokens === undefined
           ? {}
           : { maxOutputTokens: this.#options.maxOutputTokens }),
+        ...(this.#options.thinkingLevel === undefined
+          ? {}
+          : { thinkingLevel: this.#options.thinkingLevel }),
         cwd: this.#options.cwd ?? process.cwd(),
         sessionId: this.#sessionId,
         tools: [...(this.#options.tools ?? [])],
@@ -584,9 +622,12 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         skillPaths: [...(this.#options.skillPaths ?? [])],
         mcpServers: [...(this.#options.mcpServers ?? [])],
         approvalHandler: (request) => this.#requestToolApproval(request),
-        customTools: this.#options.subagentSpawner === undefined
-          ? []
-          : [this.#createSubagentTool(this.#options.subagentSpawner)],
+        customTools: [
+          ...(this.#options.customTools ?? []),
+          ...(this.#options.subagentSpawner === undefined
+            ? []
+            : [this.#createSubagentTool(this.#options.subagentSpawner)]),
+        ],
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;
@@ -792,7 +833,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
           if (update.reason === "aborted") {
             this.#markTurnCancelled();
           } else {
-            this.#markTurnFailed("pi_response_error", "Pi provider response failed");
+            const failure = classifyPiRetryFailure(update.error.errorMessage);
+            this.#markTurnFailed(failure.code, failure.message);
           }
         }
         break;
@@ -847,11 +889,22 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         break;
       case "auto_retry_end":
         if (!event.success) {
+          const classified = classifyPiRetryFailure(event.finalError);
+          const failure = classified.code === "pi_response_error" &&
+              this.#turnFailureErrorCode !== undefined &&
+              this.#turnFailureErrorCode !== "pi_response_error"
+            ? providerFailureForCode(this.#turnFailureErrorCode)
+            : classified.code === "pi_response_error"
+              ? {
+                  code: "pi_retry_exhausted",
+                  message: "Pi automatic retry was exhausted",
+                }
+              : classified;
           this.#turnFailed = true;
-          this.#turnFailureErrorCode = "pi_retry_exhausted";
+          this.#turnFailureErrorCode = failure.code;
           this.#emit("runtime.failed", {
-            errorCode: "pi_retry_exhausted",
-            message: "Pi automatic retry was exhausted",
+            errorCode: failure.code,
+            message: failure.message,
           }, this.#activeTurnCommandId);
         }
         break;
@@ -864,14 +917,21 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     if (typeof message !== "object" || message === null) {
       return;
     }
-    const finalMessage = message as { role?: unknown; stopReason?: unknown };
+    const finalMessage = message as {
+      role?: unknown;
+      stopReason?: unknown;
+      errorMessage?: unknown;
+    };
     if (finalMessage.role !== "assistant") {
       return;
     }
     if (finalMessage.stopReason === "aborted") {
       this.#markTurnCancelled();
     } else if (finalMessage.stopReason === "error") {
-      this.#markTurnFailed("pi_response_error", "Pi provider response failed");
+      const failure = classifyPiRetryFailure(
+        typeof finalMessage.errorMessage === "string" ? finalMessage.errorMessage : undefined,
+      );
+      this.#markTurnFailed(failure.code, failure.message);
     }
   }
 
@@ -1001,6 +1061,94 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
     this.#commandResults.set(result.commandId, { fingerprint, result });
     return result;
+  }
+}
+
+function createIsolatedSettingsManager(thinkingLevel: ThinkingLevel): SettingsManager {
+  // The frozen participant manifest is authoritative. Loading ~/.pi settings
+  // would let unrelated CLI defaults, extensions, and timeouts alter a live
+  // Windows-owned meeting after its configuration has been accepted.
+  return SettingsManager.inMemory({
+    defaultThinkingLevel: thinkingLevel,
+    httpIdleTimeoutMs: 90_000,
+    websocketConnectTimeoutMs: 15_000,
+    retry: {
+      enabled: true,
+      maxRetries: 1,
+      baseDelayMs: 500,
+      provider: {
+        timeoutMs: 90_000,
+        maxRetries: 1,
+        maxRetryDelayMs: 2_000,
+      },
+    },
+    compaction: { enabled: false },
+    packages: [],
+    extensions: [],
+    skills: [],
+    prompts: [],
+    themes: [],
+  }, { projectTrusted: false });
+}
+
+function classifyPiRetryFailure(finalError: string | undefined): {
+  code: string;
+  message: string;
+} {
+  const normalized = (finalError ?? "").toLowerCase();
+  if (/\b(401|403)\b|unauthori[sz]ed|authentication|invalid api[-_ ]?key/.test(normalized)) {
+    return {
+      code: "pi_provider_auth_failed",
+      message: "The provider rejected the runtime credential",
+    };
+  }
+  if (/\b(402|429)\b|rate.?limit|quota|insufficient.?balance|billing/.test(normalized)) {
+    return {
+      code: "pi_provider_capacity_limited",
+      message: "The provider rejected the request because of quota, balance, or rate limits",
+    };
+  }
+  if (/\b404\b|model[^\r\n]*(not.?found|does.?not.?exist|unavailable)/.test(normalized)) {
+    return {
+      code: "pi_provider_model_unavailable",
+      message: "The provider does not expose the configured model",
+    };
+  }
+  if (/\b400\b|invalid.?request|unsupported|max[_ -]?(completion[_ -]?)?tokens/.test(normalized)) {
+    return {
+      code: "pi_provider_request_incompatible",
+      message: "The provider rejected the Pi compatibility request",
+    };
+  }
+  if (/connection|fetch failed|econn|enotfound|etimedout|network|socket|tls|certificate/.test(normalized)) {
+    return {
+      code: "pi_provider_network_failed",
+      message: "The provider request failed at the network layer",
+    };
+  }
+  return {
+    code: "pi_response_error",
+    message: "Pi provider response failed",
+  };
+}
+
+function providerFailureForCode(code: string): { code: string; message: string } {
+  switch (code) {
+    case "pi_provider_auth_failed":
+      return { code, message: "The provider rejected the runtime credential" };
+    case "pi_provider_capacity_limited":
+      return {
+        code,
+        message: "The provider rejected the request because of quota, balance, or rate limits",
+      };
+    case "pi_provider_model_unavailable":
+      return { code, message: "The provider does not expose the configured model" };
+    case "pi_provider_request_incompatible":
+      return { code, message: "The provider rejected the Pi compatibility request" };
+    case "pi_provider_network_failed":
+      return { code, message: "The provider request failed at the network layer" };
+    default:
+      return { code: "pi_response_error", message: "Pi provider response failed" };
   }
 }
 

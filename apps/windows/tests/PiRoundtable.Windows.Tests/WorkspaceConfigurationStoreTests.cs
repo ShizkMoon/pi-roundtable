@@ -70,6 +70,9 @@ public sealed class WorkspaceConfigurationStoreTests
             "long_term",
             "Test prompt",
             "model.test");
+        role.FallbackModelProfileIds.Add("model.fallback");
+        role.ThinkingLevel = "low";
+        role.MaxOutputTokens = 320;
         role.SetMcpGrant("mcp.files", new[] { "write_file", "read_file" });
 
         var manifest = MainViewModel.BuildParticipantManifest(role);
@@ -78,6 +81,12 @@ public sealed class WorkspaceConfigurationStoreTests
         CollectionAssert.AreEqual(
             new[] { "read_file", "write_file" },
             manifest.CapabilitiesSnapshot.McpGrants[0].ToolAllowlist);
+        Assert.AreEqual("model.test", manifest.ModelRouteSnapshot.PrimaryModelProfileId);
+        CollectionAssert.AreEqual(
+            new[] { "model.fallback" },
+            manifest.ModelRouteSnapshot.FallbackModelProfileIds);
+        Assert.AreEqual("low", manifest.ModelRouteSnapshot.ThinkingLevel);
+        Assert.AreEqual(320, manifest.ModelRouteSnapshot.MaxOutputTokens);
     }
 
     private static WorkspaceConfiguration WorkspaceWithGrant(string toolName) => new()

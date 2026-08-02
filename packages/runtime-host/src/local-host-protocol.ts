@@ -1,11 +1,13 @@
-import type {
-  CommandReceipt,
-  MeetingCommand,
-  MeetingEvent,
-  RoundtableSession,
-  WorkspaceProfile,
+import {
+  validateMeetingCommand,
+  type CommandReceipt,
+  type MeetingCommand,
+  type MeetingEvent,
+  type RoundtableSession,
+  type WorkspaceProfile,
 } from "@pi-roundtable/protocol";
 import type { RuntimeCapabilities } from "./runtime-adapter.js";
+import type { DiscussionSchedulerSnapshot } from "./discussion-scheduler.js";
 
 export const LOCAL_HOST_PROTOCOL_VERSION = 3 as const;
 export const MAX_LOCAL_HOST_LINE_BYTES = 1_048_576;
@@ -17,6 +19,7 @@ export interface LocalHostInitializeFrame {
   session: RoundtableSession;
   credentials: Record<string, string>;
   initialSequence: number;
+  discussionState?: DiscussionSchedulerSnapshot;
 }
 
 export interface LocalHostCommandFrame {
@@ -165,6 +168,17 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
       session: value.session as unknown as RoundtableSession,
       credentials,
       initialSequence: value.initialSequence as number,
+      ...(value.discussionState === undefined
+        ? {}
+        : isRecord(value.discussionState)
+          ? { discussionState: value.discussionState as unknown as DiscussionSchedulerSnapshot }
+          : (() => {
+              throw new LocalHostProtocolError(
+                "invalid_frame",
+                "Initialize discussionState must be an object",
+                requestId,
+              );
+            })()),
     };
   }
 
@@ -176,5 +190,13 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
     );
   }
 
+  const commandIssues = validateMeetingCommand(value.command);
+  if (commandIssues.length > 0) {
+    throw new LocalHostProtocolError(
+      "invalid_command",
+      "Command frame failed protocol v1 validation",
+      typeof value.command.commandId === "string" ? value.command.commandId : null,
+    );
+  }
   return { type: "command", command: value.command as unknown as MeetingCommand };
 }

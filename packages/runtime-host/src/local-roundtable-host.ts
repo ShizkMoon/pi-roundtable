@@ -17,6 +17,10 @@ import {
   type ParticipantManifest,
   type RoundtableSession,
   type WorkspaceProfile,
+  type DiscussionMode,
+  type DiscussionProgressKind,
+  type FloorRequestKind,
+  type ThinkingLevel,
 } from "@pi-roundtable/protocol";
 
 import { PiRuntimeAdapter, PiRuntimeError } from "./pi-runtime-adapter.js";
@@ -33,6 +37,28 @@ import {
   PiSubagentRunner,
   type SubagentRunner,
 } from "./subagent-runner.js";
+import {
+  PiPublicMessagePlanner,
+  createFallbackPublicMessagePlan,
+  validatePublicMessagePlan,
+  type PublicMessagePlan,
+  type PublicMessagePlanner,
+  type PublicMessagePlanningModel,
+  type PublicMessagePlanningRole,
+} from "./public-message-planner.js";
+import {
+  FacilitatedDiscussionScheduler,
+  type DiscussionFloorRequest,
+  type DiscussionLimits,
+  type DiscussionSchedulerSnapshot,
+  type DiscussionTransition,
+} from "./discussion-scheduler.js";
+import { AsyncWorkLimiter } from "./async-work-limiter.js";
+import {
+  PiDiscussionObserver,
+  type DiscussionObservationDecision,
+  type DiscussionObserver,
+} from "./discussion-observer.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -45,6 +71,9 @@ export interface LocalRoundtableHostOptions {
   turnTimeoutMs?: number;
   adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
   subagentRunner?: SubagentRunner;
+  publicMessagePlanner?: PublicMessagePlanner;
+  discussionScheduler?: FacilitatedDiscussionScheduler;
+  discussionObserver?: DiscussionObserver;
 }
 
 export interface ResolvedRoleRuntimeConfiguration {
@@ -58,6 +87,7 @@ export interface ResolvedRoleRuntimeConfiguration {
   modelCapabilities: ModelCapability[];
   contextWindow?: number;
   maxOutputTokens?: number;
+  thinkingLevel?: ThinkingLevel;
   apiKey: string;
   systemPrompt: string;
   skillPaths: string[];
@@ -92,15 +122,26 @@ interface ExpectedTurn {
 interface PendingPublicTurn {
   roleId: string;
   commandId: string;
+  semanticInstruction?: string;
+  floorRequestId?: string;
+  requestKind?: FloorRequestKind;
+  requestReason?: string;
 }
 
 interface PublicHostMessage {
   message: string;
   mentions: string[];
+  speakerRoleId?: string;
+  speakerDisplayName?: string;
 }
 
 interface ActiveSubagentRun {
   parentRoleId: string;
+  controller: AbortController;
+  completion: Promise<void>;
+}
+
+interface ActiveDiscussionObservation {
   controller: AbortController;
   completion: Promise<void>;
 }
@@ -115,6 +156,11 @@ interface PendingSubagentContinuation {
 
 const SUBAGENT_CONTINUATION_BUSY_RETRY_DELAY_MS = 25;
 const SUBAGENT_CONTINUATION_BUSY_RETRY_LIMIT = 40;
+const MIN_OBSERVER_TEXT_LENGTH = 240;
+const OBSERVER_TEXT_INTERVAL = 800;
+const MAX_OBSERVER_MEETING_CONTEXT = 8_192;
+const MAX_CONCURRENT_DISCUSSION_OBSERVERS = 3;
+const MAX_REMEMBERED_OBSERVATION_IDS = 1_024;
 
 interface RememberedReceipt {
   fingerprint: string;
@@ -145,7 +191,15 @@ export class LocalRoundtableHost {
   readonly #publicMessages: PublicHostMessage[] = [];
   readonly #rolePublicCursors = new Map<string, number>();
   readonly #subagentRunner: SubagentRunner;
+  readonly #publicMessagePlanner: PublicMessagePlanner;
+  readonly #discussionScheduler: FacilitatedDiscussionScheduler;
+  readonly #discussionObserver: DiscussionObserver;
+  readonly #discussionObserverLimiter = new AsyncWorkLimiter(MAX_CONCURRENT_DISCUSSION_OBSERVERS);
   readonly #subagentRuns = new Map<string, ActiveSubagentRun>();
+  readonly #discussionObservations = new Map<string, ActiveDiscussionObservation>();
+  readonly #scheduledDiscussionObservationIds = new Set<string>();
+  readonly #acceptedObserverFloorRequests = new Set<string>();
+  readonly #lastObservedLengths = new Map<string, number>();
   readonly #pendingSubagentContinuations: PendingSubagentContinuation[] = [];
   readonly #turnTimeouts = new Map<string, ActiveTurnTimeout>();
   readonly #timedOutTurnCommands = new Set<string>();
@@ -156,6 +210,7 @@ export class LocalRoundtableHost {
   #activeRoleId: string | undefined;
   #activeTurnCorrelationId: string | undefined;
   #activeTurnVisibility: "public" | "private" = "public";
+  #activePublicOutput = "";
   #pendingHandoff: PendingHandoff | undefined;
   #deferredTerminalEvents:
     | { roleId: string; events: RuntimeEvent[] }
@@ -185,6 +240,9 @@ export class LocalRoundtableHost {
     }
     this.#turnTimeoutMs = turnTimeoutMs;
     this.#subagentRunner = options.subagentRunner ?? new PiSubagentRunner();
+    this.#publicMessagePlanner = options.publicMessagePlanner ?? new PiPublicMessagePlanner();
+    this.#discussionScheduler = options.discussionScheduler ?? new FacilitatedDiscussionScheduler();
+    this.#discussionObserver = options.discussionObserver ?? new PiDiscussionObserver();
   }
 
   get meetingId(): string {
@@ -218,6 +276,7 @@ export class LocalRoundtableHost {
     session: RoundtableSession,
     credentials: Readonly<Record<string, string>>,
     initialSequence = 0,
+    discussionState?: DiscussionSchedulerSnapshot,
   ): void {
     if (this.#leaseActive || this.#stopped || this.#runtimeConfigurationInitialized) {
       throw new Error("Runtime configuration is already initialized");
@@ -236,6 +295,9 @@ export class LocalRoundtableHost {
     this.#workspace = structuredClone(workspace);
     this.#session = structuredClone(session);
     this.#credentials = new Map(Object.entries(credentials));
+    if (discussionState !== undefined) {
+      this.#discussionScheduler.restore(discussionState);
+    }
     this.#runtimeConfigurationInitialized = true;
   }
 
@@ -346,8 +408,15 @@ export class LocalRoundtableHost {
     for (const run of subagentRuns) {
       run.controller.abort();
     }
+    const discussionObservations = [...this.#discussionObservations.values()];
+    for (const observation of discussionObservations) {
+      observation.controller.abort();
+    }
     await Promise.allSettled(subagentRuns.map((run) => run.completion));
+    await Promise.allSettled(discussionObservations.map((run) => run.completion));
     this.#subagentRuns.clear();
+    this.#discussionObservations.clear();
+    this.#lastObservedLengths.clear();
     const roles = [...this.#roles.values()];
     this.#roles.clear();
     await Promise.all(
@@ -479,6 +548,30 @@ export class LocalRoundtableHost {
           "unsupported_command",
           "Tools and subagents require an explicit capability policy",
         );
+
+      case "discussion.configure":
+        return this.#configureDiscussion(command);
+
+      case "discussion.mode.set":
+        return this.#setDiscussionMode(command);
+
+      case "discussion.resume":
+        return this.#resumeDiscussion(command);
+
+      case "agenda.advance":
+        return this.#advanceAgenda(command);
+
+      case "floor.request":
+        return this.#requestFloor(command);
+
+      case "floor.grant":
+        return this.#grantFloor(command);
+
+      case "floor.reject":
+        return this.#rejectFloor(command);
+
+      case "convergence.record":
+        return this.#recordConvergence(command);
     }
   }
 
@@ -594,6 +687,9 @@ export class LocalRoundtableHost {
           ...(configuration.maxOutputTokens === undefined
             ? {}
             : { maxOutputTokens: configuration.maxOutputTokens }),
+          ...(configuration.thinkingLevel === undefined
+            ? {}
+            : { thinkingLevel: configuration.thinkingLevel }),
           apiKey: configuration.apiKey,
           cwd: this.#options.cwd ?? process.cwd(),
           systemPrompt: configuration.systemPrompt,
@@ -781,10 +877,306 @@ export class LocalRoundtableHost {
       this.#diagnose("role_stop_failed", "The role runtime did not stop cleanly");
     }
     this.#roles.delete(roleId);
+    for (const request of this.#discussionScheduler.removeRole(roleId)) {
+      this.#emit("floor.rejected", this.#runtimeId, roleId, command.commandId, {
+        requestId: request.requestId,
+        reason: archive ? "role_archived" : "role_removed",
+      });
+    }
     this.#emit(archive ? "role.archived" : "role.left", roleId, null, command.commandId, {
       displayName: role.displayName,
       scope: role.scope,
     });
+    return this.#accepted(command);
+  }
+
+  async #configureDiscussion(command: MeetingCommand): Promise<CommandReceipt> {
+    if (
+      this.#phase !== "live" ||
+      command.actorId !== "user.direct_host" ||
+      this.#activeRoleId !== undefined ||
+      this.#pendingPublicTurns.length > 0
+    ) {
+      return this.#invalidTransition(command);
+    }
+    const agendaItems = this.#readStringArray(command.payload, "agendaItems");
+    const limits = this.#readDiscussionLimits(command.payload);
+    if (agendaItems === undefined || limits === undefined) {
+      return this.#receipt(
+        command,
+        "rejected",
+        "invalid_discussion_configuration",
+        "Discussion configuration requires bounded agenda items and limits",
+      );
+    }
+    let snapshot: DiscussionSchedulerSnapshot;
+    try {
+      snapshot = this.#discussionScheduler.configure(
+        agendaItems,
+        Math.max(1, this.#roles.size),
+        limits,
+      );
+    } catch {
+      return this.#receipt(
+        command,
+        "rejected",
+        "invalid_discussion_configuration",
+        "Discussion limits or agenda items are invalid",
+      );
+    }
+    this.#emit(
+      "discussion.configured",
+      "user.direct_host",
+      null,
+      command.commandId,
+      this.#discussionSnapshotPayload(snapshot),
+    );
+    const activeItem = snapshot.agendaItems.find((item) => item.status === "active");
+    if (activeItem !== undefined) {
+      this.#emit("agenda.item_changed", "user.direct_host", null, command.commandId, {
+        agendaItemId: activeItem.agendaItemId,
+        title: activeItem.title,
+        status: "active",
+        reason: "discussion_configured",
+      });
+    }
+    return this.#accepted(command);
+  }
+
+  async #setDiscussionMode(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    const mode = this.#readString(command.payload, "mode");
+    const reason = this.#readString(command.payload, "reason")?.trim() || "host_control";
+    if (!this.#isDiscussionMode(mode)) {
+      return this.#receipt(command, "rejected", "invalid_discussion_mode", "Discussion mode is invalid");
+    }
+    let transition: DiscussionTransition | undefined;
+    try {
+      transition = this.#discussionScheduler.setMode(mode, reason);
+    } catch {
+      return this.#receipt(command, "rejected", "invalid_transition", "Discussion mode cannot change now");
+    }
+    if (transition !== undefined) {
+      this.#emitDiscussionTransition(transition, command.commandId, "user.direct_host");
+      if (transition.mode === "convergence") {
+        this.#queueConvergenceTurn(command.commandId);
+      }
+      if (transition.mode !== "paused" && transition.mode !== "completed") {
+        await this.#startNextPublicTurn();
+      }
+    }
+    return this.#accepted(command);
+  }
+
+  async #resumeDiscussion(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    const transition = this.#discussionScheduler.resume(
+      this.#readString(command.payload, "reason")?.trim() || "host_resume",
+    );
+    if (transition === undefined) {
+      return this.#receipt(command, "rejected", "invalid_transition", "Discussion is not paused");
+    }
+    this.#emitDiscussionTransition(transition, command.commandId, "user.direct_host");
+    await this.#startNextPublicTurn();
+    return this.#accepted(command);
+  }
+
+  async #advanceAgenda(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    try {
+      const result = this.#discussionScheduler.advanceAgenda(
+        this.#readString(command.payload, "reason")?.trim() || "host_advanced",
+      );
+      if (result.completed !== undefined) {
+        this.#emit("agenda.item_changed", "user.direct_host", null, command.commandId, {
+          agendaItemId: result.completed.agendaItemId,
+          title: result.completed.title,
+          status: "completed",
+          reason: result.reason,
+        });
+      }
+      if (result.active !== undefined) {
+        this.#emit("agenda.item_changed", "user.direct_host", null, command.commandId, {
+          agendaItemId: result.active.agendaItemId,
+          title: result.active.title,
+          status: "active",
+          reason: result.reason,
+        });
+      }
+      if (result.transition !== undefined) {
+        this.#emitDiscussionTransition(result.transition, command.commandId, "user.direct_host");
+      }
+    } catch {
+      return this.#receipt(command, "rejected", "invalid_transition", "Agenda cannot advance now");
+    }
+    return this.#accepted(command);
+  }
+
+  async #requestFloor(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live") {
+      return this.#invalidTransition(command);
+    }
+    const roleId = command.actorId === "user.direct_host" ? command.targetId : command.actorId;
+    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const kindText = this.#readString(command.payload, "kind") ?? "normal";
+    const reason = this.#readString(command.payload, "reason")?.trim();
+    const prompt = this.#readString(command.payload, "message")?.trim() ?? reason;
+    if (
+      roleId === undefined ||
+      roleId === null ||
+      role === undefined ||
+      !this.#isFloorRequestKind(kindText) ||
+      reason === undefined ||
+      reason.length === 0 ||
+      prompt === undefined ||
+      prompt.length === 0
+    ) {
+      return this.#receipt(
+        command,
+        "rejected",
+        "invalid_floor_request",
+        "A floor request requires a known role, kind, reason, and prompt",
+      );
+    }
+    const result = this.#discussionScheduler.requestFloor({
+      requestId: command.commandId,
+      roleId,
+      kind: kindText,
+      reason,
+      prompt,
+      requestedAtSequence: this.#sequence + 1,
+      ...(command.targetId === undefined || command.targetId === null || command.targetId === roleId
+        ? {}
+        : { respondsToRoleId: command.targetId }),
+      ...(this.#discussionScheduler.activeAgendaItemId === undefined
+        ? {}
+        : { agendaItemId: this.#discussionScheduler.activeAgendaItemId }),
+    });
+    if (!result.accepted || result.request === undefined) {
+      return this.#receipt(
+        command,
+        "rejected",
+        result.errorCode ?? "floor_request_rejected",
+        "The floor request could not be queued",
+      );
+    }
+    this.#emit("floor.requested", roleId, this.#activeRoleId ?? null, command.commandId, {
+      requestId: result.request.requestId,
+      kind: result.request.kind,
+      reason: result.request.reason,
+      prompt: result.request.prompt,
+      requestedAtSequence: result.request.requestedAtSequence,
+      respondsToRoleId: result.request.respondsToRoleId ?? null,
+      agendaItemId: result.request.agendaItemId ?? null,
+      downgradedFromCritical: result.downgradedFromCritical,
+    });
+    if (
+      result.request.kind === "critical" &&
+      this.#activeRoleId !== undefined &&
+      this.#activeRoleId !== roleId &&
+      this.#discussionScheduler.acceptInterruption(roleId)
+    ) {
+      this.#discussionScheduler.rejectFloor(result.request.requestId);
+      this.#emit("floor.granted", this.#runtimeId, roleId, command.commandId, {
+        requestId: result.request.requestId,
+        kind: result.request.kind,
+        reason: result.request.reason,
+        mode: this.#discussionScheduler.mode,
+        agendaItemId: result.request.agendaItemId ?? null,
+        interrupting: true,
+      });
+      const interruptionCommand: MeetingCommand = {
+        ...command,
+        kind: "speech.interrupt",
+        actorId: roleId,
+        targetId: this.#activeRoleId,
+        payload: {
+          message: prompt,
+          severity: "critical",
+          reason,
+          budgetReserved: true,
+        },
+      };
+      return this.#interrupt(interruptionCommand);
+    }
+    if (this.#activeRoleId === undefined && this.#pendingPublicTurns.length === 0) {
+      await this.#startNextPublicTurn();
+    }
+    return this.#accepted(command);
+  }
+
+  async #grantFloor(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    const requestId = this.#readString(command.payload, "requestId")?.trim();
+    if (!requestId) {
+      return this.#receipt(command, "rejected", "invalid_floor_request", "requestId is required");
+    }
+    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roles.keys()), requestId);
+    if (request === undefined) {
+      return this.#receipt(command, "rejected", "unknown_floor_request", "Floor request is unavailable");
+    }
+    this.#queueFloorRequest(request, command.commandId);
+    await this.#startNextPublicTurn();
+    return this.#accepted(command);
+  }
+
+  async #rejectFloor(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
+      return this.#invalidTransition(command);
+    }
+    const requestId = this.#readString(command.payload, "requestId")?.trim();
+    const request = requestId === undefined
+      ? undefined
+      : this.#discussionScheduler.rejectFloor(requestId);
+    if (request === undefined) {
+      return this.#receipt(command, "rejected", "unknown_floor_request", "Floor request is unavailable");
+    }
+    this.#emit("floor.rejected", "user.direct_host", request.roleId, command.commandId, {
+      requestId: request.requestId,
+      reason: this.#readString(command.payload, "reason")?.trim() || "host_rejected",
+    });
+    return this.#accepted(command);
+  }
+
+  async #recordConvergence(command: MeetingCommand): Promise<CommandReceipt> {
+    if (
+      this.#phase !== "live" ||
+      (command.actorId !== "user.direct_host" &&
+        (command.actorId === undefined || command.actorId === null || !this.#roles.has(command.actorId)))
+    ) {
+      return this.#invalidTransition(command);
+    }
+    const decisions = this.#readStringArray(command.payload, "decisions");
+    const objections = this.#readStringArray(command.payload, "objections");
+    const evidenceRequests = this.#readStringArray(command.payload, "evidenceRequests");
+    const actions = this.#readStringArray(command.payload, "actions");
+    if (
+      decisions === undefined || objections === undefined ||
+      evidenceRequests === undefined || actions === undefined
+    ) {
+      return this.#receipt(command, "rejected", "invalid_convergence_record", "Convergence record is invalid");
+    }
+    this.#emit("convergence.recorded", command.actorId ?? this.#runtimeId, null, command.commandId, {
+      decisions,
+      objections,
+      evidenceRequests,
+      actions,
+      complete: command.payload.complete === true,
+    });
+    if (command.payload.complete === true) {
+      const transition = this.#discussionScheduler.setMode("completed", "convergence_recorded");
+      if (transition !== undefined) {
+        this.#emitDiscussionTransition(transition, command.commandId, command.actorId ?? this.#runtimeId);
+      }
+    }
     return this.#accepted(command);
   }
 
@@ -843,6 +1235,34 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "unknown_role", "A mentioned role does not exist");
     }
     const targets = mentions.length > 0 ? mentions : [...this.#roles.keys()];
+    const planningRoles = targets.map((roleId): PublicMessagePlanningRole => ({
+      roleId,
+      displayName: this.#roles.get(roleId)?.displayName ?? roleId,
+    }));
+    let plan = createFallbackPublicMessagePlan(planningRoles);
+    try {
+      const planningModel = this.#selectPublicMessagePlanningModel(targets);
+      const planned = await this.#publicMessagePlanner.plan({
+        commandId: command.commandId,
+        message,
+        roles: planningRoles,
+        ...(planningModel === undefined ? {} : { model: planningModel }),
+        cwd: this.#options.cwd ?? process.cwd(),
+      });
+      plan = validatePublicMessagePlan(planned, message, planningRoles);
+    } catch {
+      // Semantic planning is an invisible enhancement. A bounded provider,
+      // timeout, or validation failure falls back to the explicit mention set
+      // without dropping, rewriting, or exposing the user's public message.
+    }
+    if (this.#discussionScheduler.configured) {
+      const counters = this.#discussionScheduler.beginSegment();
+      this.#emit("discussion.budget_updated", this.#runtimeId, null, command.commandId, {
+        mode: this.#discussionScheduler.mode,
+        reason: "host_segment_started",
+        ...this.#discussionCountersPayload(counters),
+      });
+    }
     this.#publicMessages.push({ message, mentions });
     this.#emit(
       "message.published",
@@ -852,7 +1272,17 @@ export class LocalRoundtableHost {
       { message, mentions },
     );
     this.#pendingPublicTurns.push(
-      ...targets.map((roleId, index) => ({ roleId, commandId: `${command.commandId}:${index + 1}` })),
+      ...plan.speakerOrder.map((roleId, index) => {
+        const semanticInstruction = this.#semanticInstructionForRole(plan, roleId);
+        return {
+          roleId,
+          commandId: `${command.commandId}:${index + 1}`,
+          floorRequestId: `${command.commandId}:floor:${index + 1}`,
+          requestKind: "host" as const,
+          requestReason: "direct_host_broadcast",
+          ...(semanticInstruction === undefined ? {} : { semanticInstruction }),
+        };
+      }),
     );
     await this.#startNextPublicTurn();
     return this.#accepted(command);
@@ -908,7 +1338,13 @@ export class LocalRoundtableHost {
   }
 
   async #startNextPublicTurn(): Promise<void> {
-    if (this.#activeRoleId !== undefined || this.#phase !== "live") {
+    if (
+      this.#activeRoleId !== undefined ||
+      this.#phase !== "live" ||
+      (this.#discussionScheduler.configured &&
+        (this.#discussionScheduler.mode === "paused" ||
+          this.#discussionScheduler.mode === "completed"))
+    ) {
       return;
     }
     while (this.#pendingPublicTurns.length > 0) {
@@ -920,6 +1356,15 @@ export class LocalRoundtableHost {
       if (role === undefined) {
         continue;
       }
+      if (this.#discussionScheduler.configured) {
+        this.#emit("floor.granted", this.#runtimeId, next.roleId, next.commandId, {
+          requestId: next.floorRequestId ?? next.commandId,
+          kind: next.requestKind ?? "host",
+          reason: next.requestReason ?? "scheduled",
+          mode: this.#discussionScheduler.mode,
+          agendaItemId: this.#discussionScheduler.activeAgendaItemId ?? null,
+        });
+      }
       this.#expectedTurns.set(next.roleId, { commandId: next.commandId, visibility: "public" });
       const result = await role.adapter.execute({
         kind: "turn.prompt",
@@ -927,7 +1372,7 @@ export class LocalRoundtableHost {
         roleId: next.roleId,
        message: this.#withUnseenPublicContext(
           next.roleId,
-          this.#publicTurnInstruction(next.roleId, role),
+          this.#publicTurnInstruction(next.roleId, role, next.semanticInstruction),
         ),
         delivery: "immediate",
       });
@@ -936,7 +1381,31 @@ export class LocalRoundtableHost {
         return;
       }
       this.#expectedTurns.delete(next.roleId);
+      if (this.#discussionScheduler.configured) {
+        this.#emit("floor.rejected", this.#runtimeId, next.roleId, next.commandId, {
+          requestId: next.floorRequestId ?? next.commandId,
+          reason: "runtime_rejected",
+        });
+      }
       this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "A mentioned role could not take the public floor");
+    }
+    if (!this.#discussionScheduler.configured) {
+      return;
+    }
+    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roles.keys()));
+    if (request !== undefined) {
+      this.#queueFloorRequest(request, request.requestId);
+      await this.#startNextPublicTurn();
+      return;
+    }
+    // An empty floor queue is not evidence that an agenda item is complete.
+    // The direct host may request several passes before explicitly advancing;
+    // independent soft/hard budgets still prevent unbounded automation.
+    if (this.#discussionScheduler.mode === "convergence") {
+      this.#queueConvergenceTurn(null);
+      if (this.#pendingPublicTurns.length > 0) {
+        await this.#startNextPublicTurn();
+      }
     }
   }
 
@@ -1012,6 +1481,9 @@ export class LocalRoundtableHost {
       return instruction;
     }
     const context = unseen.map((entry) => {
+      if (entry.speakerRoleId !== undefined) {
+        return `[Public role statement from ${entry.speakerDisplayName ?? entry.speakerRoleId} (${entry.speakerRoleId})]\n${entry.message}`;
+      }
       const mentionLabel = entry.mentions.length === 0
         ? "addressed to the full roundtable"
         : `mentions: ${entry.mentions.join(", ")}`;
@@ -1020,15 +1492,440 @@ export class LocalRoundtableHost {
     return `${context}\n\n${instruction}`;
   }
 
-  #publicTurnInstruction(roleId: string, role: HostedRole): string {
+  #publicTurnInstruction(
+    roleId: string,
+    role: HostedRole,
+    semanticInstruction?: string,
+  ): string {
     return [
       "[Roundtable role boundary]",
       `You are the only role answering this turn: ${role.displayName} (${roleId}).`,
       "Answer only from this role's own perspective and responsibilities.",
       "Do not draft, simulate, summarize as, or create answer sections on behalf of any other mentioned role.",
+      "A host message may contain shared requirements plus separate @role assignments. Apply the shared requirements, then perform only the assignment addressed to your display name.",
+      "Do not perform assignments addressed to other roles. If the message has no assignment specifically addressed to you, answer only the shared request.",
       "You may reference or disagree with statements already present in the public record, but label only your own position.",
       "Respond to the latest public roundtable message. Keep private conversations private.",
+      ...this.#discussionModeInstruction(),
+      ...(semanticInstruction === undefined ? [] : ["", semanticInstruction]),
     ].join("\n");
+  }
+
+  #selectPublicMessagePlanningModel(
+    targets: readonly string[],
+  ): PublicMessagePlanningModel | undefined {
+    const candidates = ["role.host", "role.secretary", ...targets, ...this.#roles.keys()];
+    for (const roleId of new Set(candidates)) {
+      const model = this.#planningModelForRole(roleId);
+      if (model !== undefined) {
+        return model;
+      }
+    }
+    return undefined;
+  }
+
+  #planningModelForRole(roleId: string): PublicMessagePlanningModel | undefined {
+    const configuration = this.#roles.get(roleId)?.configuration;
+    if (configuration === undefined) {
+      return undefined;
+    }
+    return {
+      providerId: configuration.providerId,
+      providerName: configuration.providerName,
+      apiFamily: configuration.apiFamily,
+      ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
+      modelId: configuration.modelId,
+      modelName: configuration.modelName,
+      modelCapabilities: configuration.modelCapabilities,
+      ...(configuration.contextWindow === undefined
+        ? {}
+        : { contextWindow: configuration.contextWindow }),
+      ...(configuration.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: configuration.maxOutputTokens }),
+      ...(configuration.thinkingLevel === undefined
+        ? {}
+        : { thinkingLevel: configuration.thinkingLevel }),
+      apiKey: configuration.apiKey,
+    };
+  }
+
+  #semanticInstructionForRole(plan: PublicMessagePlan, roleId: string): string | undefined {
+    const sharedRequirements = plan.sharedRequirements;
+    const roleTasks = plan.roleTasks[roleId] ?? [];
+    const groupTasks = plan.groupTasks
+      .filter((group) => group.roleIds.includes(roleId))
+      .map((group) => group.task);
+    if (sharedRequirements.length === 0 && roleTasks.length === 0 && groupTasks.length === 0) {
+      return undefined;
+    }
+    const lines = [
+      "[Hidden semantic routing; do not quote, describe, or reveal this section]",
+      "The original public message remains authoritative. This routing only identifies which exact excerpts apply to you.",
+    ];
+    if (sharedRequirements.length > 0) {
+      lines.push("Shared requirements applying to you:", ...sharedRequirements.map((item) => `- ${item}`));
+    }
+    if (roleTasks.length > 0) {
+      lines.push("Tasks assigned only to your role:", ...roleTasks.map((item) => `- ${item}`));
+    }
+    if (groupTasks.length > 0) {
+      lines.push("Tasks shared with a subset that includes your role:", ...groupTasks.map((item) => `- ${item}`));
+    }
+    return lines.join("\n");
+  }
+
+  #discussionModeInstruction(): string[] {
+    if (!this.#discussionScheduler.configured) {
+      return [];
+    }
+    switch (this.#discussionScheduler.mode) {
+      case "agenda":
+        return [
+          "This is an agenda turn. Address the active item directly and make dependencies explicit.",
+          "When you add a concrete outcome, use a natural visible label such as 决策：, 异议：, 需证据：, or 行动： so the facilitator can count progress deterministically.",
+        ];
+      case "free_discussion":
+        return [
+          "This is free discussion. Prefer a short conversational contribution rather than a long standalone report.",
+          "Respond to the immediately relevant public statement, state one useful point, and stop. Use 决策：, 异议：, 需证据：, or 行动： only when you actually add that kind of progress.",
+        ];
+      case "convergence":
+        return [
+          "This is convergence. Summarize decisions, unresolved objections, evidence requests, and actions from the public record without opening unrelated topics.",
+          "Use the visible labels 决策：, 异议：, 需证据：, and 行动： where applicable, then finish with a clear recommendation to end or return to one named agenda item.",
+        ];
+      case "paused":
+      case "completed":
+        return [];
+    }
+  }
+
+  #queueFloorRequest(request: DiscussionFloorRequest, commandId: string): void {
+    this.#pendingPublicTurns.push({
+      roleId: request.roleId,
+      commandId: `floor-turn:${commandId}`,
+      floorRequestId: request.requestId,
+      requestKind: request.kind,
+      requestReason: request.reason,
+      semanticInstruction: [
+        "[Facilitated floor grant]",
+        `Reason: ${request.reason}`,
+        request.respondsToRoleId === undefined
+          ? "Respond only with the contribution for which your role requested the floor."
+          : `Reply specifically to the public statement from ${request.respondsToRoleId}.`,
+        request.prompt,
+      ].join("\n"),
+    });
+  }
+
+  #queueConvergenceTurn(causationId: string | null): void {
+    if (
+      this.#discussionScheduler.mode !== "convergence" ||
+      this.#discussionScheduler.pendingRequestCount > 0 ||
+      this.#pendingPublicTurns.length > 0 ||
+      this.#activeRoleId !== undefined
+    ) {
+      return;
+    }
+    const roleId = this.#selectFacilitatorRole();
+    if (roleId === undefined) {
+      const transition = this.#discussionScheduler.pause("facilitator_unavailable");
+      if (transition !== undefined) {
+        this.#emitDiscussionTransition(transition, causationId, this.#runtimeId);
+      }
+      return;
+    }
+    const requestId = `convergence:${causationId ?? this.#sequence + 1}`;
+    const result = this.#discussionScheduler.requestFloor({
+      requestId,
+      roleId,
+      kind: "facilitator",
+      reason: "automatic_convergence",
+      prompt: "收敛当前公开讨论：只列出已有决策、未解决异议、待补证据与下一步行动，并建议结束或返回一个明确议题。",
+      requestedAtSequence: this.#sequence + 1,
+      ...(this.#discussionScheduler.activeAgendaItemId === undefined
+        ? {}
+        : { agendaItemId: this.#discussionScheduler.activeAgendaItemId }),
+    });
+    if (result.accepted && result.request !== undefined) {
+      this.#emit("floor.requested", roleId, null, causationId, {
+        requestId: result.request.requestId,
+        kind: result.request.kind,
+        reason: result.request.reason,
+        prompt: result.request.prompt,
+        requestedAtSequence: result.request.requestedAtSequence,
+        respondsToRoleId: result.request.respondsToRoleId ?? null,
+        agendaItemId: result.request.agendaItemId ?? null,
+        automatic: true,
+      });
+    }
+  }
+
+  #selectFacilitatorRole(): string | undefined {
+    for (const roleId of ["role.host", "role.secretary", ...this.#roles.keys()]) {
+      if (this.#roles.has(roleId)) {
+        return roleId;
+      }
+    }
+    return undefined;
+  }
+
+  #recordDiscussionTurn(
+    roleId: string,
+    progressKinds: readonly DiscussionProgressKind[],
+    causationId: string | null,
+  ): void {
+    if (!this.#discussionScheduler.configured) {
+      return;
+    }
+    const modeBefore = this.#discussionScheduler.mode;
+    const result = this.#discussionScheduler.recordTurn(roleId, progressKinds);
+    this.#emit("discussion.budget_updated", this.#runtimeId, roleId, causationId, {
+      mode: this.#discussionScheduler.mode,
+      progressKinds: [...progressKinds],
+      ...this.#discussionCountersPayload(result.counters),
+    });
+    if (result.transition !== undefined) {
+      this.#emitDiscussionTransition(result.transition, causationId, this.#runtimeId);
+      if (result.transition.mode === "convergence") {
+        this.#queueConvergenceTurn(causationId);
+      }
+      return;
+    }
+    if (modeBefore === "convergence" && this.#discussionScheduler.mode === "convergence") {
+      this.#emit("convergence.recorded", roleId, null, causationId, {
+        progressKinds: [...progressKinds],
+        complete: true,
+        automatic: true,
+      });
+      const transition = this.#discussionScheduler.setMode("completed", "convergence_turn_completed");
+      if (transition !== undefined) {
+        this.#emitDiscussionTransition(transition, causationId, this.#runtimeId);
+      }
+    }
+  }
+
+  #emitDiscussionTransition(
+    transition: DiscussionTransition,
+    causationId: string | null,
+    actorId: string,
+  ): void {
+    this.#emit("discussion.mode_changed", actorId, null, causationId, {
+      previousMode: transition.previousMode,
+      mode: transition.mode,
+      reason: transition.reason,
+      ...this.#discussionCountersPayload(this.#discussionScheduler.snapshot().counters),
+    });
+  }
+
+  #discussionSnapshotPayload(snapshot: DiscussionSchedulerSnapshot): JsonObject {
+    return structuredClone(snapshot) as unknown as JsonObject;
+  }
+
+  #discussionCountersPayload(
+    counters: DiscussionSchedulerSnapshot["counters"],
+  ): JsonObject {
+    return structuredClone(counters) as unknown as JsonObject;
+  }
+
+  #detectStructuredProgress(output: string): DiscussionProgressKind[] {
+    const progress = new Set<DiscussionProgressKind>();
+    const lines = output.split(/\r?\n/u);
+    for (const line of lines) {
+      const normalized = line.trim().replace(/^[-*#>\s]+/u, "");
+      if (/^(?:决策|决定|结论|decision)\s*[:：]/iu.test(normalized)) {
+        progress.add("decision");
+      } else if (/^(?:异议|反对|objection)\s*[:：]/iu.test(normalized)) {
+        progress.add("objection");
+      } else if (/^(?:需证据|证据请求|待验证|evidence(?:\s+request)?)\s*[:：]/iu.test(normalized)) {
+        progress.add("evidence_request");
+      } else if (/^(?:行动|下一步|待办|action)\s*[:：]/iu.test(normalized)) {
+        progress.add("action");
+      }
+    }
+    return [...progress];
+  }
+
+  #maybeScheduleDiscussionObservers(
+    speakerRoleId: string,
+    correlationId: string | undefined,
+    observedText: string,
+    speechComplete: boolean,
+  ): void {
+    if (
+      correlationId === undefined ||
+      !this.#discussionScheduler.configured ||
+      this.#discussionScheduler.mode !== "free_discussion" ||
+      observedText.trim().length === 0
+    ) {
+      return;
+    }
+    const textLength = observedText.length;
+    const lastLength = this.#lastObservedLengths.get(correlationId) ?? 0;
+    if (
+      !speechComplete &&
+      (textLength < MIN_OBSERVER_TEXT_LENGTH ||
+        (lastLength > 0 && textLength - lastLength < OBSERVER_TEXT_INTERVAL))
+    ) {
+      return;
+    }
+    this.#lastObservedLengths.set(correlationId, textLength);
+    this.#enqueueInternal(async () => {
+      this.#launchDiscussionObservers(
+        speakerRoleId,
+        correlationId,
+        observedText,
+        speechComplete,
+      );
+    });
+  }
+
+  #launchDiscussionObservers(
+    speakerRoleId: string,
+    correlationId: string,
+    observedText: string,
+    speechComplete: boolean,
+  ): void {
+    if (
+      this.#stopped ||
+      this.#discussionScheduler.mode !== "free_discussion"
+    ) {
+      return;
+    }
+    const speakerDisplayName = this.#roles.get(speakerRoleId)?.displayName ?? speakerRoleId;
+    for (const [candidateRoleId, candidate] of this.#roles) {
+      const configuration = candidate.configuration;
+      if (candidateRoleId === speakerRoleId || configuration === undefined) {
+        continue;
+      }
+      const model = this.#planningModelForRole(candidateRoleId);
+      if (model === undefined) {
+        continue;
+      }
+      const observationId = `${correlationId}:${candidateRoleId}:${observedText.length}:${speechComplete ? "final" : "partial"}`;
+      if (this.#scheduledDiscussionObservationIds.has(observationId)) {
+        continue;
+      }
+      if (!this.#discussionScheduler.acceptObserverProbe()) {
+        break;
+      }
+      this.#rememberScheduledObservation(observationId);
+      this.#emit("discussion.budget_updated", this.#runtimeId, candidateRoleId, correlationId, {
+        mode: this.#discussionScheduler.mode,
+        observerRoleId: candidateRoleId,
+        observedSpeakerRoleId: speakerRoleId,
+        ...this.#discussionCountersPayload(this.#discussionScheduler.snapshot().counters),
+      });
+      const controller = new AbortController();
+      const completion = this.#discussionObserverLimiter.run(controller.signal, () =>
+        this.#discussionObserver.observe({
+          observationId,
+          candidateRoleId,
+          candidateDisplayName: candidate.displayName,
+          candidateInstructions: configuration.systemPrompt.slice(0, 4_096),
+          speakerRoleId,
+          speakerDisplayName,
+          observedText,
+          meetingContext: this.#discussionObserverMeetingContext(),
+          speechComplete,
+          model,
+          cwd: this.#options.cwd ?? process.cwd(),
+        }, controller.signal),
+      ).then((decision) => {
+        this.#enqueueInternal(() => this.#applyDiscussionObservation(
+          observationId,
+          correlationId,
+          candidateRoleId,
+          speakerRoleId,
+          decision,
+        ));
+      }).catch(() => undefined).finally(() => {
+        this.#discussionObservations.delete(observationId);
+      });
+      this.#discussionObservations.set(observationId, { controller, completion });
+    }
+  }
+
+  #rememberScheduledObservation(observationId: string): void {
+    this.#scheduledDiscussionObservationIds.add(observationId);
+    // Correlation ids are unique, but a long-lived meeting still needs a hard
+    // memory bound. Set insertion order gives us a deterministic FIFO trim.
+    while (this.#scheduledDiscussionObservationIds.size > MAX_REMEMBERED_OBSERVATION_IDS) {
+      const oldest = this.#scheduledDiscussionObservationIds.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#scheduledDiscussionObservationIds.delete(oldest);
+    }
+  }
+
+  #discussionObserverMeetingContext(): string {
+    const context = this.#publicMessages
+      .slice(-8)
+      .map((entry) => entry.speakerRoleId === undefined
+        ? `[Meeting host] ${entry.message}`
+        : `[${entry.speakerDisplayName ?? entry.speakerRoleId}] ${entry.message}`)
+      .join("\n\n");
+    return context.slice(-MAX_OBSERVER_MEETING_CONTEXT);
+  }
+
+  async #applyDiscussionObservation(
+    observationId: string,
+    observedCorrelationId: string,
+    candidateRoleId: string,
+    observedSpeakerRoleId: string,
+    decision: DiscussionObservationDecision,
+  ): Promise<void> {
+    const decisionKey = `${observedCorrelationId}\u0000${candidateRoleId}`;
+    if (
+      this.#stopped ||
+      this.#discussionScheduler.mode !== "free_discussion" ||
+      decision.action === "none" ||
+      decision.kind === undefined ||
+      decision.reason === undefined ||
+      decision.prompt === undefined ||
+      !this.#roles.has(candidateRoleId) ||
+      this.#activeRoleId === candidateRoleId ||
+      this.#acceptedObserverFloorRequests.has(decisionKey)
+    ) {
+      return;
+    }
+    const kind = decision.action === "interrupt" &&
+        this.#activeRoleId === observedSpeakerRoleId
+      ? "critical"
+      : decision.kind === "normal"
+        ? "normal"
+        : "reply";
+    // Streaming and terminal probes for the same speech can resolve out of
+    // order. Reserve the candidate before enqueuing so only one autonomous
+    // public contribution is accepted for that observed turn.
+    this.#acceptedObserverFloorRequests.add(decisionKey);
+    if (this.#acceptedObserverFloorRequests.size > 1_024) {
+      const oldest = this.#acceptedObserverFloorRequests.values().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.#acceptedObserverFloorRequests.delete(oldest);
+      }
+    }
+    const receipt = await this.#executeSerialized({
+      protocolVersion: PROTOCOL_VERSION,
+      meetingId: this.meetingId,
+      commandId: `observer-floor:${observationId}`,
+      kind: "floor.request",
+      issuedAt: this.#now().toISOString(),
+      runtimeGeneration: this.#runtimeGeneration,
+      actorId: candidateRoleId,
+      targetId: observedSpeakerRoleId,
+      payload: {
+        kind,
+        reason: decision.reason,
+        message: decision.prompt,
+        automatic: true,
+      },
+    });
+    if (receipt.status !== "accepted") {
+      this.#acceptedObserverFloorRequests.delete(decisionKey);
+    }
   }
 
   async #interrupt(command: MeetingCommand): Promise<CommandReceipt> {
@@ -1059,7 +1956,22 @@ export class LocalRoundtableHost {
         "An interruption requires the next prompt",
       );
     }
-    this.#pendingPublicTurns.length = 0;
+    if (
+      this.#discussionScheduler.configured &&
+      command.payload.hostAuthorized !== true &&
+      command.payload.budgetReserved !== true &&
+      !this.#discussionScheduler.acceptInterruption(interruptorId)
+    ) {
+      return this.#receipt(
+        command,
+        "rejected",
+        "interruption_budget_exhausted",
+        "The autonomous interruption budget is exhausted",
+      );
+    }
+    if (!this.#discussionScheduler.configured) {
+      this.#pendingPublicTurns.length = 0;
+    }
     const target = this.#roles.get(targetId);
     if (target === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Target role does not exist");
@@ -1089,7 +2001,7 @@ export class LocalRoundtableHost {
       interruptorId,
       targetId,
       command.commandId,
-      {},
+      { message },
     );
     for (const event of deferred.events) {
       this.#onRuntimeEvent(targetId, event);
@@ -1184,11 +2096,24 @@ export class LocalRoundtableHost {
         this.#activeRoleId = roleId;
         this.#activeTurnCorrelationId = event.correlationId ?? expectedCorrelationId;
         this.#activeTurnVisibility = expectedTurn?.visibility ?? "public";
+        this.#activePublicOutput = "";
         this.#emitActiveTurnEvent("speech.started", roleId, event, {});
         break;
       }
       case "turn.delta":
         if (this.#isActiveTurnEvent(roleId, event)) {
+          if (
+            this.#activeTurnVisibility === "public" &&
+            typeof event.payload.delta === "string"
+          ) {
+            this.#activePublicOutput += event.payload.delta;
+            this.#maybeScheduleDiscussionObservers(
+              roleId,
+              this.#activeTurnCorrelationId,
+              this.#activePublicOutput,
+              false,
+            );
+          }
           this.#emitActiveTurnEvent("speech.delta", roleId, event, event.payload);
         }
         break;
@@ -1216,9 +2141,39 @@ export class LocalRoundtableHost {
           event.kind === "turn.cancelled" ? roleId : null,
         );
         const completedVisibility = this.#activeTurnVisibility;
+        const completedOutput = this.#activePublicOutput.trim();
+        if (
+          event.kind === "turn.completed" &&
+          completedVisibility === "public" &&
+          completedOutput.length > 0
+        ) {
+          this.#maybeScheduleDiscussionObservers(
+            roleId,
+            correlationId,
+            completedOutput,
+            true,
+          );
+        }
+        if (completedVisibility === "public" && completedOutput.length > 0) {
+          const role = this.#roles.get(roleId);
+          this.#publicMessages.push({
+            message: completedOutput,
+            mentions: [],
+            speakerRoleId: roleId,
+            speakerDisplayName: role?.displayName ?? roleId,
+          });
+        }
         this.#activeRoleId = undefined;
         this.#activeTurnCorrelationId = undefined;
         this.#activeTurnVisibility = "public";
+        this.#activePublicOutput = "";
+        if (completedVisibility === "public") {
+          this.#recordDiscussionTurn(
+            roleId,
+            this.#detectStructuredProgress(completedOutput),
+            correlationId ?? null,
+          );
+        }
         this.#enqueueInternal(() => this.#continueHandoff(roleId));
         if (completedVisibility === "public") {
           this.#enqueueInternal(() => this.#startNextPublicTurn());
@@ -1307,6 +2262,9 @@ export class LocalRoundtableHost {
       ...(configuration.maxOutputTokens === undefined
         ? {}
         : { maxOutputTokens: configuration.maxOutputTokens }),
+      ...(configuration.thinkingLevel === undefined
+        ? {}
+        : { thinkingLevel: configuration.thinkingLevel }),
       tools: [],
       systemPrompt: configuration.systemPrompt,
       skillPaths: configuration.skillPaths,
@@ -1513,6 +2471,7 @@ export class LocalRoundtableHost {
       ...(participant.modelRouteSnapshot.maxOutputTokens === undefined
         ? {}
         : { maxOutputTokens: participant.modelRouteSnapshot.maxOutputTokens }),
+      thinkingLevel: participant.modelRouteSnapshot.thinkingLevel,
       apiKey,
       systemPrompt,
       skillPaths,
@@ -1890,6 +2849,45 @@ export class LocalRoundtableHost {
       return undefined;
     }
     return value as string[];
+  }
+
+  #readDiscussionLimits(payload: JsonObject): Partial<DiscussionLimits> | undefined {
+    const value = payload.limits;
+    if (value === undefined) {
+      return {};
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return undefined;
+    }
+    const allowed = new Set<keyof DiscussionLimits>([
+      "softTurnLimit",
+      "hardTurnLimit",
+      "softRoundLimit",
+      "hardRoundLimit",
+      "maxConsecutiveTurnsPerRole",
+      "maxInterruptionsPerSegment",
+      "maxInterruptionsPerRole",
+      "noProgressTurnLimit",
+      "maxObserverProbesPerSegment",
+    ]);
+    const limits: Partial<DiscussionLimits> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (!allowed.has(key as keyof DiscussionLimits) || typeof entry !== "number") {
+        return undefined;
+      }
+      limits[key as keyof DiscussionLimits] = entry;
+    }
+    return limits;
+  }
+
+  #isDiscussionMode(value: string | undefined): value is DiscussionMode {
+    return value === "agenda" || value === "free_discussion" || value === "convergence" ||
+      value === "paused" || value === "completed";
+  }
+
+  #isFloorRequestKind(value: string): value is FloorRequestKind {
+    return value === "host" || value === "critical" || value === "facilitator" ||
+      value === "reply" || value === "normal";
   }
 
   #safeRuntimeErrorCode(errorCode: string | null | undefined): string {

@@ -28,6 +28,40 @@ export {
   type PiSessionHandle,
   type RuntimeCredentialProvider,
 } from "./pi-runtime-adapter.js";
+export {
+  PiPublicMessagePlanner,
+  createFallbackPublicMessagePlan,
+  validatePublicMessagePlan,
+  type PiPublicMessagePlannerOptions,
+  type PublicMessageGroupTask,
+  type PublicMessagePlan,
+  type PublicMessagePlanner,
+  type PublicMessagePlanningModel,
+  type PublicMessagePlanningRequest,
+  type PublicMessagePlanningRole,
+} from "./public-message-planner.js";
+export {
+  DEFAULT_DISCUSSION_LIMITS,
+  FacilitatedDiscussionScheduler,
+  type AgendaItemStatus,
+  type DiscussionAgendaItem,
+  type DiscussionCounters,
+  type DiscussionFloorRequest,
+  type DiscussionLimits,
+  type DiscussionSchedulerSnapshot,
+  type DiscussionTransition,
+  type FloorRequestResult,
+  type TurnBudgetResult,
+} from "./discussion-scheduler.js";
+export {
+  PiDiscussionObserver,
+  validateDiscussionObservation,
+  type DiscussionObservationDecision,
+  type DiscussionObservationRequest,
+  type DiscussionObserver,
+  type DiscussionObserverAdapterFactory,
+  type PiDiscussionObserverOptions,
+} from "./discussion-observer.js";
 export { StdioRuntimeHost } from "./stdio-runtime-host.js";
 export type {
   RuntimeAdapter,

@@ -637,6 +637,40 @@ test("redacts raw provider failure details from runtime events", async () => {
   await adapter.stop();
 });
 
+test("classifies a final retry error without exposing provider details", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  await adapter.start();
+  const session = factory.session;
+  assert.ok(session !== undefined);
+
+  await adapter.execute({
+    kind: "turn.prompt",
+    commandId: "prompt-incompatible-provider-request",
+    roleId: "role.researcher",
+    message: "provider compatibility probe",
+    delivery: "immediate",
+  });
+  session.emit({ type: "agent_start" });
+  session.emit({ type: "turn_start" });
+  session.emit({
+    type: "auto_retry_end",
+    success: false,
+    attempt: 3,
+    finalError: "HTTP 400 invalid max_completion_tokens; Authorization: Bearer secret-value",
+  });
+  session.emit({ type: "agent_settled" });
+
+  const failure = events.find((event) => event.kind === "runtime.failed");
+  assert.equal(failure?.payload.errorCode, "pi_provider_request_incompatible");
+  assert.equal(failure?.payload.message, "The provider rejected the Pi compatibility request");
+  assert.ok(!JSON.stringify(events).includes("secret-value"));
+  const terminal = events.find((event) => event.kind === "turn.cancelled");
+  assert.equal(terminal?.payload.errorCode, "pi_provider_request_incompatible");
+  await adapter.stop();
+});
+
 test("treats a final Pi assistant error as failed even without a streamed error update", async () => {
   const factory = new FakePiSessionFactory();
   const events: RuntimeEvent[] = [];
