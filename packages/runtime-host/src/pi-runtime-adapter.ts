@@ -337,6 +337,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnFailed = false;
   #turnFailureErrorCode: string | undefined;
   #turnFailureTerminalEmitted = false;
+  #turnStartedEmitted = false;
   #activeTurnCommandId: string | undefined;
   readonly #pendingToolApprovals = new Map<string, PendingToolApproval>();
 
@@ -502,6 +503,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#clearCancellationOutcome();
         this.#turnFailed = false;
         this.#turnFailureTerminalEmitted = false;
+        this.#turnStartedEmitted = false;
         this.#activeTurnCommandId = command.commandId;
         this.#promptDispatchPending = true;
         invocation = session.prompt(command.message);
@@ -526,6 +528,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
                 this.#turnFailureTerminalEmitted = true;
                 this.#emit("turn.cancelled", {}, command.commandId);
               }
+              this.#turnStartedEmitted = false;
               this.#activeTurnCommandId = undefined;
             }
             this.#emitFailure(error, command.commandId);
@@ -536,6 +539,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     } catch (error) {
       if (startsTurn) {
         this.#promptDispatchPending = false;
+        this.#turnStartedEmitted = false;
         this.#activeTurnCommandId = undefined;
       }
       return this.#rememberFailure(command.commandId, fingerprint, error);
@@ -657,6 +661,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#clearCancellationOutcome();
     this.#turnFailed = false;
     this.#turnFailureTerminalEmitted = false;
+    this.#turnStartedEmitted = false;
     this.#activeTurnCommandId = undefined;
     for (const pending of this.#pendingToolApprovals.values()) {
       clearTimeout(pending.timeout);
@@ -770,11 +775,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
 
     switch (event.type) {
-      case "turn_start":
+      case "agent_start":
         this.#turnFailed = false;
         this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
-        this.#emit("turn.started", {}, this.#activeTurnCommandId);
+        if (!this.#turnStartedEmitted) {
+          this.#turnStartedEmitted = true;
+          this.#emit("turn.started", {}, this.#activeTurnCommandId);
+        }
         break;
       case "message_update": {
         const update = event.assistantMessageEvent;
@@ -794,6 +802,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         break;
       case "turn_end":
         this.#observeFinalMessage(event.message);
+        break;
+      case "agent_settled":
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
             this.#emit("turn.cancelled", { reason: "cancelled" }, this.#activeTurnCommandId);
@@ -813,6 +823,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#turnFailed = false;
         this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
+        this.#turnStartedEmitted = false;
         this.#activeTurnCommandId = undefined;
         break;
       case "tool_execution_start":
