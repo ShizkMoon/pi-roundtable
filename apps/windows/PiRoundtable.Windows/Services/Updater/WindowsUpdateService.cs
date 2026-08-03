@@ -122,86 +122,73 @@ internal sealed class WindowsUpdateService : IDisposable
     {
         var versionDirectory = Path.Combine(_options.StagingRoot, manifest.Version.ToString(3));
         EnsureSafeStagingPath(versionDirectory);
-        Directory.CreateDirectory(versionDirectory);
-        EnsureNoReparsePoint(versionDirectory);
 
         var finalPath = Path.Combine(versionDirectory, manifest.Document.Asset.FileName);
-        var partialPath = finalPath + ".partial";
+        await using var directoryLease = await ArtifactStager.AcquireDirectoryAsync(
+            versionDirectory,
+            cancellationToken: cancellationToken);
+        directoryLease.DeleteStaleArtifactsFor(manifest.Document.Asset.FileName);
+        directoryLease.DeleteStaleArtifactsFor("staged-update.json");
         var verificationSpec = new ArtifactVerificationSpec(
             manifest.Document.Asset.Size,
             manifest.ExpectedSha256);
-        if (await ArtifactVerifier.MatchesFileAsync(finalPath, verificationSpec, cancellationToken))
+        if (await TryUseExistingPackageAsync(
+                finalPath,
+                versionDirectory,
+                manifest,
+                verificationSpec,
+                cancellationToken))
         {
             return new StagedUpdatePackage(manifest, finalPath);
         }
 
-        TryDelete(partialPath);
-        TryDelete(finalPath);
         ValidateInitialUri(manifest.AssetUri);
-        var finalPromoted = false;
+        using var response = await SendWithRedirectsAsync(manifest.AssetUri, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is long contentLength &&
+            contentLength != manifest.Document.Asset.Size)
+        {
+            throw new InvalidDataException("更新包 Content-Length 与签名清单不一致。");
+        }
+
+        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await using var staging = ArtifactStager.CreateNew(
+            versionDirectory,
+            manifest.Document.Asset.FileName);
         try
         {
-            using var response = await SendWithRedirectsAsync(manifest.AssetUri, cancellationToken);
-            response.EnsureSuccessStatusCode();
-            if (response.Content.Headers.ContentLength is long contentLength &&
-                contentLength != manifest.Document.Asset.Size)
+            try
             {
-                throw new InvalidDataException("更新包 Content-Length 与签名清单不一致。");
+                await staging.CopyAndVerifyAsync(
+                    source,
+                    verificationSpec,
+                    progress is null ? null : new DownloadProgress(progress, manifest.Document.Asset.Size),
+                    cancellationToken);
             }
-
-            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
-            await using (var destination = new FileStream(
-                partialPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
+            catch (ArtifactIntegrityException exception)
             {
-                try
-                {
-                    await ArtifactVerifier.CopyAndVerifyAsync(
-                        source,
-                        destination,
-                        verificationSpec,
-                        progress is null ? null : new DownloadProgress(progress, manifest.Document.Asset.Size),
-                        cancellationToken);
-                }
-                catch (ArtifactIntegrityException exception)
-                {
-                    throw new InvalidDataException("更新包大小或 SHA-256 与签名清单不一致。", exception);
-                }
-                await destination.FlushAsync(cancellationToken);
-                destination.Flush(flushToDisk: true);
+                throw new InvalidDataException("更新包大小或 SHA-256 与签名清单不一致。", exception);
             }
-
-            File.Move(partialPath, finalPath, overwrite: true);
-            finalPromoted = true;
-            await using (var verifiedPackage = await ArtifactVerifier.OpenVerifiedReadAsync(
-                finalPath,
-                verificationSpec,
-                FileShare.Read,
-                cancellationToken))
+            if (manifest.Document.Asset.AuthenticodeRequired &&
+                !_authenticodeVerifier.IsTrusted(staging.CurrentPath, staging.FileHandle))
             {
-                // Keep both the verified leaf and its parent path locked while
-                // WinVerifyTrust resolves the path, so signature verification
-                // cannot observe a replacement that differs from the bytes
-                // reverified above.
-                if (manifest.Document.Asset.AuthenticodeRequired && !_authenticodeVerifier.IsTrusted(finalPath))
-                {
-                    throw new CryptographicException("更新清单要求 Authenticode，但安装包签名不受 Windows 信任。");
-                }
-                await WriteStateAsync(versionDirectory, manifest, finalPath, cancellationToken);
+                throw new CryptographicException("更新清单要求 Authenticode，但安装包签名不受 Windows 信任。");
             }
+            cancellationToken.ThrowIfCancellationRequested();
+            staging.Promote();
+            await WriteStateAsync(versionDirectory, manifest, finalPath, CancellationToken.None);
             progress?.Report(1);
             return new StagedUpdatePackage(manifest, finalPath);
         }
         catch
         {
-            TryDelete(partialPath);
-            if (finalPromoted)
+            // Promotion publishes a fully verified package. If the replaceable
+            // state sidecar then fails, keep the package so a later invocation
+            // can re-lock, re-verify, and repair state without downloading it
+            // again. Before promotion, disposal retries handle-based cleanup.
+            if (!staging.IsPromoted)
             {
-                TryDelete(finalPath);
+                _ = staging.TryDiscard();
             }
             throw;
         }
@@ -306,8 +293,6 @@ internal sealed class WindowsUpdateService : IDisposable
         string packagePath,
         CancellationToken cancellationToken)
     {
-        var statePath = Path.Combine(directory, "staged-update.json");
-        var temporaryPath = statePath + ".tmp";
         var state = new
         {
             manifest.Document.ProductId,
@@ -317,13 +302,58 @@ internal sealed class WindowsUpdateService : IDisposable
             Sha256 = manifest.Document.Asset.Sha256.ToUpperInvariant(),
             StagedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
         };
-        await using (var stream = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        var content = JsonSerializer.SerializeToUtf8Bytes(state, StateSerializerOptions);
+        var spec = new ArtifactVerificationSpec(content.Length, SHA256.HashData(content));
+        await using var source = new MemoryStream(content, writable: false);
+        await using var staging = ArtifactStager.CreateNew(directory, "staged-update.json");
+        await staging.CopyAndVerifyAsync(source, spec, cancellationToken: cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        staging.Promote();
+    }
+
+    private async Task<bool> TryUseExistingPackageAsync(
+        string packagePath,
+        string versionDirectory,
+        VerifiedUpdateManifest manifest,
+        ArtifactVerificationSpec verificationSpec,
+        CancellationToken cancellationToken)
+    {
+        VerifiedArtifactLease verifiedPackage;
+        try
         {
-            await JsonSerializer.SerializeAsync(stream, state, StateSerializerOptions, cancellationToken);
-            await stream.FlushAsync(cancellationToken);
-            stream.Flush(flushToDisk: true);
+            verifiedPackage = await ArtifactVerifier.OpenVerifiedReadAsync(
+                packagePath,
+                verificationSpec,
+                FileShare.Read,
+                cancellationToken);
         }
-        File.Move(temporaryPath, statePath, overwrite: true);
+        catch (ArtifactIntegrityException exception) when (exception.Failure != ArtifactIntegrityFailure.ReparsePoint)
+        {
+            return false;
+        }
+        catch (Exception exception) when (exception is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return false;
+        }
+        catch (System.ComponentModel.Win32Exception exception) when (exception.NativeErrorCode is 2 or 3)
+        {
+            return false;
+        }
+
+        await using (verifiedPackage)
+        {
+            if (manifest.Document.Asset.AuthenticodeRequired &&
+                !_authenticodeVerifier.IsTrusted(packagePath, verifiedPackage.Stream.SafeFileHandle))
+            {
+                throw new CryptographicException("更新清单要求 Authenticode，但缓存安装包签名不受 Windows 信任。");
+            }
+            await WriteStateAsync(
+                versionDirectory,
+                manifest,
+                packagePath,
+                cancellationToken);
+            return true;
+        }
     }
 
     private void EnsureSafeStagingPath(string path)
@@ -336,17 +366,6 @@ internal sealed class WindowsUpdateService : IDisposable
         }
     }
 
-    private static void EnsureNoReparsePoint(string directory)
-    {
-        for (var current = new DirectoryInfo(directory); current is not null && current.Exists; current = current.Parent)
-        {
-            if ((current.Attributes & FileAttributes.ReparsePoint) != 0)
-            {
-                throw new IOException("更新 staging 路径不能包含重解析点。");
-            }
-        }
-    }
-
     private static bool IsRedirect(HttpStatusCode statusCode)
     {
         return statusCode is HttpStatusCode.Moved or
@@ -354,20 +373,6 @@ internal sealed class WindowsUpdateService : IDisposable
             HttpStatusCode.RedirectMethod or
             HttpStatusCode.TemporaryRedirect or
             HttpStatusCode.PermanentRedirect;
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch (IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
     }
 
     private sealed class DownloadProgress(IProgress<double> progress, long expectedSize) : IProgress<long>

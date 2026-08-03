@@ -107,7 +107,7 @@ pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.3.0
 
 脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.3.0-win-x64.msi` 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，清单必须保持 `authenticodeRequired: false`。
 
-无依赖的 `PiRoundtable.Distribution` 还实现了可供后续更新、模块目录、离线布局和工件导入复用的 v1 签名目录纯验证层：严格拒绝重复、未知或缺失字段，绑定密钥/算法、有效期、epoch/sequence 防回滚和同源资产策略，并只返回封闭的无凭据诊断。它当前没有连接目录刷新或模块安装；模块解析、依赖、授权、下载、健康检查、回滚事务，以及句柄相对的安全提升仍是后续工作。架构边界见 [`ADR 0011`](docs/adr/0011-signed-catalog-trust-boundary.md)。
+无依赖的 `PiRoundtable.Distribution` 还实现了可供后续更新、模块目录、离线布局和工件导入复用的 v1 签名目录纯验证层：严格拒绝重复、未知或缺失字段，绑定密钥/算法、有效期、epoch/sequence 防回滚和同源资产策略，并只返回封闭的无凭据诊断。与纯验证器分离的 Windows 工件事务会锁定全部目标目录组件，以同一 no-follow 文件句柄完成复制、落盘后二次哈希、可选 Authenticode 和原子提升，并通过跨进程目录租约恢复崩溃残留；状态旁车失败时保留已验证包供下次离线修复。它当前没有连接目录刷新或模块安装；模块解析、依赖、授权、下载、健康检查和完整安装回滚事务仍是后续工作。架构边界见 [`ADR 0011`](docs/adr/0011-signed-catalog-trust-boundary.md) 与 [`ADR 0012`](docs/adr/0012-handle-owned-windows-artifact-staging.md)。
 
 Windows 发布门禁现提供三组自动化：
 

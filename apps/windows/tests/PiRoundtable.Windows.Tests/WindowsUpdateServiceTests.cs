@@ -1,9 +1,13 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Win32.SafeHandles;
+using PiRoundtable.Distribution;
 using PiRoundtable.Updater;
 using PiRoundtable.Windows.Services.Updater;
 
@@ -33,7 +37,7 @@ public sealed class WindowsUpdateServiceTests
         Assert.AreEqual(new Version(0, 2, 0), check.AvailableVersion);
         CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(staged.PackagePath));
         Assert.IsTrue(File.Exists(Path.Combine(Path.GetDirectoryName(staged.PackagePath)!, "staged-update.json")));
-        Assert.IsFalse(File.Exists(staged.PackagePath + ".partial"));
+        AssertNoPartialArtifacts(Path.GetDirectoryName(staged.PackagePath)!);
     }
 
     [TestMethod]
@@ -100,7 +104,7 @@ public sealed class WindowsUpdateServiceTests
         await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.DownloadAndStageAsync(check.Manifest));
         var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
         Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, "PiRoundtable-0.2.0-win-x64.msi")));
-        Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, "PiRoundtable-0.2.0-win-x64.msi.partial")));
+        AssertNoPartialArtifacts(versionDirectory);
     }
 
     [TestMethod]
@@ -119,6 +123,292 @@ public sealed class WindowsUpdateServiceTests
         var check = await service.CheckAsync();
 
         await Assert.ThrowsExactlyAsync<CryptographicException>(() => service.DownloadAndStageAsync(check.Manifest));
+        var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
+        Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, manifest.Asset.FileName)));
+        Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, "staged-update.json")));
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task Required_authenticode_observes_the_same_locked_leaf_that_is_promoted()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("signed-msi-fixture");
+        var manifest = fixture.CreateManifest(payload, "0.2.0", authenticodeRequired: true);
+        using var client = CreateClient(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/manifest" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "/release.msi" => BytesResponse(payload),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+        using var authenticode = new InspectingAuthenticodeVerifier(payload, trusted: true);
+        using var service = fixture.CreateService(client, authenticode);
+
+        var check = await service.CheckAsync();
+        var staged = await service.DownloadAndStageAsync(check.Manifest);
+
+        Assert.IsTrue(authenticode.WasCalled);
+        Assert.IsTrue(authenticode.WriteReplacementWasBlocked);
+        Assert.IsNotNull(authenticode.ObservedPath);
+        Assert.EndsWith(".msi", authenticode.ObservedPath, StringComparison.OrdinalIgnoreCase);
+        Assert.IsTrue(authenticode.ObservedPath.Contains(".partial", StringComparison.Ordinal));
+        Assert.IsFalse(File.Exists(authenticode.ObservedPath));
+        Assert.AreEqual(
+            Path.GetFullPath(staged.PackagePath),
+            Path.GetFullPath(authenticode.GetCurrentPath()),
+            ignoreCase: true);
+        authenticode.Dispose();
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(staged.PackagePath));
+    }
+
+    [TestMethod]
+    public async Task Existing_verified_package_is_relocked_retrusted_and_repairs_missing_state_without_download()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("cached-signed-msi");
+        var manifest = fixture.CreateManifest(payload, "0.2.0", authenticodeRequired: true);
+        using (var firstClient = CreateClient(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/manifest" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "/release.msi" => BytesResponse(payload),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        }))
+        using (var firstAuthenticode = new InspectingAuthenticodeVerifier(payload, trusted: true))
+        using (var firstService = fixture.CreateService(firstClient, firstAuthenticode))
+        {
+            var firstCheck = await firstService.CheckAsync();
+            var firstStaged = await firstService.DownloadAndStageAsync(firstCheck.Manifest);
+            File.Delete(Path.Combine(Path.GetDirectoryName(firstStaged.PackagePath)!, "staged-update.json"));
+        }
+
+        using var offlineClient = CreateClient(_ =>
+            throw new AssertFailedException("A verified cached package must not be downloaded again."));
+        using var secondAuthenticode = new InspectingAuthenticodeVerifier(payload, trusted: true);
+        using var secondService = fixture.CreateService(offlineClient, secondAuthenticode);
+
+        var reused = await secondService.DownloadAndStageAsync(
+            new UpdateManifestVerifier(fixture.Policy).ParseAndVerify(
+                fixture.SignAndSerialize(manifest),
+                DateTimeOffset.UtcNow));
+
+        Assert.IsTrue(secondAuthenticode.WasCalled);
+        Assert.IsTrue(secondAuthenticode.WriteReplacementWasBlocked);
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(reused.PackagePath));
+        var versionDirectory = Path.GetDirectoryName(reused.PackagePath)!;
+        var state = JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(versionDirectory, "staged-update.json")))!.AsObject();
+        Assert.AreEqual(manifest.Asset.Sha256.ToUpperInvariant(), state["sha256"]!.GetValue<string>());
+        Assert.AreEqual(manifest.Asset.FileName, state["packageFileName"]!.GetValue<string>());
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task Tampered_cached_package_is_replaced_by_exactly_one_verified_download()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("expected-cached-payload");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        var verifiedManifest = new UpdateManifestVerifier(fixture.Policy).ParseAndVerify(
+            fixture.SignAndSerialize(manifest),
+            DateTimeOffset.UtcNow);
+        var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
+        Directory.CreateDirectory(versionDirectory);
+        var packagePath = Path.Combine(versionDirectory, manifest.Asset.FileName);
+        await File.WriteAllBytesAsync(packagePath, Encoding.UTF8.GetBytes("tampered-cached-content"));
+        var downloads = 0;
+        using var client = CreateClient(request =>
+        {
+            if (request.RequestUri!.AbsolutePath == "/release.msi")
+            {
+                Interlocked.Increment(ref downloads);
+                return BytesResponse(payload);
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        using var service = fixture.CreateService(client, authenticodeTrusted: false);
+
+        var staged = await service.DownloadAndStageAsync(verifiedManifest);
+
+        Assert.AreEqual(1, downloads);
+        Assert.AreEqual(packagePath, staged.PackagePath);
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(packagePath));
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task Cached_package_with_untrusted_required_authenticode_fails_without_network()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("cached-authenticode-payload");
+        var manifest = fixture.CreateManifest(payload, "0.2.0", authenticodeRequired: true);
+        var verifiedManifest = new UpdateManifestVerifier(fixture.Policy).ParseAndVerify(
+            fixture.SignAndSerialize(manifest),
+            DateTimeOffset.UtcNow);
+        var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
+        Directory.CreateDirectory(versionDirectory);
+        await File.WriteAllBytesAsync(Path.Combine(versionDirectory, manifest.Asset.FileName), payload);
+        using var offlineClient = CreateClient(_ =>
+            throw new AssertFailedException("An untrusted cached package must fail before network access."));
+        using var service = fixture.CreateService(offlineClient, authenticodeTrusted: false);
+
+        await Assert.ThrowsExactlyAsync<CryptographicException>(() =>
+            service.DownloadAndStageAsync(verifiedManifest));
+
+        Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, "staged-update.json")));
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task Concurrent_same_version_staging_is_serialized_and_recovers_crash_orphans()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("single-download-payload");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        var verifiedManifest = new UpdateManifestVerifier(fixture.Policy).ParseAndVerify(
+            fixture.SignAndSerialize(manifest),
+            DateTimeOffset.UtcNow);
+        var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
+        Directory.CreateDirectory(versionDirectory);
+        await File.WriteAllBytesAsync(
+            Path.Combine(versionDirectory, $"PiRoundtable-0.2.0-win-x64.{Guid.NewGuid():N}.partial.msi"),
+            [1]);
+        await File.WriteAllBytesAsync(
+            Path.Combine(versionDirectory, $"staged-update.{Guid.NewGuid():N}.partial.json"),
+            [2]);
+        await File.WriteAllBytesAsync(
+            Path.Combine(versionDirectory, $"{manifest.Asset.FileName}.partial"),
+            [3]);
+        await File.WriteAllBytesAsync(
+            Path.Combine(versionDirectory, "staged-update.json.tmp"),
+            [4]);
+        var assetDownloads = 0;
+        HttpResponseMessage Handle(HttpRequestMessage request)
+        {
+            if (request.RequestUri!.AbsolutePath == "/release.msi")
+            {
+                Interlocked.Increment(ref assetDownloads);
+                return BytesResponse(payload);
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        }
+        using var firstClient = CreateClient(Handle);
+        using var secondClient = CreateClient(Handle);
+        using var firstService = fixture.CreateService(firstClient, authenticodeTrusted: false);
+        using var secondService = fixture.CreateService(secondClient, authenticodeTrusted: false);
+
+        var results = await Task.WhenAll(
+            firstService.DownloadAndStageAsync(verifiedManifest),
+            secondService.DownloadAndStageAsync(verifiedManifest));
+
+        Assert.AreEqual(1, assetDownloads);
+        Assert.AreEqual(results[0].PackagePath, results[1].PackagePath);
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(results[0].PackagePath));
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task State_commit_failure_preserves_verified_package_for_offline_repair()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("recoverable-package");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        var versionDirectory = Path.Combine(fixture.StagingRoot, "0.2.0");
+        Directory.CreateDirectory(Path.Combine(versionDirectory, "staged-update.json"));
+        using var client = CreateClient(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/manifest" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "/release.msi" => BytesResponse(payload),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+        using (var service = fixture.CreateService(client, authenticodeTrusted: false))
+        {
+            var check = await service.CheckAsync();
+
+            await Assert.ThrowsExactlyAsync<Win32Exception>(() =>
+                service.DownloadAndStageAsync(check.Manifest));
+        }
+
+        var packagePath = Path.Combine(versionDirectory, manifest.Asset.FileName);
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(packagePath));
+        AssertNoPartialArtifacts(versionDirectory);
+        Directory.Delete(Path.Combine(versionDirectory, "staged-update.json"));
+
+        using var offlineClient = CreateClient(_ =>
+            throw new AssertFailedException("Recovery must reuse the already verified package."));
+        using var recoveryService = fixture.CreateService(offlineClient, authenticodeTrusted: false);
+        var recovered = await recoveryService.DownloadAndStageAsync(
+            new UpdateManifestVerifier(fixture.Policy).ParseAndVerify(
+                fixture.SignAndSerialize(manifest),
+                DateTimeOffset.UtcNow));
+
+        Assert.AreEqual(packagePath, recovered.PackagePath);
+        Assert.IsTrue(File.Exists(Path.Combine(versionDirectory, "staged-update.json")));
+        AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public async Task Staging_rejects_reparse_root_without_writing_to_its_target()
+    {
+        using var fixture = new UpdateFixture();
+        var outside = Path.Combine(Path.GetTempPath(), $"pi-roundtable-update-outside-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(outside);
+        Directory.CreateSymbolicLink(fixture.StagingRoot, outside);
+        var payload = Encoding.UTF8.GetBytes("must-not-escape");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        using var client = CreateClient(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/manifest" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "/release.msi" => BytesResponse(payload),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+        using var service = fixture.CreateService(client, authenticodeTrusted: false);
+        try
+        {
+            var check = await service.CheckAsync();
+
+            var exception = await Assert.ThrowsExactlyAsync<ArtifactIntegrityException>(() =>
+                service.DownloadAndStageAsync(check.Manifest));
+
+            Assert.AreEqual(ArtifactIntegrityFailure.ReparsePoint, exception.Failure);
+            Assert.HasCount(0, Directory.GetFileSystemEntries(outside, "*", SearchOption.AllDirectories));
+        }
+        finally
+        {
+            Directory.Delete(fixture.StagingRoot);
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task Windows_authenticode_verifier_accepts_a_borrowed_staging_handle_contract()
+    {
+        var trustDataType = typeof(WindowsAuthenticodeVerifier).GetNestedType(
+            "WinTrustData",
+            System.Reflection.BindingFlags.NonPublic);
+        Assert.IsNotNull(trustDataType);
+        Assert.AreEqual(IntPtr.Size == 8 ? 88 : 52, Marshal.SizeOf(trustDataType));
+
+        var directory = Path.Combine(Path.GetTempPath(), $"pi-roundtable-auth-handle-{Guid.NewGuid():N}");
+        byte[] payload = [1, 2, 3, 4];
+        var spec = new ArtifactVerificationSpec(payload.Length, SHA256.HashData(payload));
+        try
+        {
+            await using var staging = ArtifactStager.CreateNew(directory, "unsigned.msi");
+            await using var source = new MemoryStream(payload, writable: false);
+            await staging.CopyAndVerifyAsync(source, spec);
+
+            Assert.IsFalse(new WindowsAuthenticodeVerifier().IsTrusted(staging.CurrentPath, staging.FileHandle));
+            Assert.IsFalse(staging.FileHandle.IsClosed);
+            var observed = new byte[payload.Length];
+            Assert.AreEqual(payload.Length, RandomAccess.Read(staging.FileHandle, observed, fileOffset: 0));
+            CollectionAssert.AreEqual(payload, observed);
+        }
+        finally
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
     }
 
     [TestMethod]
@@ -287,6 +577,21 @@ public sealed class WindowsUpdateServiceTests
         };
     }
 
+    private static void AssertNoPartialArtifacts(string directory)
+    {
+        if (!Directory.Exists(directory))
+        {
+            return;
+        }
+        var temporaryEntries = Directory.GetFileSystemEntries(directory, "*", SearchOption.TopDirectoryOnly)
+            .Where(path =>
+                Path.GetFileName(path).Contains(".partial.", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetFileName(path).EndsWith(".partial", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetFileName(path).EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        Assert.HasCount(0, temporaryEntries);
+    }
+
     private sealed class DelegateHandler(Func<HttpRequestMessage, HttpResponseMessage> handler) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(
@@ -299,7 +604,92 @@ public sealed class WindowsUpdateServiceTests
 
     private sealed class ConstantAuthenticodeVerifier(bool trusted) : IAuthenticodeVerifier
     {
-        public bool IsTrusted(string filePath) => trusted;
+        public bool IsTrusted(string filePath, SafeFileHandle fileHandle) => trusted;
+    }
+
+    private sealed class InspectingAuthenticodeVerifier(byte[] expectedContent, bool trusted)
+        : IAuthenticodeVerifier, IDisposable
+    {
+        private SafeFileHandle? _observedHandle;
+
+        public bool WasCalled { get; private set; }
+        public bool WriteReplacementWasBlocked { get; private set; }
+        public string? ObservedPath { get; private set; }
+
+        public bool IsTrusted(string filePath, SafeFileHandle fileHandle)
+        {
+            WasCalled = true;
+            ObservedPath = filePath;
+            var observed = new byte[expectedContent.Length];
+            Assert.AreEqual(
+                expectedContent.Length,
+                RandomAccess.Read(fileHandle, observed, fileOffset: 0));
+            CollectionAssert.AreEqual(expectedContent, observed);
+            Assert.IsTrue(DuplicateHandle(
+                GetCurrentProcess(),
+                fileHandle,
+                GetCurrentProcess(),
+                out var duplicate,
+                desiredAccess: 0,
+                inheritHandle: false,
+                options: 2));
+            _observedHandle?.Dispose();
+            _observedHandle = duplicate;
+            try
+            {
+                new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite).Dispose();
+            }
+            catch (IOException)
+            {
+                WriteReplacementWasBlocked = true;
+            }
+            return trusted;
+        }
+
+        public string GetCurrentPath()
+        {
+            var handle = _observedHandle
+                ?? throw new InvalidOperationException("Authenticode was not invoked.");
+            var path = new StringBuilder(32_768);
+            var length = GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, flags: 0);
+            if (length == 0 || length >= path.Capacity)
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+            return path.ToString() switch
+            {
+                var value when value.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal) => $"\\\\{value[8..]}",
+                var value when value.StartsWith("\\\\?\\", StringComparison.Ordinal) => value[4..],
+                var value => value,
+            };
+        }
+
+        public void Dispose()
+        {
+            _observedHandle?.Dispose();
+            _observedHandle = null;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DuplicateHandle(
+            nint sourceProcess,
+            SafeFileHandle sourceHandle,
+            nint targetProcess,
+            out SafeFileHandle targetHandle,
+            uint desiredAccess,
+            [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+            uint options);
+
+        [DllImport("kernel32.dll")]
+        private static extern nint GetCurrentProcess();
+
+        [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetFinalPathNameByHandleW(
+            SafeFileHandle file,
+            StringBuilder filePath,
+            uint filePathLength,
+            uint flags);
     }
 
     private sealed class UpdateFixture : IDisposable
@@ -315,6 +705,13 @@ public sealed class WindowsUpdateServiceTests
         }
 
         public string StagingRoot { get; }
+
+        public UpdateManifestPolicy Policy => new(
+            "PiRoundtable.Windows",
+            "stable",
+            "x64",
+            new Dictionary<string, string> { ["test-key"] = _key.ExportSubjectPublicKeyInfoPem() },
+            AllowLoopbackHttp: _allowLoopbackHttp);
 
         public UpdateManifestDocument CreateManifest(
             byte[] payload,
@@ -356,17 +753,19 @@ public sealed class WindowsUpdateServiceTests
 
         public WindowsUpdateService CreateService(HttpClient client, bool authenticodeTrusted)
         {
+            return CreateService(client, new ConstantAuthenticodeVerifier(authenticodeTrusted));
+        }
+
+        public WindowsUpdateService CreateService(
+            HttpClient client,
+            IAuthenticodeVerifier authenticodeVerifier)
+        {
             var options = new WindowsUpdateServiceOptions(
                 new Uri("http://127.0.0.1/manifest"),
-                new UpdateManifestPolicy(
-                    "PiRoundtable.Windows",
-                    "stable",
-                    "x64",
-                    new Dictionary<string, string> { ["test-key"] = _key.ExportSubjectPublicKeyInfoPem() },
-                    AllowLoopbackHttp: _allowLoopbackHttp),
+                Policy,
                 StagingRoot,
                 new Version(0, 1, 0));
-            return new WindowsUpdateService(options, client, new ConstantAuthenticodeVerifier(authenticodeTrusted));
+            return new WindowsUpdateService(options, client, authenticodeVerifier);
         }
 
         public void Dispose()

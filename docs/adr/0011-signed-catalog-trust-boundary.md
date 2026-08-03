@@ -60,6 +60,7 @@ claiming that a catalog verifier is a module resolver or installer.
 - Persisting an anti-rollback floor too early could suppress a still-needed
   catalog, so state ownership stays outside the pure verifier.
 - Deterministic adversarial and seeded malformed-input tests cover the current
-  contract. Sustained fuzzing, handle-relative staging, reparse-safe creation,
-  Authenticode-on-the-same-handle, and atomic promotion remain separate pending
-  work.
+  contract. Sustained verifier fuzzing remains pending. Handle-owned staging,
+  reparse-safe creation, Authenticode-on-the-same-handle, and atomic promotion
+  are separate side-effect work implemented by [ADR 0012](0012-handle-owned-windows-artifact-staging.md),
+  not behavior of this pure verifier.

@@ -198,7 +198,7 @@ public static class ArtifactVerifier
             : OpenPortableRead(path, fileShare);
         try
         {
-            await VerifyAsync(lease.Stream, spec, cancellationToken);
+            await VerifyOpenStreamAsync(lease.Stream, spec, cancellationToken);
             lease.Stream.Position = 0;
             return lease;
         }
@@ -241,7 +241,7 @@ public static class ArtifactVerifier
         }
     }
 
-    private static async Task VerifyAsync(
+    internal static async Task VerifyOpenStreamAsync(
         Stream source,
         ArtifactVerificationSpec spec,
         CancellationToken cancellationToken)
@@ -365,22 +365,58 @@ internal static class WindowsNoFollowFile
 
     private static List<SafeFileHandle> OpenParentDirectories(string fullPath)
     {
-        var directory = Directory.GetParent(fullPath);
-        var directories = new Stack<string>();
-        while (directory is not null)
+        var directory = Directory.GetParent(fullPath)
+            ?? throw new IOException("Artifact path must have a parent directory.");
+        return OpenDirectoryTree(directory.FullName, finalDirectoryAccess: 0, createMissing: false);
+    }
+
+    internal static List<SafeFileHandle> OpenOrCreateDirectoryTree(
+        string directoryPath,
+        uint finalDirectoryAccess)
+    {
+        return OpenDirectoryTree(directoryPath, finalDirectoryAccess, createMissing: true);
+    }
+
+    private static List<SafeFileHandle> OpenDirectoryTree(
+        string directoryPath,
+        uint finalDirectoryAccess,
+        bool createMissing)
+    {
+        var fullDirectoryPath = Path.GetFullPath(directoryPath);
+        var root = Path.GetPathRoot(fullDirectoryPath)
+            ?? throw new IOException("Artifact directory must have a filesystem root.");
+        var relative = Path.GetRelativePath(root, fullDirectoryPath);
+        var segments = relative == "."
+            ? Array.Empty<string>()
+            : relative.Split(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+                StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(segment => segment is "." or ".."))
         {
-            directories.Push(directory.FullName);
-            directory = directory.Parent;
+            throw new IOException("Artifact directory cannot contain relative traversal segments.");
         }
 
-        var handles = new List<SafeFileHandle>(directories.Count);
+        var paths = new List<string>(segments.Length + 1) { root };
+        var current = root;
+        foreach (var segment in segments)
+        {
+            current = Path.Combine(current, segment);
+            paths.Add(current);
+        }
+
+        var handles = new List<SafeFileHandle>(paths.Count);
         try
         {
-            while (directories.TryPop(out var path))
+            for (var index = 0; index < paths.Count; index++)
             {
+                var path = paths[index];
+                if (createMissing && index > 0)
+                {
+                    CreateDirectoryIfMissing(path);
+                }
                 var handle = CreateFileW(
                     ToExtendedPath(path),
-                    0,
+                    index == paths.Count - 1 ? finalDirectoryAccess : 0,
                     (uint)(FileShare.Read | FileShare.Write),
                     nint.Zero,
                     OpenExisting,
@@ -394,7 +430,7 @@ internal static class WindowsNoFollowFile
                 }
                 try
                 {
-                    RejectReparsePoint(handle);
+                    RejectReparsePoint(handle, requireDirectory: true);
                     handles.Add(handle);
                 }
                 catch
@@ -412,7 +448,7 @@ internal static class WindowsNoFollowFile
         }
     }
 
-    private static void RejectReparsePoint(SafeFileHandle handle)
+    internal static void RejectReparsePoint(SafeFileHandle handle, bool requireDirectory = false)
     {
         if (!GetFileInformationByHandleEx(
                 handle,
@@ -428,9 +464,13 @@ internal static class WindowsNoFollowFile
                 ArtifactIntegrityFailure.ReparsePoint,
                 "Artifact path cannot contain a reparse point.");
         }
+        if (requireDirectory && (information.FileAttributes & (uint)FileAttributes.Directory) == 0)
+        {
+            throw new IOException("Artifact path component must be a directory.");
+        }
     }
 
-    private static string ToExtendedPath(string path)
+    internal static string ToExtendedPath(string path)
     {
         if (path.StartsWith("\\\\?\\", StringComparison.Ordinal))
         {
@@ -443,12 +483,26 @@ internal static class WindowsNoFollowFile
         return $"\\\\?\\{path}";
     }
 
-    private static void DisposeHandles(List<SafeFileHandle> handles)
+    internal static void DisposeHandles(List<SafeFileHandle> handles)
     {
         for (var index = handles.Count - 1; index >= 0; index--)
         {
             handles[index].Dispose();
         }
+    }
+
+    private static void CreateDirectoryIfMissing(string path)
+    {
+        if (CreateDirectoryW(ToExtendedPath(path), nint.Zero))
+        {
+            return;
+        }
+        var error = Marshal.GetLastPInvokeError();
+        if (error is 80 or 183)
+        {
+            return;
+        }
+        throw new Win32Exception(error);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -467,6 +521,10 @@ internal static class WindowsNoFollowFile
         uint creationDisposition,
         uint flagsAndAttributes,
         nint templateFile);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateDirectoryW", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectoryW(string pathName, nint securityAttributes);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
