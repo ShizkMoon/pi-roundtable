@@ -195,12 +195,12 @@ public sealed class WindowsUpdateServiceTests
                 [UpdateTrustAnchor.KeyId] = UpdateTrustAnchor.PublicKeyPem,
             }));
 
-        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-03T00:00:00Z"));
+        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-04T00:00:00Z"));
 
-        Assert.AreEqual(new Version(0, 2, 2), verified.Version);
+        Assert.AreEqual(new Version(0, 3, 0), verified.Version);
         Assert.AreEqual("stable-2026-08", verified.Document.Signature.KeyId);
-        Assert.AreEqual(158351672, verified.Document.Asset.Size);
-        Assert.AreEqual("9C826AA81AEDA3D71225086828B1EE87B92F38A9658001710B7513CEE67B4F77", verified.Document.Asset.Sha256);
+        Assert.AreEqual(148653395, verified.Document.Asset.Size);
+        Assert.AreEqual("F39BDB09AB7590F5BD5F314B51170BE0255843C16A8E4C212867C7DA9C99B109", verified.Document.Asset.Sha256);
     }
 
     private static async Task AssertManifestFailsAsync(UpdateFixture fixture, string json, Type expectedType)
