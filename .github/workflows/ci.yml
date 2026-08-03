@@ -83,17 +83,20 @@ jobs:
         # GitHub's Windows runner closes the WiX ICE validation pipe for this
         # large self-contained package. Release builds keep validation on;
         # CI still compiles the complete MSI after tests have passed.
-        run: ./scripts/build-windows-x64.ps1 -Version 0.2.2 -SkipVerification -SuppressMsiValidation
+        run: ./scripts/build-windows-x64.ps1 -Version 0.3.0 -SkipVerification -SuppressMsiValidation
       - name: Test Authenticode signing pipeline on copies
         shell: pwsh
         run: ./scripts/test-windows-signing-pipeline.ps1
       - name: Test isolated MSI lifecycle
         shell: pwsh
-        run: ./scripts/test-windows-msi-lifecycle.ps1 -SkipLaunch
+        # Exercise the actual Node/runtime-host payload. The shell-only fixture
+        # remains available for quick local iterations, but cannot prove that a
+        # production upgrade and uninstall remove the complete runtime tree.
+        run: ./scripts/test-windows-msi-lifecycle.ps1 -UseFullPayload -SkipLaunch
       - uses: actions/upload-artifact@v4
         with:
-          name: PiRoundtable-0.2.2-win-x64
-          path: out/installer/PiRoundtable-0.2.2-win-x64.msi
+          name: PiRoundtable-0.3.0-win-x64
+          path: out/installer/PiRoundtable-0.3.0-win-x64.msi
           if-no-files-found: error
       - name: Upload Windows release QA evidence
         if: always()

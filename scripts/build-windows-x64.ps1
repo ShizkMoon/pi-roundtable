@@ -1,12 +1,14 @@
 ﻿param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.2.2',
+    [string]$Version = '0.3.0',
 
     [string]$OutputRoot,
 
     [string]$InstallerOutputRoot,
 
     [string]$NuGetConfigFile,
+
+    [switch]$IgnoreFailedPackageSources,
 
     [switch]$SkipVerification,
 
@@ -117,6 +119,40 @@ function Invoke-CheckedWixBuild {
     }
 }
 
+function Remove-NodeDevelopmentArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RuntimeRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApplicationRoot
+    )
+
+    $resolvedRuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
+    $resolvedApplicationRoot = [System.IO.Path]::GetFullPath($ApplicationRoot)
+    if (!(Test-PathIsStrictChild -Path $resolvedRuntimeRoot -Root $resolvedApplicationRoot)) {
+        throw "Runtime pruning root must remain inside the staged application: $resolvedRuntimeRoot"
+    }
+
+    # The embedded host executes JavaScript only. Type declarations, compiler
+    # state, and source maps are useful to developers but create thousands of
+    # MSI components and slow install/upgrade/uninstall without affecting stack
+    # traces or runtime module resolution.
+    $developmentNames = @('*.map', '*.d.ts', '*.d.mts', '*.d.cts', '*.tsbuildinfo')
+    $removedFiles = 0
+    $removedBytes = 0L
+    Get-ChildItem -LiteralPath $resolvedRuntimeRoot -Recurse -File | Where-Object {
+        $name = $_.Name
+        $developmentNames | Where-Object { $name -like $_ } | Select-Object -First 1
+    } | ForEach-Object {
+        $removedFiles++
+        $removedBytes += $_.Length
+        Remove-Item -LiteralPath $_.FullName -Force
+    }
+    Write-Host ("Pruned {0} non-runtime files ({1:N2} MiB) from the embedded Node payload." -f `
+        $removedFiles, ($removedBytes / 1MB))
+}
+
 try {
     $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $packageRoot = if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -129,6 +165,12 @@ try {
         throw "OutputRoot must remain inside $approvedOutputRoot."
     }
     $restoreConfigArgument = @()
+    if ($IgnoreFailedPackageSources) {
+        # Restore still resolves every pinned package. This only permits a
+        # complete local cache to satisfy the build when a remote feed is
+        # temporarily unavailable; missing packages continue to fail.
+        $restoreConfigArgument += '-p:RestoreIgnoreFailedSources=true'
+    }
     if (![string]::IsNullOrWhiteSpace($NuGetConfigFile)) {
         $resolvedNuGetConfig = [System.IO.Path]::GetFullPath($NuGetConfigFile)
         if (!(Test-Path -LiteralPath $resolvedNuGetConfig -PathType Leaf)) {
@@ -275,6 +317,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $dependencyStage 'package-lock.json') -Destination $runtimeHostStage -Force
     Remove-Item -LiteralPath $dependencyStage -Recurse -Force
     $dependencyStage = $null
+    Remove-NodeDevelopmentArtifacts -RuntimeRoot $runtimeHostStage -ApplicationRoot $appStage
 
     $nodeExecutable = (& node -p 'process.execPath').Trim()
     if (!(Test-Path -LiteralPath $nodeExecutable)) {
@@ -298,6 +341,11 @@ try {
         '--input-type=module',
         '--eval',
         "await import('@pi-roundtable/protocol')"
+    ) $runtimeHostStage
+    Invoke-Checked $packagedNode @(
+        '--input-type=module',
+        '--eval',
+        "await import('./index.js')"
     ) $runtimeHostStage
 
     if (![string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {

@@ -4,10 +4,10 @@
     [string]$OutputRoot,
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$BaselineVersion = '0.2.1',
+    [string]$BaselineVersion = '0.2.2',
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$CandidateVersion = '0.2.2',
+    [string]$CandidateVersion = '0.3.0',
 
     [string]$BaselineMsiPath,
 

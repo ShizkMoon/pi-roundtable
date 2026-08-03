@@ -59,6 +59,8 @@ import {
   type DiscussionObservationDecision,
   type DiscussionObserver,
 } from "./discussion-observer.js";
+import { buildStableRoleSystemPrompt } from "./runtime-context-policy.js";
+import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -1498,13 +1500,10 @@ export class LocalRoundtableHost {
     semanticInstruction?: string,
   ): string {
     return [
-      "[Roundtable role boundary]",
+      "[Roundtable turn]",
       `You are the only role answering this turn: ${role.displayName} (${roleId}).`,
-      "Answer only from this role's own perspective and responsibilities.",
       "Do not draft, simulate, summarize as, or create answer sections on behalf of any other mentioned role.",
       "A host message may contain shared requirements plus separate @role assignments. Apply the shared requirements, then perform only the assignment addressed to your display name.",
-      "Do not perform assignments addressed to other roles. If the message has no assignment specifically addressed to you, answer only the shared request.",
-      "You may reference or disagree with statements already present in the public record, but label only your own position.",
       "Respond to the latest public roundtable message. Keep private conversations private.",
       ...this.#discussionModeInstruction(),
       ...(semanticInstruction === undefined ? [] : ["", semanticInstruction]),
@@ -2246,6 +2245,7 @@ export class LocalRoundtableHost {
     if (configuration === undefined) {
       throw new Error("Resolved role runtime configuration is required");
     }
+    const plugins = resolvePiPluginSet(configuration.skillPaths, configuration.mcpServers);
     const options = {
       runtimeId: `${this.#runtimeId}:${roleId}`,
       roleId,
@@ -2266,9 +2266,13 @@ export class LocalRoundtableHost {
         ? {}
         : { thinkingLevel: configuration.thinkingLevel }),
       tools: [],
-      systemPrompt: configuration.systemPrompt,
-      skillPaths: configuration.skillPaths,
-      mcpServers: configuration.mcpServers,
+      systemPrompt: buildStableRoleSystemPrompt(
+        configuration.systemPrompt,
+        roleId,
+        configuration.displayName,
+      ),
+      skillPaths: plugins.skillPaths,
+      mcpServers: plugins.mcpServers,
       ...(configuration.delegation.maxConcurrentSubagents < 1
         ? {}
         : { subagentSpawner: (task: string) =>

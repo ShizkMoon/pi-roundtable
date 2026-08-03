@@ -12,7 +12,12 @@ import {
   type PromptOptions,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type, type Credential, type CredentialInfo, type CredentialStore } from "@earendil-works/pi-ai";
+import {
+  Type,
+  type Credential,
+  type CredentialInfo,
+  type CredentialStore,
+} from "@earendil-works/pi-ai";
 
 import type { ApiFamily, ModelCapability, ThinkingLevel } from "@pi-roundtable/protocol";
 
@@ -33,6 +38,10 @@ import {
   createProviderTransport,
   type ProviderTransport,
 } from "./provider-transport.js";
+import {
+  resolveRuntimeContextPolicy,
+  type RuntimeContextPolicyOptions,
+} from "./runtime-context-policy.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
@@ -72,6 +81,7 @@ export interface PiSessionCreateOptions {
   tools: readonly string[];
   apiKey: string;
   systemPrompt: string;
+  contextPolicy: RuntimeContextPolicyOptions;
   skillPaths: readonly string[];
   mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
   approvalHandler?: (request: McpToolApprovalRequest) => Promise<boolean>;
@@ -101,6 +111,7 @@ export interface PiRuntimeAdapterOptions {
   agentDir?: string;
   tools?: readonly string[];
   systemPrompt?: string;
+  contextPolicy?: RuntimeContextPolicyOptions;
   skillPaths?: readonly string[];
   mcpServers?: readonly ResolvedMcpServerRuntimeConfiguration[];
   /** Internal, host-defined tools; never populated from meeting message content. */
@@ -272,7 +283,17 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         throw toStageError("mcp_connect_failed", error);
       }
       const customTools = [...mcpTools, ...(options.customTools ?? [])];
-      const settingsManager = createIsolatedSettingsManager(options.thinkingLevel ?? "off");
+      // The model registry is authoritative for the final window. Computing
+      // from adapter defaults before model resolution can compact too late for
+      // a smaller built-in model or unnecessarily early for a larger one.
+      const contextPolicy = resolveRuntimeContextPolicy(
+        model.contextWindow,
+        options.contextPolicy,
+      );
+      const settingsManager = createIsolatedSettingsManager(
+        options.thinkingLevel ?? "off",
+        contextPolicy,
+      );
       const createOptions: CreateAgentSessionOptions = {
         cwd: options.cwd,
         modelRuntime,
@@ -321,7 +342,10 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         piStreamFunction(streamModel, context, {
           ...streamOptions,
           fetch: activeProviderTransport.fetch,
+          cacheRetention: streamOptions?.cacheRetention ?? contextPolicy.cacheRetention,
+          sessionId: streamOptions?.sessionId ?? options.sessionId,
         });
+      let disposePromise: Promise<void> | undefined;
       return {
         sessionId: session.sessionId,
         get isStreaming() {
@@ -333,12 +357,15 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         steer: (text) => session.steer(text),
         followUp: (text) => session.followUp(text),
         abort: () => session.abort(),
-        dispose: async () => {
-          try {
-            await session.dispose();
-          } finally {
-            await Promise.all([mcpManager.close(), activeProviderTransport.close()]);
-          }
+        dispose: () => {
+          disposePromise ??= (async () => {
+            try {
+              await session.dispose();
+            } finally {
+              await Promise.all([mcpManager.close(), activeProviderTransport.close()]);
+            }
+          })();
+          return disposePromise;
         },
       };
     } catch (error) {
@@ -619,6 +646,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         tools: [...(this.#options.tools ?? [])],
         apiKey,
         systemPrompt: this.#options.systemPrompt ?? "",
+        contextPolicy: { ...this.#options.contextPolicy },
         skillPaths: [...(this.#options.skillPaths ?? [])],
         mcpServers: [...(this.#options.mcpServers ?? [])],
         approvalHandler: (request) => this.#requestToolApproval(request),
@@ -1064,7 +1092,10 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   }
 }
 
-function createIsolatedSettingsManager(thinkingLevel: ThinkingLevel): SettingsManager {
+function createIsolatedSettingsManager(
+  thinkingLevel: ThinkingLevel,
+  contextPolicy: ReturnType<typeof resolveRuntimeContextPolicy>,
+): SettingsManager {
   // The frozen participant manifest is authoritative. Loading ~/.pi settings
   // would let unrelated CLI defaults, extensions, and timeouts alter a live
   // Windows-owned meeting after its configuration has been accepted.
@@ -1082,7 +1113,11 @@ function createIsolatedSettingsManager(thinkingLevel: ThinkingLevel): SettingsMa
         maxRetryDelayMs: 2_000,
       },
     },
-    compaction: { enabled: false },
+    compaction: {
+      enabled: contextPolicy.autoCompaction,
+      reserveTokens: contextPolicy.reserveTokens,
+      keepRecentTokens: contextPolicy.keepRecentTokens,
+    },
     packages: [],
     extensions: [],
     skills: [],

@@ -63,6 +63,20 @@ export {
   type PiDiscussionObserverOptions,
 } from "./discussion-observer.js";
 export { StdioRuntimeHost } from "./stdio-runtime-host.js";
+export {
+  buildStableRoleSystemPrompt,
+  resolveRuntimeContextPolicy,
+  type ResolvedRuntimeContextPolicy,
+  type RuntimeContextPolicyOptions,
+} from "./runtime-context-policy.js";
+export {
+  PI_PLUGIN_CAPABILITIES,
+  PI_PLUGIN_COMPATIBILITY_VERSION,
+  resolvePiPluginSet,
+  type PiPluginCompatibilityCapability,
+  type PiPluginCompatibilityMode,
+  type ResolvedPiPluginSet,
+} from "./pi-plugin-compatibility.js";
 export type {
   RuntimeAdapter,
   RuntimeCapabilities,
