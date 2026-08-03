@@ -14,4 +14,8 @@
     <AssemblyName>PiRoundtable.Updater</AssemblyName>
     <RootNamespace>PiRoundtable.Updater</RootNamespace>
   </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PiRoundtable.Distribution\PiRoundtable.Distribution.csproj" />
+  </ItemGroup>
 </Project>

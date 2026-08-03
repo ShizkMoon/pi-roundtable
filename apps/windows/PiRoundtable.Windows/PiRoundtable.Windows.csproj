@@ -28,6 +28,10 @@
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\PiRoundtable.Distribution\PiRoundtable.Distribution.csproj" />
+  </ItemGroup>
+
   <PropertyGroup>
     <NativeCorePath Condition="'$(Configuration)' == 'Release'">$(MSBuildProjectDirectory)\..\..\..\out\build\release\core\pi_roundtable_core.dll</NativeCorePath>
     <NativeCorePath Condition="'$(NativeCorePath)' == ''">$(MSBuildProjectDirectory)\..\..\..\out\build\dev\core\pi_roundtable_core.dll</NativeCorePath>

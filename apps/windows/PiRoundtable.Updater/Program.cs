@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
+using PiRoundtable.Distribution;
 
 namespace PiRoundtable.Updater;
 
@@ -243,7 +244,7 @@ internal static class Program
 
 public static class VerifiedPackageLock
 {
-    public static async Task<FileStream> OpenAsync(
+    public static async Task<VerifiedArtifactLease> OpenAsync(
         string path,
         long expectedSize,
         ReadOnlyMemory<byte> expectedSha256,
@@ -253,35 +254,26 @@ public static class VerifiedPackageLock
         {
             throw new ArgumentOutOfRangeException(nameof(expectedSize), "Expected MSI size and SHA-256 must be complete.");
         }
-        var attributes = File.GetAttributes(path);
-        if ((attributes & FileAttributes.ReparsePoint) != 0)
-        {
-            throw new IOException("The staged MSI cannot be a reparse point.");
-        }
-        var stream = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            128 * 1024,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
         try
         {
-            if (stream.Length != expectedSize)
-            {
-                throw new InvalidDataException("The staged MSI size changed after client verification.");
-            }
-            var actualHash = await SHA256.HashDataAsync(stream, cancellationToken);
-            if (!CryptographicOperations.FixedTimeEquals(actualHash, expectedSha256.Span))
-            {
-                throw new CryptographicException("The staged MSI hash changed after client verification.");
-            }
-            return stream;
+            return await ArtifactVerifier.OpenVerifiedReadAsync(
+                path,
+                new ArtifactVerificationSpec(expectedSize, expectedSha256.Span),
+                FileShare.Read,
+                cancellationToken);
         }
-        catch
+        catch (ArtifactIntegrityException exception) when (exception.Failure == ArtifactIntegrityFailure.ReparsePoint)
         {
-            await stream.DisposeAsync();
-            throw;
+            throw new IOException("The staged MSI cannot be a reparse point.", exception);
+        }
+        catch (ArtifactIntegrityException exception) when (
+            exception.Failure is ArtifactIntegrityFailure.SizeExceeded or ArtifactIntegrityFailure.SizeMismatch)
+        {
+            throw new InvalidDataException("The staged MSI size changed after client verification.", exception);
+        }
+        catch (ArtifactIntegrityException exception) when (exception.Failure == ArtifactIntegrityFailure.Sha256Mismatch)
+        {
+            throw new CryptographicException("The staged MSI hash changed after client verification.", exception);
         }
     }
 }

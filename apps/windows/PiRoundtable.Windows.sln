@@ -8,6 +8,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Windows.Tests"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Updater", "PiRoundtable.Updater\PiRoundtable.Updater.csproj", "{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PiRoundtable.Distribution", "PiRoundtable.Distribution\PiRoundtable.Distribution.csproj", "{564C72AE-49D1-4827-8D27-A21A0B58444D}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -40,5 +42,13 @@ Global
 		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|ARM64.Build.0 = Release|x64
 		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|x64.ActiveCfg = Release|x64
 		{041E26F9-E8F5-43F1-BF4B-C34A0E54A3A8}.Release|x64.Build.0 = Release|x64
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Debug|ARM64.ActiveCfg = Debug|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Debug|ARM64.Build.0 = Debug|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Debug|x64.Build.0 = Debug|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Release|ARM64.ActiveCfg = Release|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Release|ARM64.Build.0 = Release|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Release|x64.ActiveCfg = Release|Any CPU
+		{564C72AE-49D1-4827-8D27-A21A0B58444D}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

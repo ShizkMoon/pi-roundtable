@@ -34,6 +34,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm run check:schema
       - run: npm run build
       - run: npm test
 
@@ -54,6 +55,7 @@ jobs:
           npm install --global npm@12.0.1
           npm --version
       - run: npm ci
+      - run: npm run check:schema
       - run: npm run build
       - name: Configure native core
         run: cmake --preset dev
