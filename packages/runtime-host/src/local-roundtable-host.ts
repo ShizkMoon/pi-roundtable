@@ -63,6 +63,7 @@ import {
 import { buildStableRoleSystemPrompt } from "./runtime-context-policy.js";
 import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
 import { RuntimeGenerationOwner } from "./runtime-generation-owner.js";
+import { MeetingCommandRouter } from "./meeting-command-router.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -167,11 +168,6 @@ const MAX_CONCURRENT_DISCUSSION_OBSERVERS = 3;
 const MAX_REMEMBERED_OBSERVATION_IDS = 1_024;
 const ROLE_STOP_GRACE_MS = 2_000;
 
-interface RememberedReceipt {
-  fingerprint: string;
-  receipt: CommandReceipt;
-}
-
 interface ActiveTurnTimeout {
   commandId: string;
   handle: ReturnType<typeof setTimeout>;
@@ -184,11 +180,11 @@ export type LocalHostStopMode = "suspend" | "close";
 export class LocalRoundtableHost {
   readonly #options: LocalRoundtableHostOptions;
   readonly #runtimeOwner: RuntimeGenerationOwner;
+  readonly #commandRouter: MeetingCommandRouter;
   readonly #now: () => Date;
   readonly #turnTimeoutMs: number;
   readonly #roles = new Map<string, HostedRole>();
   readonly #adapterStopPromises = new WeakMap<RuntimeAdapter, Promise<void>>();
-  readonly #receipts = new Map<string, RememberedReceipt>();
   readonly #eventListeners = new Set<MeetingEventListener>();
   readonly #diagnosticListeners = new Set<HostDiagnosticListener>();
   readonly #expectedTurns = new Map<string, ExpectedTurn>();
@@ -219,7 +215,6 @@ export class LocalRoundtableHost {
   #deferredTerminalEvents:
     | { roleId: string; events: RuntimeEvent[] }
     | undefined;
-  #operationTail: Promise<void> = Promise.resolve();
   #workspace: WorkspaceProfile | undefined;
   #session: RoundtableSession | undefined;
   #credentials = new Map<string, string>();
@@ -243,6 +238,43 @@ export class LocalRoundtableHost {
     this.#publicMessagePlanner = options.publicMessagePlanner ?? new PiPublicMessagePlanner();
     this.#discussionScheduler = options.discussionScheduler ?? new FacilitatedDiscussionScheduler();
     this.#discussionObserver = options.discussionObserver ?? new PiDiscussionObserver();
+    this.#commandRouter = new MeetingCommandRouter({
+      readState: () => ({
+        meetingId: this.meetingId,
+        runtimeGeneration: this.runtimeGeneration,
+        sequence: this.#sequence,
+        leaseActive: this.#runtimeOwner.leaseActive,
+        stopRequested: this.#runtimeOwner.stopRequested,
+        stopped: this.#runtimeOwner.stopped,
+      }),
+      now: this.#now,
+      handlers: {
+        "meeting.open": (command) => this.#openMeeting(command),
+        "meeting.close": (command) => this.#closeMeeting(command),
+        "role.add": (command) => this.#addRole(command, "long_term", "role.registered"),
+        "role.create_temporary": (command) =>
+          this.#addRole(command, "temporary", "role.temporary_registered"),
+        "role.promote": (command) => this.#promoteRole(command),
+        "role.archive": (command) => this.#removeRole(command, true),
+        "role.remove": (command) => this.#removeRole(command, false),
+        "speech.broadcast": (command) => this.#broadcast(command),
+        "speech.direct": (command) => this.#direct(command),
+        "speech.prompt": (command) => this.#promptRole(command),
+        "speech.interrupt": (command) => this.#interrupt(command),
+        "generation.cancel": (command) => this.#cancel(command),
+        "subagent.spawn": (command) => this.#spawnSubagent(command),
+        "tool.approval.resolve": (command) => this.#resolveToolApproval(command),
+        "tool.invoke": (command) => this.#rejectUnsupportedToolInvocation(command),
+        "discussion.configure": (command) => this.#configureDiscussion(command),
+        "discussion.mode.set": (command) => this.#setDiscussionMode(command),
+        "discussion.resume": (command) => this.#resumeDiscussion(command),
+        "agenda.advance": (command) => this.#advanceAgenda(command),
+        "floor.request": (command) => this.#requestFloor(command),
+        "floor.grant": (command) => this.#grantFloor(command),
+        "floor.reject": (command) => this.#rejectFloor(command),
+        "convergence.record": (command) => this.#recordConvergence(command),
+      },
+    });
   }
 
   get meetingId(): string {
@@ -310,7 +342,7 @@ export class LocalRoundtableHost {
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.#enqueueOperation(() => this.#restoreConfiguredRolesNow());
+    return this.#commandRouter.serializeOperation(() => this.#restoreConfiguredRolesNow());
   }
 
   async #restoreConfiguredRolesNow(): Promise<void> {
@@ -374,49 +406,12 @@ export class LocalRoundtableHost {
   }
 
   execute(command: MeetingCommand): Promise<CommandReceipt> {
-    return this.#enqueueOperation(() => this.#executeSerialized(command));
-  }
-
-  async #executeSerialized(command: MeetingCommand): Promise<CommandReceipt> {
-    const fingerprint = JSON.stringify(command);
-    const remembered = this.#receipts.get(command.commandId);
-    if (remembered !== undefined) {
-      if (remembered.fingerprint !== fingerprint) {
-        return this.#receipt(
-          command,
-          "rejected",
-          "command_id_conflict",
-          "The command ID was already used with different content",
-        );
-      }
-      return { ...remembered.receipt, status: "duplicate" };
-    }
-
-    const validation = this.#validateEnvelope(command);
-    if (validation !== undefined) {
-      return this.#remember(command, fingerprint, validation);
-    }
-
-    let receipt: CommandReceipt;
-    try {
-      receipt = await this.#executeNew(command);
-    } catch {
-      receipt = this.#receipt(
-        command,
-        "rejected",
-        "host_execution_failed",
-        "Local Runtime Host could not execute the command",
-      );
-    }
-    if (this.#runtimeOwner.stopRequested && receipt.status === "accepted") {
-      receipt = this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
-    }
-    return this.#remember(command, fingerprint, receipt);
+    return this.#commandRouter.execute(command);
   }
 
   stop(mode: LocalHostStopMode = "suspend"): Promise<void> {
     this.#runtimeOwner.requestStop();
-    return this.#enqueueOperation(() => this.#stopNow(mode));
+    return this.#commandRouter.serializeOperation(() => this.#stopNow(mode));
   }
 
   async #stopNow(mode: LocalHostStopMode): Promise<void> {
@@ -479,143 +474,40 @@ export class LocalRoundtableHost {
     this.#runtimeOwner.clearConfiguration();
   }
 
-  #validateEnvelope(command: MeetingCommand): CommandReceipt | undefined {
-    if (command.protocolVersion !== PROTOCOL_VERSION) {
-      return this.#receipt(
-        command,
-        "rejected",
-        "unsupported_protocol",
-        `Expected protocol version ${PROTOCOL_VERSION}`,
-      );
+  #openMeeting(command: MeetingCommand): CommandReceipt {
+    if (this.#phase !== "created") {
+      return this.#invalidTransition(command);
     }
-    if (command.meetingId !== this.meetingId) {
-      return this.#receipt(command, "rejected", "meeting_mismatch", "Meeting ID mismatch");
-    }
-    if (!this.#runtimeOwner.matchesGeneration(command.runtimeGeneration)) {
-      return this.#receipt(
-        command,
-        "rejected",
-        "runtime_generation_mismatch",
-        "Command does not carry the active runtime generation",
-      );
-    }
-    if (
-      command.expectedSequence !== undefined &&
-      command.expectedSequence !== null &&
-      command.expectedSequence !== this.#sequence
-    ) {
-      return this.#receipt(
-        command,
-        "rejected",
-        "sequence_mismatch",
-        `Expected sequence ${this.#sequence}`,
-      );
-    }
-    if (
-      !this.#runtimeOwner.leaseActive ||
-      this.#runtimeOwner.stopRequested ||
-      this.#runtimeOwner.stopped
-    ) {
-      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
-    }
-    return undefined;
+    this.#phase = "live";
+    this.#emit("meeting.opened", this.runtimeId, null, command.commandId, {});
+    return this.#accepted(command);
   }
 
-  async #executeNew(command: MeetingCommand): Promise<CommandReceipt> {
-    switch (command.kind) {
-      case "meeting.open":
-        if (this.#phase !== "created") {
-          return this.#invalidTransition(command);
-        }
-        this.#phase = "live";
-        this.#emit("meeting.opened", this.runtimeId, null, command.commandId, {});
-        return this.#accepted(command);
-
-      case "meeting.close":
-        if (this.#phase !== "live") {
-          return this.#invalidTransition(command);
-        }
-        this.#phase = "closed";
-        this.#activeRoleId = undefined;
-        this.#activeTurnCorrelationId = undefined;
-        this.#pendingHandoff = undefined;
-        this.#expectedTurns.clear();
-        this.#pendingPublicTurns.length = 0;
-        await this.#stopAllRoles();
-        if (this.#runtimeOwner.stopRequested) {
-          return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
-        }
-        this.#emit("meeting.closed", this.runtimeId, null, command.commandId, {});
-        return this.#accepted(command);
-
-      case "role.add":
-        return this.#addRole(command, "long_term", "role.registered");
-
-      case "role.create_temporary":
-        return this.#addRole(command, "temporary", "role.temporary_registered");
-
-      case "role.promote":
-        return this.#promoteRole(command);
-
-      case "role.archive":
-        return this.#removeRole(command, true);
-
-      case "role.remove":
-        return this.#removeRole(command, false);
-
-      case "speech.broadcast":
-        return this.#broadcast(command);
-
-      case "speech.direct":
-        return this.#direct(command);
-
-      case "speech.prompt":
-        return this.#promptRole(command);
-
-      case "speech.interrupt":
-        return this.#interrupt(command);
-
-      case "generation.cancel":
-        return this.#cancel(command);
-
-      case "tool.approval.resolve":
-        return this.#resolveToolApproval(command);
-
-      case "subagent.spawn":
-        return this.#spawnSubagent(command);
-
-      case "tool.invoke":
-        return this.#receipt(
-          command,
-          "rejected",
-          "unsupported_command",
-          "Tools and subagents require an explicit capability policy",
-        );
-
-      case "discussion.configure":
-        return this.#configureDiscussion(command);
-
-      case "discussion.mode.set":
-        return this.#setDiscussionMode(command);
-
-      case "discussion.resume":
-        return this.#resumeDiscussion(command);
-
-      case "agenda.advance":
-        return this.#advanceAgenda(command);
-
-      case "floor.request":
-        return this.#requestFloor(command);
-
-      case "floor.grant":
-        return this.#grantFloor(command);
-
-      case "floor.reject":
-        return this.#rejectFloor(command);
-
-      case "convergence.record":
-        return this.#recordConvergence(command);
+  async #closeMeeting(command: MeetingCommand): Promise<CommandReceipt> {
+    if (this.#phase !== "live") {
+      return this.#invalidTransition(command);
     }
+    this.#phase = "closed";
+    this.#activeRoleId = undefined;
+    this.#activeTurnCorrelationId = undefined;
+    this.#pendingHandoff = undefined;
+    this.#expectedTurns.clear();
+    this.#pendingPublicTurns.length = 0;
+    await this.#stopAllRoles();
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
+    this.#emit("meeting.closed", this.runtimeId, null, command.commandId, {});
+    return this.#accepted(command);
+  }
+
+  #rejectUnsupportedToolInvocation(command: MeetingCommand): CommandReceipt {
+    return this.#receipt(
+      command,
+      "rejected",
+      "unsupported_command",
+      "Tools and subagents require an explicit capability policy",
+    );
   }
 
   async #resolveToolApproval(command: MeetingCommand): Promise<CommandReceipt> {
@@ -2039,7 +1931,7 @@ export class LocalRoundtableHost {
         this.#acceptedObserverFloorRequests.delete(oldest);
       }
     }
-    const receipt = await this.#executeSerialized({
+    const receipt = await this.#commandRouter.executeWithinSerializedOperation({
       protocolVersion: PROTOCOL_VERSION,
       meetingId: this.meetingId,
       commandId: `observer-floor:${observationId}`,
@@ -2909,17 +2801,8 @@ export class LocalRoundtableHost {
     }
   }
 
-  #enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#operationTail.then(operation);
-    this.#operationTail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
-
   #enqueueInternal(operation: () => Promise<void>): void {
-    void this.#enqueueOperation(async () => {
+    void this.#commandRouter.serializeOperation(async () => {
       // A callback can enqueue continuation work while stop is already behind
       // the current operation. Fence again at execution so nothing mutates the
       // meeting or emits after the authoritative lease has been released.
@@ -3069,38 +2952,7 @@ export class LocalRoundtableHost {
     message: string | null,
     sequence?: number,
   ): CommandReceipt {
-    const receipt: CommandReceipt = {
-      protocolVersion: PROTOCOL_VERSION,
-      meetingId: this.meetingId,
-      commandId: command.commandId,
-      status,
-      acknowledgedAt: this.#now().toISOString(),
-    };
-    if (errorCode !== null) {
-      receipt.errorCode = errorCode;
-    }
-    if (message !== null) {
-      receipt.message = message;
-    }
-    if (sequence !== undefined) {
-      receipt.sequence = sequence;
-    }
-    return receipt;
-  }
-
-  #remember(
-    command: MeetingCommand,
-    fingerprint: string,
-    receipt: CommandReceipt,
-  ): CommandReceipt {
-    if (this.#receipts.size >= 2_048) {
-      const oldest = this.#receipts.keys().next().value as string | undefined;
-      if (oldest !== undefined) {
-        this.#receipts.delete(oldest);
-      }
-    }
-    this.#receipts.set(command.commandId, { fingerprint, receipt });
-    return receipt;
+    return this.#commandRouter.createReceipt(command, status, errorCode, message, sequence);
   }
 
   #readString(payload: JsonObject, key: string): string | undefined {
