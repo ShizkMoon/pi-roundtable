@@ -13,8 +13,13 @@
   "scripts": {
     "build": "npm run clean && tsc -b packages/protocol-ts packages/runtime-host packages/sync-server",
     "check:schema": "node scripts/check-protocol-schemas.mjs",
+    "check:version": "node scripts/check-repository-version.mjs",
     "clean": "node scripts/clean.mjs",
+    "quality:fast": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope Fast",
+    "quality:release-candidate": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope ReleaseCandidate",
+    "quality:windows": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope Windows",
     "test": "npm run build && npm run test --workspaces --if-present",
+    "version:set": "node scripts/set-repository-version.mjs",
     "dev:runtime": "npm run build --workspace @pi-roundtable/runtime-host && npm run start:stdio --workspace @pi-roundtable/runtime-host",
     "dev:sync": "npm run dev --workspace @pi-roundtable/sync-server"
   },

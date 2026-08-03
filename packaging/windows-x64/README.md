@@ -18,7 +18,7 @@ Outputs:
 
 The client updater uses a signed canonical manifest with an ECDSA P-256 public key pinned in the application. It then verifies the exact MSI byte count and SHA-256 before atomically promoting a staged package. If a manifest declares `authenticodeRequired: true`, Windows Authenticode trust must also succeed; otherwise installation fails closed. `scripts/New-WindowsUpdateManifest.ps1` signs a release manifest using a private key outside the repository. Never commit that private key.
 
-Without an external production certificate the MSI remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD`, imported non-exportable for the build, and removed in `finally`:
+Without an external production certificate the MSI remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from the process-scoped `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD` (persisted user/machine values are rejected), imported non-exportable for the build, and removed in `finally`:
 
 ```powershell
 $env:PI_ROUNDTABLE_SIGNING_PFX_PASSWORD = '<secret from CI secret store>'
@@ -28,7 +28,7 @@ pwsh -File .\scripts\build-signed-windows-x64.ps1 `
   -TimestampUrl https://timestamp.example.com
 ```
 
-The build signs first-party EXE/DLL files before generating `GeneratedFiles.wxs`, signs the MSI after WiX linking, verifies the selected signer and timestamp, and calculates release hashes last. Pull-request/local mechanics can be tested without retaining a certificate:
+The build signs first-party EXE/DLL files before generating `GeneratedFiles.wxs`, signs the MSI after WiX linking, verifies the selected signer and timestamp, and calculates release hashes last. It writes `out\package\windows-x64\signed-build-report.json`, binding all five signed artifacts to `VERSION`, the current Git commit, byte size, SHA-256, signer, and timestamper. A build using `-SkipVerification` or `-SuppressMsiValidation` is recorded only as `passed`; it cannot satisfy the Release Candidate gate. Pull-request/local mechanics can be tested without retaining a certificate:
 
 ```powershell
 pwsh -File .\scripts\test-windows-signing-pipeline.ps1
@@ -66,7 +66,7 @@ pwsh -File .\scripts\run-windows-theme-visual-qa.ps1 `
 )
 ```
 
-The per-session script verifies light, dark, and real Windows high contrast at 720/900/1280/1520 DIP, restores the original high-contrast flags and scheme, and records actual `GetDpiForWindow` output. The aggregate gate requires exactly the real 96/144/192 DPI evidence; it does not emulate scaling. ARM64 packaging remains pending.
+The per-session script verifies light, dark, and real Windows high contrast at 720/900/1280/1520 DIP, restores the original high-contrast flags and scheme, and records actual `GetDpiForWindow` output. Each report is bound to the repository version, Git commit, and tested WinUI EXE SHA-256. The aggregate gate requires exactly the real 96/144/192 DPI evidence from the same executable; it does not emulate scaling. The final Release Candidate workflow and clean-VM production lifecycle report format are defined in [`docs/quality/release-candidate-evidence.md`](../../docs/quality/release-candidate-evidence.md). ARM64 packaging remains pending.
 
 WiX cannot encode the embedded nonnumeric language metadata in the Windows App SDK MUI files for `gd-gb`, `mi-NZ`, and `ug-CN`; the MSI omits those six localized MUI files and Windows falls back to neutral resources for those locales. Simplified Chinese, English, and the other published resources remain included.
 

@@ -1,6 +1,6 @@
 ﻿param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.3.0',
+    [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
+    [string]$Version = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -Raw).Trim(),
 
     [string]$OutputRoot,
 
@@ -41,6 +41,10 @@
 )
 
 $ErrorActionPreference = 'Stop'
+$versionParts = @($Version.Split('.') | ForEach-Object { [uint32]$_ })
+if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -gt 65535) {
+    throw 'Version exceeds Windows Installer limits (major/minor <= 255 and patch <= 65535).'
+}
 $dependencyStage = $null
 $temporaryWixNuGetConfig = $null
 . (Join-Path $PSScriptRoot 'windows-packaging.ps1')

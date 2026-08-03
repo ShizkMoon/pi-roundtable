@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using PiRoundtable.Updater;
 using PiRoundtable.Windows.Services.Updater;
 
@@ -49,6 +50,35 @@ public sealed class WindowsUpdateServiceTests
         await AssertManifestFailsAsync(fixture, tampered, typeof(CryptographicException));
         await AssertManifestFailsAsync(fixture, duplicated, typeof(InvalidDataException));
         await AssertManifestFailsAsync(fixture, unknown, typeof(JsonException));
+    }
+
+    [TestMethod]
+    [DataRow("asset")]
+    [DataRow("signature")]
+    public async Task Null_manifest_objects_fail_as_invalid_data_instead_of_crashing(string propertyName)
+    {
+        using var fixture = new UpdateFixture();
+        var manifest = fixture.CreateManifest([1], "0.2.0");
+        var document = JsonNode.Parse(fixture.SignAndSerialize(manifest))!.AsObject();
+        document[propertyName] = null;
+
+        await AssertManifestFailsAsync(fixture, document.ToJsonString(), typeof(InvalidDataException));
+    }
+
+    [TestMethod]
+    [DataRow("00.2.0")]
+    [DataRow("256.0.0")]
+    [DataRow("0.256.0")]
+    [DataRow("0.0.65536")]
+    public async Task Signed_manifest_rejects_noncanonical_or_uninstallable_versions(string invalidVersion)
+    {
+        using var fixture = new UpdateFixture();
+        var manifest = fixture.CreateManifest([1], invalidVersion);
+
+        await AssertManifestFailsAsync(
+            fixture,
+            Encoding.UTF8.GetString(fixture.SignAndSerialize(manifest)),
+            typeof(InvalidDataException));
     }
 
     [TestMethod]

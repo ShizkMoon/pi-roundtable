@@ -58,6 +58,22 @@ npm test
 npm run dev:sync
 ```
 
+仓库根目录的 `VERSION` 是当前构建版本；npm workspace/lock 与 Runtime Host
+身份通过 `npm run check:version` 核对，并可用
+`npm run version:set -- <major.minor.patch>` 幂等更新。该命令不会改写已签名的稳定
+更新清单或历史 QA 版本。更新命令在首次写入前校验全部目标，使用互斥锁和可恢复事务
+日志，进程中断后下次调用会先回滚。跨平台快速质量门禁可运行
+`npm run quality:fast`；Windows 打包、默认 ICE、签名机械链与隔离 MSI 生命周期使用
+`npm run quality:windows`。每次门禁写入独立运行目录；命令退出码只记录为 `passed`，
+只有解析并核对版本、提交、工件哈希和时间的报告才能记录为 `verified`。
+
+正式 `ReleaseCandidate` 是对已经完成的签名构建及现场证据作最终失败关闭核验：必须
+提供完整测试/ICE 均未跳过的生产签名构建报告、与已签名 stable manifest 字节一致的
+基线 MSI、同一候选工件在 clean VM 上完成真实 production stable→candidate 升级的
+报告，以及绑定同一 WinUI EXE 的真实 96/144/192 DPI 报告。普通 CI、一次性自签名
+smoke 和隔离 QA UpgradeCode 生命周期都不能替代这些证据。完整契约见
+[`Release Candidate evidence contract`](docs/quality/release-candidate-evidence.md)。
+
 同步服务默认监听 `http://127.0.0.1:4317`。健康检查无需认证；所有 `/v1` 路由都要求由 `PI_ROUNDTABLE_AUTH_KEYS_JSON` 验证的签名设备令牌。未设置 `DATABASE_URL` 时仅使用内存存储，适合有界本机开发；配置 PostgreSQL 后启动时会应用幂等迁移。令牌约束和待完成的 TLS/E2EE 边界见 [`packages/sync-server/README.md`](packages/sync-server/README.md)。
 
 ### Android
@@ -107,7 +123,7 @@ pwsh -File .\scripts\run-windows-theme-visual-qa.ps1 `
   -AppRoot .\out\package\windows-x64\app -ExpectedDpi 144
 ```
 
-`merge-windows-visual-matrix.ps1` 只接受真实 96/144/192 DPI 会话分别生成的三主题报告；任何缺失或实际 DPI 不符都会失败。正式签名使用 `build-signed-windows-x64.ps1`，证书必须来自仓库外的 PFX 或证书存储，密码只从环境变量读取，并要求 RFC 3161 时间戳与可信链验证。完整操作和证据口径见 [`packaging/windows-x64/README.md`](packaging/windows-x64/README.md)。ARM64 MSI 仍为 pending。
+`merge-windows-visual-matrix.ps1` 只接受真实 96/144/192 DPI 会话分别生成、且产品版本、Git 提交与应用 EXE SHA-256 完全一致的三主题报告；任何缺失、过期或实际 DPI 不符都会失败。正式签名使用 `build-signed-windows-x64.ps1`，证书必须来自仓库外的 PFX 或证书存储，PFX 密码只能存在于当前进程环境，并要求 RFC 3161 时间戳与可信链验证。脚本会输出 `signed-build-report.json`，但使用 `-SkipVerification` 或 `-SuppressMsiValidation` 的构建只能标记为 `passed`，不能进入 RC。完整操作和证据口径见 [`packaging/windows-x64/README.md`](packaging/windows-x64/README.md)。ARM64 MSI 仍为 pending。
 
 当前 Windows 工作站已分别 verified 精简 WinUI 壳和完整 22,594 文件生产负载的隔离生命周期；这证明自动化及当前 0.2.1→0.2.2 QA 包可完成安装、修复、升级、降级阻止和卸载，但每个新的 release candidate 仍必须重新运行，不能沿用本次现场结果。
 

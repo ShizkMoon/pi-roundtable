@@ -39,6 +39,10 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
         RejectDuplicateProperties(json);
         var document = JsonSerializer.Deserialize<UpdateManifestDocument>(json, SerializerOptions)
             ?? throw new InvalidDataException("更新清单无法解析。");
+        if (document.Asset is null || document.Signature is null)
+        {
+            throw new InvalidDataException("更新清单缺少工件或签名对象。");
+        }
 
         ValidateCanonicalField(document.ProductId, nameof(document.ProductId));
         ValidateCanonicalField(document.Channel, nameof(document.Channel));
@@ -92,9 +96,13 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
             }
         }
 
-        if (!ThreePartVersionRegex().IsMatch(document.Version) || !Version.TryParse(document.Version, out var version))
+        if (!ThreePartVersionRegex().IsMatch(document.Version) ||
+            !Version.TryParse(document.Version, out var version) ||
+            version.Major > 255 ||
+            version.Minor > 255 ||
+            version.Build > 65535)
         {
-            throw new InvalidDataException("更新版本必须是三段数字版本号。");
+            throw new InvalidDataException("更新版本必须是无前导零且符合 Windows Installer 范围的三段数字版本号。");
         }
         if (!DateTimeOffset.TryParseExact(
                 document.PublishedAt,
@@ -193,7 +201,7 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
         }
     }
 
-    [GeneratedRegex(@"^\d+\.\d+\.\d+$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$", RegexOptions.CultureInvariant)]
     private static partial Regex ThreePartVersionRegex();
 
     [GeneratedRegex(@"^[0-9A-Fa-f]{64}$", RegexOptions.CultureInvariant)]

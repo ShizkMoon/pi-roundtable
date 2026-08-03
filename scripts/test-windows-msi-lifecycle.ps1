@@ -3,11 +3,11 @@
 
     [string]$OutputRoot,
 
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
     [string]$BaselineVersion = '0.2.2',
 
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$CandidateVersion = '0.3.0',
+    [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
+    [string]$CandidateVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\VERSION') -Raw).Trim(),
 
     [string]$BaselineMsiPath,
 
@@ -22,7 +22,21 @@
 )
 
 $ErrorActionPreference = 'Stop'
+$startedAt = [DateTimeOffset]::UtcNow
+foreach ($versionEntry in @(
+    [ordered]@{ Name = 'BaselineVersion'; Value = $BaselineVersion },
+    [ordered]@{ Name = 'CandidateVersion'; Value = $CandidateVersion })) {
+    $versionParts = @($versionEntry.Value.Split('.') | ForEach-Object { [uint32]$_ })
+    if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -gt 65535) {
+        throw "$($versionEntry.Name) exceeds Windows Installer limits (major/minor <= 255 and patch <= 65535)."
+    }
+}
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repositoryVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Unable to bind the MSI lifecycle report to the current Git commit.'
+}
 $approvedOutputRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'out'))
 . (Join-Path $PSScriptRoot 'windows-packaging.ps1')
 $effectiveMsiTimeoutMinutes = if ($MsiTimeoutMinutes -gt 0) {
@@ -358,6 +372,8 @@ try {
     }
     $baselineProperties = [ordered]@{
         path = $baselineMsi
+        size = (Get-Item -LiteralPath $baselineMsi).Length
+        sha256 = (Get-FileHash -LiteralPath $baselineMsi -Algorithm SHA256).Hash.ToUpperInvariant()
         productCode = Get-MsiProperty $baselineMsi 'ProductCode'
         productVersion = Get-MsiProperty $baselineMsi 'ProductVersion'
         productName = Get-MsiProperty $baselineMsi 'ProductName'
@@ -365,6 +381,8 @@ try {
     }
     $candidateProperties = [ordered]@{
         path = $candidateMsi
+        size = (Get-Item -LiteralPath $candidateMsi).Length
+        sha256 = (Get-FileHash -LiteralPath $candidateMsi -Algorithm SHA256).Hash.ToUpperInvariant()
         productCode = Get-MsiProperty $candidateMsi 'ProductCode'
         productVersion = Get-MsiProperty $candidateMsi 'ProductVersion'
         productName = Get-MsiProperty $candidateMsi 'ProductName'
@@ -450,7 +468,12 @@ try {
     $productionUnchanged = ($productionBefore -join '|') -eq ($productionAfter -join '|')
     $qaProductsRemaining = @(Get-RelatedProducts $qaUpgradeCode)
     $report = [ordered]@{
+        schemaVersion = 2
+        evidenceId = [Guid]::NewGuid().ToString()
         status = $(if ($null -eq $failure -and $qaProductsRemaining.Count -eq 0 -and $productionUnchanged) { 'verified' } else { 'failed' })
+        evidenceClass = 'isolated-qa-msi-lifecycle'
+        repositoryVersion = $repositoryVersion
+        sourceCommit = $sourceCommit
         failure = $failure
         isolation = [ordered]@{
             productName = $qaProductName
@@ -468,6 +491,7 @@ try {
         installDirectory = $qaInstallDirectory
         steps = $steps
         cleanup = $cleanupSteps
+        startedAt = $startedAt.ToString('O')
         verifiedAt = [DateTimeOffset]::UtcNow.ToString('O')
     }
     $reportPath = Join-Path $resolvedOutput 'msi-lifecycle-report.json'
