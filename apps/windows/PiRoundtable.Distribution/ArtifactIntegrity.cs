@@ -154,15 +154,14 @@ public static class ArtifactVerifier
         long total = 0;
         while (true)
         {
-            var remainingWithSentinel = spec.ExpectedSize - total + 1;
-            var requested = (int)Math.Min(buffer.Length, remainingWithSentinel);
+            var requested = GetReadSizeWithSentinel(spec.ExpectedSize, total, buffer.Length);
             var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
             if (read == 0)
             {
                 break;
             }
 
-            if (total + read > spec.ExpectedSize)
+            if (read > spec.ExpectedSize - total)
             {
                 throw new ArtifactIntegrityException(
                     ArtifactIntegrityFailure.SizeExceeded,
@@ -259,20 +258,19 @@ public static class ArtifactVerifier
         long total = 0;
         while (true)
         {
-            var remainingWithSentinel = spec.ExpectedSize - total + 1;
-            var requested = (int)Math.Min(buffer.Length, remainingWithSentinel);
+            var requested = GetReadSizeWithSentinel(spec.ExpectedSize, total, buffer.Length);
             var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
             if (read == 0)
             {
                 break;
             }
-            total += read;
-            if (total > spec.ExpectedSize)
+            if (read > spec.ExpectedSize - total)
             {
                 throw new ArtifactIntegrityException(
                     ArtifactIntegrityFailure.SizeExceeded,
                     "Artifact contains more bytes than its trusted descriptor allows.");
             }
+            total += read;
             hash.AppendData(buffer.AsSpan(0, read));
         }
 
@@ -293,6 +291,14 @@ public static class ArtifactVerifier
                 ArtifactIntegrityFailure.Sha256Mismatch,
                 "Artifact SHA-256 does not match its trusted descriptor.");
         }
+    }
+
+    private static int GetReadSizeWithSentinel(long expectedSize, long consumed, int bufferLength)
+    {
+        var remaining = expectedSize - consumed;
+        return remaining >= bufferLength
+            ? bufferLength
+            : checked((int)remaining + 1);
     }
 
     private static VerifiedArtifactLease OpenPortableRead(string path, FileShare fileShare)
@@ -494,8 +500,10 @@ public static class BoundedContent
         var buffer = new byte[bufferLength];
         while (true)
         {
-            var remainingWithSentinel = maximumBytes - checked((int)content.Length) + 1;
-            var requested = Math.Min(buffer.Length, remainingWithSentinel);
+            var remaining = maximumBytes - content.Length;
+            var requested = remaining >= buffer.Length
+                ? buffer.Length
+                : checked((int)remaining + 1);
             var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
             if (read == 0)
             {
