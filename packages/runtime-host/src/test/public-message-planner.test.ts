@@ -97,6 +97,9 @@ const REQUEST: PublicMessagePlanningRequest = {
     { roleId: "role.experience", displayName: "体验官" },
   ],
   model: {
+    ownerRoleId: "role.architect",
+    runtimeGeneration: 3,
+    roleSessionToken: "3.1",
     providerId: "deepseek",
     providerName: "DeepSeek",
     apiFamily: "openai_chat_completions",
@@ -139,6 +142,8 @@ test("runs semantic planning in an isolated Pi session and validates exact excer
   assert.deepEqual(adapter?.options.tools, []);
   assert.deepEqual(adapter?.options.skillPaths, []);
   assert.deepEqual(adapter?.options.mcpServers, []);
+  assert.match(adapter?.options.runtimeId ?? "", /g3:role\.architect/);
+  assert.match(adapter?.options.sessionId ?? "", /\.3\.3\.1\./);
   assert.equal(adapter?.options.subagentSpawner, undefined);
   assert.equal(adapter?.options.maxOutputTokens, 2_048);
   assert.match(adapter?.options.systemPrompt ?? "", /Return exactly one JSON object/);

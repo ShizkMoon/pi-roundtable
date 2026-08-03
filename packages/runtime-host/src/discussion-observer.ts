@@ -114,8 +114,8 @@ export class PiDiscussionObserver implements DiscussionObserver {
     };
     const adapter = this.#adapterFactory({
       roleId,
-      runtimeId: `discussion-observer-runtime:${observerId}`,
-      sessionId: `discussion-observer-session.${observerId}`,
+      runtimeId: `discussion-observer-runtime:g${model.runtimeGeneration}:${model.ownerRoleId}:${observerId}`,
+      sessionId: `discussion-observer-session.${model.runtimeGeneration}.${model.roleSessionToken}.${observerId}`,
       providerId: model.providerId,
       providerName: model.providerName,
       apiFamily: model.apiFamily,

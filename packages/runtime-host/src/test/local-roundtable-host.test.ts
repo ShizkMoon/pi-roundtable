@@ -131,6 +131,27 @@ class ControlledSubagentRunner implements SubagentRunner {
   }
 }
 
+class AbortAwareSubagentRunner implements SubagentRunner {
+  readonly requests: SubagentRunRequest[] = [];
+  readonly signals: AbortSignal[] = [];
+
+  run(
+    request: SubagentRunRequest,
+    _onProgress: (progress: { updateCount: number }) => void,
+    signal: AbortSignal,
+  ): Promise<string> {
+    this.requests.push(request);
+    this.signals.push(signal);
+    return new Promise<string>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new Error("controlled child cancellation")),
+        { once: true },
+      );
+    });
+  }
+}
+
 class ControlledPublicMessagePlanner implements PublicMessagePlanner {
   readonly requests: PublicMessagePlanningRequest[] = [];
 
@@ -170,6 +191,20 @@ class ControlledDiscussionObserver implements DiscussionObserver {
   }
 }
 
+class DeferredDiscussionObserver implements DiscussionObserver {
+  readonly requests: DiscussionObservationRequest[] = [];
+  readonly pending: Array<{
+    resolve: (decision: DiscussionObservationDecision) => void;
+  }> = [];
+
+  observe(request: DiscussionObservationRequest): Promise<DiscussionObservationDecision> {
+    this.requests.push(structuredClone(request));
+    return new Promise<DiscussionObservationDecision>((resolve) => {
+      this.pending.push({ resolve });
+    });
+  }
+}
+
 function createObservedWorkspaceAndSession(): {
   workspace: WorkspaceProfile;
   session: RoundtableSession;
@@ -206,6 +241,75 @@ function command(
     payload: {},
     ...overrides,
   };
+}
+
+async function startObservedFreeDiscussion(observer: DiscussionObserver): Promise<{
+  host: LocalRoundtableHost;
+  adapters: Map<string, FakeRuntimeAdapter>;
+  events: MeetingEvent[];
+  speaker: FakeRuntimeAdapter;
+  correlationId: string;
+}> {
+  const { workspace, session } = createObservedWorkspaceAndSession();
+  const planner = new ControlledPublicMessagePlanner({
+    sharedRequirements: [],
+    roleTasks: { "participant.secretary": [] },
+    groupTasks: [],
+    speakerOrder: ["participant.secretary"],
+  });
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    publicMessagePlanner: planner,
+    discussionObserver: observer,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(workspace, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  await host.execute(command("role.add", "add-observed-secretary", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("role.add", "add-observed-risk", {
+    actorId: "participant.risk",
+  }));
+  await host.execute(command("meeting.open", "open-observer-fence"));
+  await host.execute(command("discussion.configure", "configure-observer-fence", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["Runtime ownership"],
+      limits: { maxObserverProbesPerSegment: 4 },
+    },
+  }));
+  await host.execute(command("discussion.mode.set", "free-observer-fence", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "test" },
+  }));
+  await host.execute(command("speech.broadcast", "broadcast-observer-fence", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "请讨论模型执行边界。",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const speaker = adapters.get("participant.secretary");
+  assert.ok(speaker !== undefined);
+  const turn = speaker.commands.at(-1);
+  assert.equal(turn?.kind, "turn.prompt");
+  const correlationId = turn?.commandId;
+  assert.ok(correlationId !== undefined);
+  speaker.emit("turn.started", {}, correlationId);
+  return { host, adapters, events, speaker, correlationId };
 }
 
 const TEST_WORKSPACE: WorkspaceProfile = {
@@ -820,6 +924,138 @@ test("runs one final observer probe when a completed speech adds no new text", a
   await host.stop();
 });
 
+test("drops a queued observer decision after the candidate role is recreated", async () => {
+  const observer = new DeferredDiscussionObserver();
+  const { host, adapters, events, speaker, correlationId } =
+    await startObservedFreeDiscussion(observer);
+  speaker.emit("turn.delta", {
+    delta: `同步服务器直接执行所有模型调用。${"这是一段仍在继续的公开发言。".repeat(20)}`,
+  }, correlationId);
+  await waitFor(() => observer.requests.length === 1, "deferred observer should start");
+
+  const candidate = adapters.get("participant.risk");
+  assert.ok(candidate !== undefined);
+  const entered = createDeferredSignal();
+  const release = createDeferredSignal();
+  candidate.onExecute = async (runtimeCommand) => {
+    if (runtimeCommand.commandId === "hold-observer-apply") {
+      entered.resolve();
+      await release.promise;
+    }
+    return { commandId: runtimeCommand.commandId, accepted: true };
+  };
+  const blocking = host.execute(command("tool.approval.resolve", "hold-observer-apply", {
+    actorId: "user.direct_host",
+    targetId: "participant.risk",
+    payload: { approvalId: "approval.observer-fence", approved: true },
+  }));
+  await entered.promise;
+  const baselineFloorRequests = events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length;
+  const removing = host.execute(command("role.remove", "remove-observer-candidate", {
+    actorId: "participant.risk",
+  }));
+  const adding = host.execute(command("role.add", "readd-observer-candidate", {
+    actorId: "participant.risk",
+  }));
+  observer.pending[0]!.resolve({
+    action: "interrupt",
+    kind: "critical",
+    reason: "stale candidate decision",
+    prompt: "This decision belongs to the retired role session.",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  release.resolve();
+  assert.equal((await blocking).status, "accepted");
+  assert.equal((await removing).status, "accepted");
+  assert.equal((await adding).status, "accepted");
+  await host.execute(command("discussion.mode.set", "drain-observer-apply", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length,
+  baselineFloorRequests);
+  await host.stop();
+});
+
+test("drops a queued observer launch after the observed speaker is recreated", async () => {
+  const observer = new ControlledDiscussionObserver({ action: "none" });
+  const { host, adapters, speaker, correlationId } = await startObservedFreeDiscussion(observer);
+  const candidate = adapters.get("participant.risk");
+  assert.ok(candidate !== undefined);
+  const entered = createDeferredSignal();
+  const release = createDeferredSignal();
+  candidate.onExecute = async (runtimeCommand) => {
+    if (runtimeCommand.commandId === "hold-observer-launch") {
+      entered.resolve();
+      await release.promise;
+    }
+    return { commandId: runtimeCommand.commandId, accepted: true };
+  };
+  const blocking = host.execute(command("tool.approval.resolve", "hold-observer-launch", {
+    actorId: "user.direct_host",
+    targetId: "participant.risk",
+    payload: { approvalId: "approval.observer-launch", approved: true },
+  }));
+  await entered.promise;
+  const removing = host.execute(command("role.remove", "remove-observed-speaker", {
+    actorId: "participant.secretary",
+  }));
+  const adding = host.execute(command("role.add", "readd-observed-speaker", {
+    actorId: "participant.secretary",
+  }));
+  speaker.emit("turn.delta", {
+    delta: "这段旧会话发言足够长，原本会触发角色观察。".repeat(20),
+  }, correlationId);
+  release.resolve();
+  assert.equal((await blocking).status, "accepted");
+  assert.equal((await removing).status, "accepted");
+  assert.equal((await adding).status, "accepted");
+  await host.execute(command("discussion.mode.set", "drain-observer-launch", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(observer.requests.length, 0);
+  await host.stop();
+});
+
+test("drops an in-flight observer decision after the observed speaker is recreated", async () => {
+  const observer = new DeferredDiscussionObserver();
+  const { host, events, speaker, correlationId } = await startObservedFreeDiscussion(observer);
+  speaker.emit("turn.delta", {
+    delta: `同步服务器直接执行所有模型调用。${"这是一段仍在继续的公开发言。".repeat(20)}`,
+  }, correlationId);
+  await waitFor(() => observer.requests.length === 1, "observer decision should be in flight");
+  const baselineFloorRequests = events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length;
+
+  assert.equal((await host.execute(command("role.remove", "remove-observed-speaker-after-launch", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "readd-observed-speaker-after-launch", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  observer.pending[0]!.resolve({
+    action: "interrupt",
+    kind: "critical",
+    reason: "stale observed speaker decision",
+    prompt: "This decision belongs to speech from the retired speaker session.",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await host.execute(command("discussion.mode.set", "drain-observed-speaker-decision", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length,
+  baselineFloorRequests);
+  await host.stop();
+});
+
 test("automatically converges a no-progress discussion and completes after one facilitator turn", async () => {
   const { host, adapters } = createHost();
   const events: MeetingEvent[] = [];
@@ -952,12 +1188,13 @@ test("resolves a frozen participant manifest into private Pi runtime options", a
     assert.equal(resolved?.modelId, "test-model");
     assert.equal(resolved?.modelName, "Test model");
     assert.deepEqual(resolved?.modelCapabilities, ["text"]);
-    assert.equal(resolved?.apiKey, "runtime-secret");
+    assert.equal(resolved?.credentialLease.resolveApiKey("test"), "runtime-secret");
     assert.equal(resolved?.systemPrompt, "Keep the meeting on track.");
     assert.equal(resolved?.skillPaths.length, 1);
     assert.equal(resolved?.skillPaths[0]?.endsWith("skills\\test\\SKILL.md") || resolved?.skillPaths[0]?.endsWith("skills/test/SKILL.md"), true);
   } finally {
     await host.stop();
+    assert.equal(resolved?.credentialLease.closed, true);
     rmSync(runtimeDirectory, { recursive: true, force: true });
   }
 });
@@ -1086,9 +1323,10 @@ test("resolves an approved Git MCP grant and its credential references", async (
       actorId: "participant.secretary",
     }));
     assert.equal(receipt.status, "accepted");
-    assert.equal(resolved?.mcpServers[0]?.serverId, "mcp.test");
-    assert.deepEqual(resolved?.mcpServers[0]?.toolAllowlist, ["echo"]);
-    assert.equal(resolved?.mcpServers[0]?.environment?.TEST_TOKEN, "mcp-secret");
+    const mcpServers = resolved?.credentialLease.materializeMcpServers() ?? [];
+    assert.equal(mcpServers[0]?.serverId, "mcp.test");
+    assert.deepEqual(mcpServers[0]?.toolAllowlist, ["echo"]);
+    assert.equal(mcpServers[0]?.environment?.TEST_TOKEN, "mcp-secret");
   } finally {
     await host.stop();
     rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -1239,6 +1477,67 @@ test("publishes the interruption reason and hands the floor to an interrupting r
   assert.equal(interruption?.actorId, "role.b");
   assert.equal(interruption?.targetId, "role.a");
   assert.equal(interruption?.payload.message, "B takes the floor");
+  await host.stop();
+});
+
+test("drops a queued interruption handoff after the interrupting role is recreated", async () => {
+  const adapters = new Map<string, FakeRuntimeAdapter[]>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      const versions = adapters.get(roleId) ?? [];
+      versions.push(adapter);
+      adapters.set(roleId, versions);
+      return adapter;
+    },
+  });
+  let removing: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  let adding: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "speech.cancelled" && removing === undefined) {
+      removing = host.execute(command("role.remove", "remove-handoff-role", {
+        actorId: "role.b",
+      }));
+      adding = host.execute(command("role.add", "readd-handoff-role", {
+        actorId: "role.b",
+        payload: { displayName: "B, new session" },
+      }));
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-handoff-target", {
+    actorId: "role.a",
+  }));
+  await host.execute(command("role.add", "add-handoff-interruptor", {
+    actorId: "role.b",
+  }));
+  await host.execute(command("meeting.open", "open-handoff-fence"));
+  await host.execute(command("speech.prompt", "prompt-handoff-target", {
+    actorId: "role.a",
+    payload: { message: "A speaks" },
+  }));
+  const target = adapters.get("role.a")?.[0];
+  assert.ok(target !== undefined);
+  target.emit("turn.started", {}, "prompt-handoff-target");
+
+  assert.equal((await host.execute(command("speech.interrupt", "stale-handoff", {
+    actorId: "role.b",
+    targetId: "role.a",
+    payload: { message: "B takes the floor" },
+  }))).status, "accepted");
+  target.emit("turn.cancelled", {}, "prompt-handoff-target");
+  await waitFor(() => removing !== undefined && adding !== undefined, "handoff role should be replaced");
+  assert.equal((await removing!).status, "accepted");
+  assert.equal((await adding!).status, "accepted");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const replacement = adapters.get("role.b")?.[1];
+  assert.ok(replacement !== undefined);
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" && runtimeCommand.commandId === "stale-handoff"), false);
   await host.stop();
 });
 
@@ -1646,6 +1945,7 @@ test("runs at most two isolated SubAgents and returns results only to the parent
       }))).status, "accepted");
     }
     await waitFor(() => runner.requests.length === 2, "both SubAgents should start");
+    assert.equal(runner.requests.every((request) => request.runtimeGeneration === 1), true);
     const limited = await host.execute(command("subagent.spawn", "spawn-3-limited", {
       actorId: "participant.secretary",
       payload: { task: "must wait for a free slot" },
@@ -2298,6 +2598,236 @@ test("drops retained adapter callbacks as soon as stop is requested", async () =
     "runtime.lease_acquired",
     "runtime.lease_released",
   ]);
+});
+
+test("drops retained callbacks after removing and recreating the same role", async () => {
+  const adapters: FakeRuntimeAdapter[] = [];
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 5,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.push(adapter);
+      return adapter;
+    },
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-first-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+    payload: { displayName: "First role" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-reused-role", {
+    runtimeGeneration: 5,
+  }))).status, "accepted");
+  adapters[0]!.retainListenersAfterUnsubscribe = true;
+  assert.equal((await host.execute(command("role.remove", "remove-first-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "add-second-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+    payload: { displayName: "Second role" },
+  }))).status, "accepted");
+
+  adapters[0]!.emit("tool.approval_requested", { approvalId: "stale" }, "stale-command");
+  assert.equal(events.some((event) =>
+    event.kind === "tool.approval_requested" && event.payload.approvalId === "stale"), false);
+  adapters[1]!.emit("tool.approval_requested", { approvalId: "fresh" }, "fresh-command");
+  assert.equal(events.some((event) =>
+    event.kind === "tool.approval_requested" && event.payload.approvalId === "fresh"), true);
+  await host.stop();
+});
+
+test("drops a queued public turn after its target role is recreated", async () => {
+  const adapters = new Map<string, FakeRuntimeAdapter[]>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      const versions = adapters.get(roleId) ?? [];
+      versions.push(adapter);
+      adapters.set(roleId, versions);
+      return adapter;
+    },
+  });
+  let removing: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  let adding: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "speech.completed" && event.actorId === "role.first") {
+      removing = host.execute(command("role.remove", "remove-queued-target", {
+        actorId: "role.second",
+      }));
+      adding = host.execute(command("role.add", "readd-queued-target", {
+        actorId: "role.second",
+        payload: { displayName: "Second role, new session" },
+      }));
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-first-queued-role", {
+    actorId: "role.first",
+    payload: { displayName: "First role" },
+  }));
+  await host.execute(command("role.add", "add-second-queued-role", {
+    actorId: "role.second",
+    payload: { displayName: "Second role" },
+  }));
+  await host.execute(command("meeting.open", "open-queued-role-test"));
+  await host.execute(command("speech.broadcast", "queued-role-broadcast", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "Both roles should answer in order.",
+      mentions: ["role.first", "role.second"],
+    },
+  }));
+  const first = adapters.get("role.first")?.[0];
+  const firstTurn = first?.commands.at(-1);
+  assert.equal(firstTurn?.kind, "turn.prompt");
+  const correlationId = firstTurn?.commandId;
+  assert.ok(correlationId !== undefined);
+  first?.emit("turn.started", {}, correlationId);
+  first?.emit("turn.completed", {}, correlationId);
+  await waitFor(() => removing !== undefined && adding !== undefined, "role replacement should queue");
+  assert.equal((await removing!).status, "accepted");
+  assert.equal((await adding!).status, "accepted");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const replacement = adapters.get("role.second")?.[1];
+  assert.ok(replacement !== undefined);
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" &&
+    runtimeCommand.commandId === "queued-role-broadcast:2"), false);
+  await host.stop();
+});
+
+test("aborts SubAgents when their parent role is removed", async () => {
+  const runner = new AbortAwareSubagentRunner();
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 6,
+    subagentRunner: runner,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-removable-parent", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-removable-parent", {
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("subagent.spawn", "spawn-removable-child", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+    payload: { task: "wait until the parent is removed" },
+  }))).status, "accepted");
+  await waitFor(() => runner.requests.length === 1, "the child should start");
+  assert.equal(runner.requests[0]?.runtimeGeneration, 6);
+
+  assert.equal((await host.execute(command("role.remove", "remove-subagent-parent", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal(runner.signals[0]?.aborted, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(events.some((event) =>
+    event.kind === "subagent.completed" || event.kind === "subagent.failed"), false);
+  await host.stop();
+});
+
+test("drops a completed SubAgent continuation after its parent role is recreated", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters: FakeRuntimeAdapter[] = [];
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.push(adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  await host.execute(command("role.add", "add-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("meeting.open", "open-stale-subagent-parent"));
+  await host.execute(command("speech.broadcast", "occupy-stale-subagent-parent", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "Hold the public turn while the delegated task finishes.",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const oldParent = adapters[0];
+  const activeTurn = oldParent?.commands.at(-1);
+  assert.equal(activeTurn?.kind, "turn.prompt");
+  const activeCorrelationId = activeTurn?.commandId;
+  assert.ok(activeCorrelationId !== undefined);
+  oldParent?.emit("turn.started", {}, activeCorrelationId);
+  await host.execute(command("subagent.spawn", "spawn-stale-continuation", {
+    actorId: "participant.secretary",
+    payload: { task: "produce a result for only this role session" },
+  }));
+  await waitFor(() => runner.pending.length === 1, "SubAgent should be running");
+  runner.pending[0]!.resolve("old-session-only-result");
+  await waitFor(() => events.some((event) =>
+    event.kind === "subagent.completed" && event.actorId === "participant.secretary"),
+  "SubAgent completion should be queued behind the active parent turn");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal((await host.execute(command("role.remove", "remove-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "readd-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  const replacement = adapters[1];
+  assert.ok(replacement !== undefined);
+  await host.execute(command("speech.broadcast", "drive-new-parent-turn", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "This is a new role session.",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const replacementTurn = replacement.commands.at(-1);
+  assert.equal(replacementTurn?.kind, "turn.prompt");
+  const replacementCorrelationId = replacementTurn?.commandId;
+  assert.ok(replacementCorrelationId !== undefined);
+  replacement.emit("turn.started", {}, replacementCorrelationId);
+  replacement.emit("turn.completed", {}, replacementCorrelationId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" &&
+    (runtimeCommand.commandId.startsWith("subagent-result:") ||
+      runtimeCommand.message.includes("old-session-only-result"))), false);
+  await host.stop();
 });
 
 test("drops an already-queued internal continuation once stop is requested", async () => {

@@ -17,6 +17,7 @@ import type { PiRuntimeAdapterOptions } from "../pi-runtime-adapter.js";
 const REQUEST: SubagentRunRequest = {
   subagentId: "subagent.startup-failure",
   parentRoleId: "role.parent",
+  runtimeGeneration: 4,
   providerId: "provider.test",
   providerName: "Test provider",
   apiFamily: "openai_chat_completions",
@@ -122,7 +123,7 @@ test("contains an early runtime.failed rejection when SubAgent startup also reje
     assert.deepEqual(unhandled, []);
     assert.equal(
       observedOptions?.sessionId,
-      "subagent-session.subagent.startup-failure",
+      "subagent-session.4.subagent.startup-failure",
     );
     assert.match(observedOptions?.sessionId ?? "", /^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$/);
   } finally {
