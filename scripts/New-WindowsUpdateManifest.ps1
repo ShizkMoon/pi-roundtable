@@ -1,9 +1,9 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$MsiPath,
 
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [ValidatePattern('^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')]
     [string]$Version,
 
     [Parameter(Mandatory = $true)]
@@ -19,6 +19,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$versionParts = @($Version.Split('.') | ForEach-Object { [uint32]$_ })
+if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -gt 65535) {
+    throw 'Version exceeds Windows Installer limits (major/minor <= 255 and patch <= 65535).'
+}
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($TrustedPublicKeyPath)) {
     $TrustedPublicKeyPath = Join-Path $repoRoot 'packaging\windows-x64\update-public-key.pem'

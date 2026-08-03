@@ -44,3 +44,6 @@ data/
 *.session.jsonl
 *.omp
 *-private.pem
+.version-update.lock
+.version-update-journal.json
+*.version-*.tmp

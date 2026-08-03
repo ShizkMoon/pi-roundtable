@@ -1,13 +1,22 @@
 ﻿param(
     [string]$AppRoot = 'out\package\windows-x64\app',
 
-    [string]$MsiPath = 'out\installer\PiRoundtable-0.3.0-win-x64.msi',
+    [string]$MsiPath,
 
     [string]$OutputRoot = 'out\e2e\signing-pipeline'
 )
 
 $ErrorActionPreference = 'Stop'
+$startedAt = [DateTimeOffset]::UtcNow
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$productVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Unable to bind the signing pipeline report to the current Git commit.'
+}
+if ([string]::IsNullOrWhiteSpace($MsiPath)) {
+    $MsiPath = "out\installer\PiRoundtable-$productVersion-win-x64.msi"
+}
 . (Join-Path $PSScriptRoot 'windows-signing.ps1')
 
 function Resolve-RepositoryPath {
@@ -87,12 +96,18 @@ try {
     }
 
     $report = [ordered]@{
+        schemaVersion = 2
+        evidenceId = [Guid]::NewGuid().ToString()
         status = 'verified'
+        evidenceClass = 'ephemeral-signing-pipeline-smoke'
+        productVersion = $productVersion
+        sourceCommit = $sourceCommit
         trustScope = 'ephemeral self-signed pipeline test; not a production release identity'
         certificatePersisted = $false
         originalsUnchanged = $true
         copies = $copies
         signatures = $signatures
+        startedAt = $startedAt.ToString('O')
         verifiedAt = [DateTimeOffset]::UtcNow.ToString('O')
     }
     $reportPath = Join-Path $resolvedOutput 'signing-pipeline-report.json'

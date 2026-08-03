@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <!-- VERSION is the current build version. The separately signed stable
+         update manifest may intentionally remain on the previous release
+         while a new candidate is under development. -->
+    <PiRoundtableVersionFile>$(MSBuildThisFileDirectory)VERSION</PiRoundtableVersionFile>
+    <Version>$([System.IO.File]::ReadAllText('$(PiRoundtableVersionFile)').Trim())</Version>
+  </PropertyGroup>
+</Project>

@@ -34,6 +34,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm run check:version
       - run: npm run check:schema
       - run: npm run build
       - run: npm test
@@ -50,11 +51,25 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
+      - name: Resolve product version
+        id: product-version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw 'VERSION must contain one three-part numeric product version without leading zeroes.'
+          }
+          $parts = @($version.Split('.') | ForEach-Object { [uint32]$_ })
+          if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {
+            throw 'VERSION exceeds Windows Installer limits (major/minor <= 255 and patch <= 65535).'
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Pin verified packaging npm
         run: |
           npm install --global npm@12.0.1
           npm --version
       - run: npm ci
+      - run: npm run check:version
       - run: npm run check:schema
       - run: npm run build
       - name: Configure native core
@@ -85,7 +100,7 @@ jobs:
         # GitHub's Windows runner closes the WiX ICE validation pipe for this
         # large self-contained package. Release builds keep validation on;
         # CI still compiles the complete MSI after tests have passed.
-        run: ./scripts/build-windows-x64.ps1 -Version 0.3.0 -SkipVerification -SuppressMsiValidation
+        run: ./scripts/build-windows-x64.ps1 -Version '${{ steps.product-version.outputs.version }}' -SkipVerification -SuppressMsiValidation
       - name: Test Authenticode signing pipeline on copies
         shell: pwsh
         run: ./scripts/test-windows-signing-pipeline.ps1
@@ -97,8 +112,8 @@ jobs:
         run: ./scripts/test-windows-msi-lifecycle.ps1 -UseFullPayload -SkipLaunch
       - uses: actions/upload-artifact@v4
         with:
-          name: PiRoundtable-0.3.0-win-x64
-          path: out/installer/PiRoundtable-0.3.0-win-x64.msi
+          name: PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64
+          path: out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.msi
           if-no-files-found: error
       - name: Upload Windows release QA evidence
         if: always()

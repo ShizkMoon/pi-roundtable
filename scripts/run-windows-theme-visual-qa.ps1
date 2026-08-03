@@ -16,7 +16,23 @@
 )
 
 $ErrorActionPreference = 'Stop'
+$startedAt = [DateTimeOffset]::UtcNow
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$resolvedAppRoot = if ([System.IO.Path]::IsPathRooted($AppRoot)) {
+    [System.IO.Path]::GetFullPath($AppRoot)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $repoRoot $AppRoot))
+}
+$appExecutable = Join-Path $resolvedAppRoot 'PiRoundtable.Windows.exe'
+if (!(Test-Path -LiteralPath $appExecutable -PathType Leaf)) {
+    throw "Visual QA application executable does not exist: $appExecutable"
+}
+$productVersion = (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'Unable to bind the visual QA report to the current Git commit.'
+}
+$appExecutableSha256 = (Get-FileHash -LiteralPath $appExecutable -Algorithm SHA256).Hash.ToUpperInvariant()
 $visualQaScript = Join-Path $PSScriptRoot 'run-windows-visual-qa.ps1'
 $resolvedOutput = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
     [System.IO.Path]::GetFullPath($OutputRoot)
@@ -132,7 +148,7 @@ function Invoke-ThemeQa {
 
     $themeOutput = Join-Path $resolvedOutput $DirectoryName
     & $visualQaScript `
-        -AppRoot $AppRoot `
+        -AppRoot $resolvedAppRoot `
         -OutputRoot $themeOutput `
         -ViewportWidths $ViewportWidths `
         -ViewportHeight $ViewportHeight `
@@ -173,13 +189,20 @@ if ($actualDpis.Count -ne 1) {
     throw "Theme runs did not share one real DPI context: $($actualDpis -join ', ')."
 }
 $report = [ordered]@{
+    schemaVersion = 2
+    evidenceId = [Guid]::NewGuid().ToString()
     status = 'verified'
+    evidenceClass = 'real-windows-theme-dpi-visual-qa'
+    productVersion = $productVersion
+    sourceCommit = $sourceCommit
+    appExecutableSha256 = $appExecutableSha256
     dpi = $actualDpis[0]
     expectedDpi = $(if ($ExpectedDpi -eq 0) { $null } else { $ExpectedDpi })
     requiredViewportWidthsDip = $ViewportWidths
     originalHighContrast = [bool]$original.Enabled
     systemStateRestored = $restored
     themes = $results
+    startedAt = $startedAt.ToString('O')
     verifiedAt = [DateTimeOffset]::UtcNow.ToString('O')
 }
 $reportPath = Join-Path $resolvedOutput 'theme-visual-qa-report.json'
