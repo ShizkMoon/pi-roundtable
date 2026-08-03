@@ -30,6 +30,7 @@ import {
 } from "./mcp-client-manager.js";
 import type {
   RuntimeAdapter,
+  RuntimeCommand,
   RuntimeCommandResult,
   RuntimeEvent,
 } from "./runtime-adapter.js";
@@ -61,6 +62,7 @@ import {
 } from "./discussion-observer.js";
 import { buildStableRoleSystemPrompt } from "./runtime-context-policy.js";
 import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
+import { RuntimeGenerationOwner } from "./runtime-generation-owner.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -163,6 +165,7 @@ const OBSERVER_TEXT_INTERVAL = 800;
 const MAX_OBSERVER_MEETING_CONTEXT = 8_192;
 const MAX_CONCURRENT_DISCUSSION_OBSERVERS = 3;
 const MAX_REMEMBERED_OBSERVATION_IDS = 1_024;
+const ROLE_STOP_GRACE_MS = 2_000;
 
 interface RememberedReceipt {
   fingerprint: string;
@@ -180,11 +183,11 @@ export type LocalHostStopMode = "suspend" | "close";
 
 export class LocalRoundtableHost {
   readonly #options: LocalRoundtableHostOptions;
-  readonly #runtimeId: string;
-  readonly #runtimeGeneration: number;
+  readonly #runtimeOwner: RuntimeGenerationOwner;
   readonly #now: () => Date;
   readonly #turnTimeoutMs: number;
   readonly #roles = new Map<string, HostedRole>();
+  readonly #adapterStopPromises = new WeakMap<RuntimeAdapter, Promise<void>>();
   readonly #receipts = new Map<string, RememberedReceipt>();
   readonly #eventListeners = new Set<MeetingEventListener>();
   readonly #diagnosticListeners = new Set<HostDiagnosticListener>();
@@ -208,7 +211,6 @@ export class LocalRoundtableHost {
   #subagentContinuationRetry: ReturnType<typeof setTimeout> | undefined;
   #phase: "created" | "live" | "closed" = "created";
   #sequence = 0;
-  #leaseActive = false;
   #activeRoleId: string | undefined;
   #activeTurnCorrelationId: string | undefined;
   #activeTurnVisibility: "public" | "private" = "public";
@@ -221,20 +223,16 @@ export class LocalRoundtableHost {
   #workspace: WorkspaceProfile | undefined;
   #session: RoundtableSession | undefined;
   #credentials = new Map<string, string>();
-  #runtimeConfigurationInitialized = false;
-  #stopped = false;
 
   constructor(options: LocalRoundtableHostOptions) {
     if (options.meetingId.length === 0) {
       throw new Error("meetingId is required");
     }
     this.#options = options;
-    this.#runtimeId = options.runtimeId ?? randomUUID();
-    const runtimeGeneration = options.runtimeGeneration ?? 1;
-    if (!Number.isSafeInteger(runtimeGeneration) || runtimeGeneration < 1) {
-      throw new RangeError("runtimeGeneration must be a positive safe integer");
-    }
-    this.#runtimeGeneration = runtimeGeneration;
+    this.#runtimeOwner = new RuntimeGenerationOwner({
+      runtimeId: options.runtimeId ?? randomUUID(),
+      runtimeGeneration: options.runtimeGeneration ?? 1,
+    });
     this.#now = options.now ?? (() => new Date());
     const turnTimeoutMs = options.turnTimeoutMs ?? 120_000;
     if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1 || turnTimeoutMs > 900_000) {
@@ -252,11 +250,11 @@ export class LocalRoundtableHost {
   }
 
   get runtimeId(): string {
-    return this.#runtimeId;
+    return this.#runtimeOwner.runtimeId;
   }
 
   get runtimeGeneration(): number {
-    return this.#runtimeGeneration;
+    return this.#runtimeOwner.runtimeGeneration;
   }
 
   get sequence(): number {
@@ -280,9 +278,7 @@ export class LocalRoundtableHost {
     initialSequence = 0,
     discussionState?: DiscussionSchedulerSnapshot,
   ): void {
-    if (this.#leaseActive || this.#stopped || this.#runtimeConfigurationInitialized) {
-      throw new Error("Runtime configuration is already initialized");
-    }
+    this.#runtimeOwner.assertCanInitializeConfiguration();
     if (session.sessionId !== this.meetingId || session.workspaceId !== workspace.workspaceId) {
       throw new Error("Runtime session does not match the meeting or workspace");
     }
@@ -300,29 +296,30 @@ export class LocalRoundtableHost {
     if (discussionState !== undefined) {
       this.#discussionScheduler.restore(discussionState);
     }
-    this.#runtimeConfigurationInitialized = true;
+    this.#runtimeOwner.markConfigurationInitialized();
   }
 
   start(): void {
-    if (this.#leaseActive || this.#stopped) {
-      throw new Error("Local Roundtable Host cannot be started again");
-    }
-    if (this.#options.adapterFactory === undefined && !this.#runtimeConfigurationInitialized) {
-      throw new Error("Runtime configuration is not initialized");
-    }
-    this.#leaseActive = true;
-    this.#emit("runtime.lease_acquired", this.#runtimeId, null, null, {});
+    this.#runtimeOwner.acquireLease(this.#options.adapterFactory !== undefined);
+    this.#emit("runtime.lease_acquired", this.runtimeId, null, null, {});
   }
 
-  async restoreConfiguredRoles(): Promise<void> {
-    if (!this.#leaseActive || this.#stopped || this.#phase !== "live") {
-      throw new Error("Configured roles can only be restored for an active live meeting");
+  restoreConfiguredRoles(): Promise<void> {
+    try {
+      this.#assertCanRestoreConfiguredRoles();
+    } catch (error) {
+      return Promise.reject(error);
     }
-    const session = this.#session;
-    if (session === undefined) {
-      throw new Error("Runtime session is not initialized");
-    }
+    return this.#enqueueOperation(() => this.#restoreConfiguredRolesNow());
+  }
+
+  async #restoreConfiguredRolesNow(): Promise<void> {
+    this.#assertCanRestoreConfiguredRoles();
+    const session = this.#session!;
     for (const participant of session.participants) {
+      if (this.#runtimeOwner.stopRequested) {
+        throw new Error("Configured role restoration was stopped");
+      }
       const roleId = participant.participantId;
       if (this.#roles.has(roleId)) {
         throw new Error("Runtime session contains a duplicate role");
@@ -330,16 +327,25 @@ export class LocalRoundtableHost {
       const configuration = this.#resolveRoleRuntimeConfiguration({}, roleId, participant.scope);
       const adapter = this.#createAdapter(roleId, configuration);
       const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
+      let startOutcome: "started" | "stop_requested";
       try {
-        await adapter.start();
+        startOutcome = await this.#startAdapterUntilStopRequested(adapter);
       } catch (error) {
         unsubscribe();
         try {
-          await adapter.stop();
+          await this.#stopAdapterWithGrace(adapter);
         } catch {
           // The initialization failure below remains the stable process surface.
         }
         throw error;
+      }
+      if (startOutcome === "stop_requested" || this.#runtimeOwner.stopRequested) {
+        unsubscribe();
+        // Invoke cancellation immediately so adapters can enter their stopping
+        // state, but do not let an unbounded startup Promise hold owner cleanup.
+        // Promise.race already observes any later startup rejection.
+        this.#requestAdapterStop(adapter);
+        throw new Error("Configured role restoration was stopped");
       }
       this.#roles.set(roleId, {
         displayName: configuration.displayName,
@@ -349,6 +355,21 @@ export class LocalRoundtableHost {
         configuration,
       });
       this.#rolePublicCursors.set(roleId, this.#publicMessages.length);
+    }
+  }
+
+  #assertCanRestoreConfiguredRoles(): void {
+    if (
+      !this.#runtimeOwner.leaseActive ||
+      this.#runtimeOwner.stopRequested ||
+      this.#runtimeOwner.stopped ||
+      this.#phase !== "live"
+    ) {
+      throw new Error("Configured roles can only be restored for an active live meeting");
+    }
+    const session = this.#session;
+    if (session === undefined) {
+      throw new Error("Runtime session is not initialized");
     }
   }
 
@@ -387,25 +408,31 @@ export class LocalRoundtableHost {
         "Local Runtime Host could not execute the command",
       );
     }
+    if (this.#runtimeOwner.stopRequested && receipt.status === "accepted") {
+      receipt = this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#remember(command, fingerprint, receipt);
   }
 
   stop(mode: LocalHostStopMode = "suspend"): Promise<void> {
+    this.#runtimeOwner.requestStop();
     return this.#enqueueOperation(() => this.#stopNow(mode));
   }
 
   async #stopNow(mode: LocalHostStopMode): Promise<void> {
-    if (this.#stopped) {
+    if (!this.#runtimeOwner.beginStop()) {
       return;
     }
-    this.#stopped = true;
     this.#pendingHandoff = undefined;
     this.#activeRoleId = undefined;
     this.#activeTurnCorrelationId = undefined;
+    this.#activeTurnVisibility = "public";
+    this.#activePublicOutput = "";
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
     this.#pendingSubagentContinuations.length = 0;
     this.#clearSubagentContinuationRetry();
+    this.#clearAllTurnTimeouts();
     const subagentRuns = [...this.#subagentRuns.values()];
     for (const run of subagentRuns) {
       run.controller.abort();
@@ -414,18 +441,26 @@ export class LocalRoundtableHost {
     for (const observation of discussionObservations) {
       observation.controller.abort();
     }
-    await Promise.allSettled(subagentRuns.map((run) => run.completion));
-    await Promise.allSettled(discussionObservations.map((run) => run.completion));
+    await Promise.all([
+      this.#waitForBackgroundCleanup(subagentRuns.map((run) => run.completion)),
+      this.#waitForBackgroundCleanup(discussionObservations.map((run) => run.completion)),
+    ]);
     this.#subagentRuns.clear();
     this.#discussionObservations.clear();
     this.#lastObservedLengths.clear();
+    this.#scheduledDiscussionObservationIds.clear();
+    this.#acceptedObserverFloorRequests.clear();
+    this.#publicMessages.length = 0;
+    this.#rolePublicCursors.clear();
     const roles = [...this.#roles.values()];
     this.#roles.clear();
     await Promise.all(
       roles.map(async (role) => {
         role.unsubscribe();
         try {
-          await role.adapter.stop();
+          if (!await this.#stopAdapterWithGrace(role.adapter)) {
+            throw new Error("role stop failed or timed out");
+          }
         } catch {
           this.#diagnose("role_stop_failed", "A role runtime did not stop cleanly");
         }
@@ -433,16 +468,15 @@ export class LocalRoundtableHost {
     );
     if (mode === "close" && this.#phase === "live") {
       this.#phase = "closed";
-      this.#emit("meeting.closed", this.#runtimeId, null, null, {});
+      this.#emit("meeting.closed", this.runtimeId, null, null, {}, "public", undefined, true);
     }
-    if (this.#leaseActive) {
-      this.#leaseActive = false;
-      this.#emit("runtime.lease_released", this.#runtimeId, null, null, {});
+    if (this.#runtimeOwner.releaseLease()) {
+      this.#emit("runtime.lease_released", this.runtimeId, null, null, {}, "public", undefined, true);
     }
     this.#credentials.clear();
     this.#workspace = undefined;
     this.#session = undefined;
-    this.#runtimeConfigurationInitialized = false;
+    this.#runtimeOwner.clearConfiguration();
   }
 
   #validateEnvelope(command: MeetingCommand): CommandReceipt | undefined {
@@ -457,7 +491,7 @@ export class LocalRoundtableHost {
     if (command.meetingId !== this.meetingId) {
       return this.#receipt(command, "rejected", "meeting_mismatch", "Meeting ID mismatch");
     }
-    if (command.runtimeGeneration !== this.runtimeGeneration) {
+    if (!this.#runtimeOwner.matchesGeneration(command.runtimeGeneration)) {
       return this.#receipt(
         command,
         "rejected",
@@ -477,7 +511,11 @@ export class LocalRoundtableHost {
         `Expected sequence ${this.#sequence}`,
       );
     }
-    if (!this.#leaseActive || this.#stopped) {
+    if (
+      !this.#runtimeOwner.leaseActive ||
+      this.#runtimeOwner.stopRequested ||
+      this.#runtimeOwner.stopped
+    ) {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
     return undefined;
@@ -490,7 +528,7 @@ export class LocalRoundtableHost {
           return this.#invalidTransition(command);
         }
         this.#phase = "live";
-        this.#emit("meeting.opened", this.#runtimeId, null, command.commandId, {});
+        this.#emit("meeting.opened", this.runtimeId, null, command.commandId, {});
         return this.#accepted(command);
 
       case "meeting.close":
@@ -504,7 +542,10 @@ export class LocalRoundtableHost {
         this.#expectedTurns.clear();
         this.#pendingPublicTurns.length = 0;
         await this.#stopAllRoles();
-        this.#emit("meeting.closed", this.#runtimeId, null, command.commandId, {});
+        if (this.#runtimeOwner.stopRequested) {
+          return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+        }
+        this.#emit("meeting.closed", this.runtimeId, null, command.commandId, {});
         return this.#accepted(command);
 
       case "role.add":
@@ -593,7 +634,7 @@ export class LocalRoundtableHost {
         "Tool approval requires a known target role, approvalId, and boolean decision",
       );
     }
-    const result = await role.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
       kind: "tool.approval.resolve",
       commandId: command.commandId,
       roleId: roleId!,
@@ -625,11 +666,14 @@ export class LocalRoundtableHost {
       return this.#accepted(command);
     } catch (error) {
       const limitReached = error instanceof Error && error.message === "subagent_limit";
+      const stopped = error instanceof Error && error.message === "runtime_stopped";
       return this.#receipt(
         command,
         "rejected",
-        limitReached ? "subagent_limit" : "subagent_unavailable",
-        limitReached
+        stopped ? "runtime_stopped" : limitReached ? "subagent_limit" : "subagent_unavailable",
+        stopped
+          ? "Runtime is stopped"
+          : limitReached
           ? "The parent role already has the maximum of two active SubAgents"
           : "The frozen participant manifest does not allow this SubAgent",
       );
@@ -645,7 +689,8 @@ export class LocalRoundtableHost {
     const configuration = parent?.configuration;
     if (
       this.#phase !== "live" ||
-      this.#stopped ||
+      this.#runtimeOwner.stopRequested ||
+      this.#runtimeOwner.stopped ||
       parent === undefined ||
       configuration === undefined ||
       configuration.delegation.maxConcurrentSubagents < 1
@@ -671,6 +716,9 @@ export class LocalRoundtableHost {
       "private",
       [parentRoleId],
     );
+    if (this.#runtimeOwner.stopRequested) {
+      throw new Error("runtime_stopped");
+    }
     const completion = Promise.resolve().then(async () => {
       try {
         const result = await this.#subagentRunner.run({
@@ -702,7 +750,7 @@ export class LocalRoundtableHost {
             return;
           }
           this.#enqueueInternal(async () => {
-            if (this.#stopped || !this.#subagentRuns.has(subagentId)) {
+            if (this.#runtimeOwner.stopped || !this.#subagentRuns.has(subagentId)) {
               return;
             }
             this.#emit(
@@ -717,7 +765,7 @@ export class LocalRoundtableHost {
           });
         }, controller.signal);
         this.#enqueueInternal(async () => {
-          if (this.#stopped || !this.#subagentRuns.delete(subagentId)) {
+          if (this.#runtimeOwner.stopRequested || !this.#subagentRuns.delete(subagentId)) {
             return;
           }
           this.#emit(
@@ -729,6 +777,9 @@ export class LocalRoundtableHost {
             "private",
             [parentRoleId],
           );
+          if (this.#runtimeOwner.stopRequested) {
+            return;
+          }
           this.#pendingSubagentContinuations.push({
             subagentId,
             parentRoleId,
@@ -740,7 +791,7 @@ export class LocalRoundtableHost {
         });
       } catch {
         this.#enqueueInternal(async () => {
-          if (this.#stopped || !this.#subagentRuns.delete(subagentId)) {
+          if (this.#runtimeOwner.stopRequested || !this.#subagentRuns.delete(subagentId)) {
             return;
           }
           this.#emit(
@@ -752,6 +803,9 @@ export class LocalRoundtableHost {
             "private",
             [parentRoleId],
           );
+          if (this.#runtimeOwner.stopRequested) {
+            return;
+          }
           this.#pendingSubagentContinuations.push({
             subagentId,
             parentRoleId,
@@ -803,12 +857,13 @@ export class LocalRoundtableHost {
     const displayName = configuration?.displayName ?? this.#readString(command.payload, "displayName") ?? roleId;
     const adapter = this.#createAdapter(roleId, configuration);
     const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
+    let startOutcome: "started" | "stop_requested";
     try {
-      await adapter.start();
+      startOutcome = await this.#startAdapterUntilStopRequested(adapter);
     } catch (error) {
       unsubscribe();
       try {
-        await adapter.stop();
+        await this.#stopAdapterWithGrace(adapter);
       } catch {
         // The stable receipt below is the public failure surface.
       }
@@ -822,6 +877,11 @@ export class LocalRoundtableHost {
         errorCode,
         "The role runtime could not be started",
       );
+    }
+    if (startOutcome === "stop_requested" || this.#runtimeOwner.stopRequested) {
+      unsubscribe();
+      this.#requestAdapterStop(adapter);
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
     this.#roles.set(roleId, {
       displayName,
@@ -861,11 +921,14 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
     }
     if (this.#activeRoleId === roleId) {
-      await role.adapter.execute({
+      await this.#executeAdapterUntilStopRequested(role.adapter, {
         kind: "turn.cancel",
         commandId: `${command.commandId}:archive-cancel`,
         roleId,
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+      }
       this.#activeRoleId = undefined;
       this.#activeTurnCorrelationId = undefined;
     }
@@ -874,13 +937,18 @@ export class LocalRoundtableHost {
     this.#rolePublicCursors.delete(roleId);
     role.unsubscribe();
     try {
-      await role.adapter.stop();
+      if (!await this.#stopAdapterWithGrace(role.adapter)) {
+        throw new Error("role stop failed or timed out");
+      }
     } catch {
       this.#diagnose("role_stop_failed", "The role runtime did not stop cleanly");
     }
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     this.#roles.delete(roleId);
     for (const request of this.#discussionScheduler.removeRole(roleId)) {
-      this.#emit("floor.rejected", this.#runtimeId, roleId, command.commandId, {
+      this.#emit("floor.rejected", this.runtimeId, roleId, command.commandId, {
         requestId: request.requestId,
         reason: archive ? "role_archived" : "role_removed",
       });
@@ -969,6 +1037,9 @@ export class LocalRoundtableHost {
         await this.#startNextPublicTurn();
       }
     }
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#accepted(command);
   }
 
@@ -984,6 +1055,9 @@ export class LocalRoundtableHost {
     }
     this.#emitDiscussionTransition(transition, command.commandId, "user.direct_host");
     await this.#startNextPublicTurn();
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#accepted(command);
   }
 
@@ -1078,6 +1152,9 @@ export class LocalRoundtableHost {
       agendaItemId: result.request.agendaItemId ?? null,
       downgradedFromCritical: result.downgradedFromCritical,
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     if (
       result.request.kind === "critical" &&
       this.#activeRoleId !== undefined &&
@@ -1085,7 +1162,7 @@ export class LocalRoundtableHost {
       this.#discussionScheduler.acceptInterruption(roleId)
     ) {
       this.#discussionScheduler.rejectFloor(result.request.requestId);
-      this.#emit("floor.granted", this.#runtimeId, roleId, command.commandId, {
+      this.#emit("floor.granted", this.runtimeId, roleId, command.commandId, {
         requestId: result.request.requestId,
         kind: result.request.kind,
         reason: result.request.reason,
@@ -1110,6 +1187,9 @@ export class LocalRoundtableHost {
     if (this.#activeRoleId === undefined && this.#pendingPublicTurns.length === 0) {
       await this.#startNextPublicTurn();
     }
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#accepted(command);
   }
 
@@ -1127,6 +1207,9 @@ export class LocalRoundtableHost {
     }
     this.#queueFloorRequest(request, command.commandId);
     await this.#startNextPublicTurn();
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#accepted(command);
   }
 
@@ -1166,17 +1249,20 @@ export class LocalRoundtableHost {
     ) {
       return this.#receipt(command, "rejected", "invalid_convergence_record", "Convergence record is invalid");
     }
-    this.#emit("convergence.recorded", command.actorId ?? this.#runtimeId, null, command.commandId, {
+    this.#emit("convergence.recorded", command.actorId ?? this.runtimeId, null, command.commandId, {
       decisions,
       objections,
       evidenceRequests,
       actions,
       complete: command.payload.complete === true,
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     if (command.payload.complete === true) {
       const transition = this.#discussionScheduler.setMode("completed", "convergence_recorded");
       if (transition !== undefined) {
-        this.#emitDiscussionTransition(transition, command.commandId, command.actorId ?? this.#runtimeId);
+        this.#emitDiscussionTransition(transition, command.commandId, command.actorId ?? this.runtimeId);
       }
     }
     return this.#accepted(command);
@@ -1199,13 +1285,16 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "floor_busy", "Another role is speaking");
     }
     this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "public" });
-    const result = await role.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
       kind: "turn.prompt",
       commandId: command.commandId,
       roleId,
       message: this.#withUnseenPublicContext(roleId, message),
       delivery: "immediate",
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#fromRuntimeResult(command, result);
+    }
     if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
       this.#expectedTurns.delete(roleId);
     } else if (result.accepted) {
@@ -1244,26 +1333,42 @@ export class LocalRoundtableHost {
     let plan = createFallbackPublicMessagePlan(planningRoles);
     try {
       const planningModel = this.#selectPublicMessagePlanningModel(targets);
-      const planned = await this.#publicMessagePlanner.plan({
-        commandId: command.commandId,
-        message,
-        roles: planningRoles,
-        ...(planningModel === undefined ? {} : { model: planningModel }),
-        cwd: this.#options.cwd ?? process.cwd(),
-      });
-      plan = validatePublicMessagePlan(planned, message, planningRoles);
+      const planningPromise = this.#publicMessagePlanner.plan(
+        {
+          commandId: command.commandId,
+          message,
+          roles: planningRoles,
+          ...(planningModel === undefined ? {} : { model: planningModel }),
+          cwd: this.#options.cwd ?? process.cwd(),
+        },
+        this.#runtimeOwner.stopSignal,
+      );
+      const planningOutcome = await Promise.race([
+        planningPromise.then((planned) => ({ kind: "planned" as const, planned })),
+        this.#runtimeOwner.waitForStopRequest().then(() => ({ kind: "stop_requested" as const })),
+      ]);
+      if (planningOutcome.kind === "stop_requested") {
+        return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+      }
+      plan = validatePublicMessagePlan(planningOutcome.planned, message, planningRoles);
     } catch {
       // Semantic planning is an invisible enhancement. A bounded provider,
       // timeout, or validation failure falls back to the explicit mention set
       // without dropping, rewriting, or exposing the user's public message.
     }
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     if (this.#discussionScheduler.configured) {
       const counters = this.#discussionScheduler.beginSegment();
-      this.#emit("discussion.budget_updated", this.#runtimeId, null, command.commandId, {
+      this.#emit("discussion.budget_updated", this.runtimeId, null, command.commandId, {
         mode: this.#discussionScheduler.mode,
         reason: "host_segment_started",
         ...this.#discussionCountersPayload(counters),
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+      }
     }
     this.#publicMessages.push({ message, mentions });
     this.#emit(
@@ -1273,6 +1378,9 @@ export class LocalRoundtableHost {
       command.commandId,
       { message, mentions },
     );
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     this.#pendingPublicTurns.push(
       ...plan.speakerOrder.map((roleId, index) => {
         const semanticInstruction = this.#semanticInstructionForRole(plan, roleId);
@@ -1287,6 +1395,9 @@ export class LocalRoundtableHost {
       }),
     );
     await this.#startNextPublicTurn();
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    }
     return this.#accepted(command);
   }
 
@@ -1320,7 +1431,7 @@ export class LocalRoundtableHost {
       audience,
     );
     this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "private" });
-    const result = await role.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
       kind: "turn.prompt",
       commandId: command.commandId,
       roleId,
@@ -1330,6 +1441,9 @@ export class LocalRoundtableHost {
       ),
       delivery: "immediate",
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#fromRuntimeResult(command, result);
+    }
     if (!result.accepted && this.#expectedTurns.get(roleId)?.commandId === command.commandId) {
       this.#expectedTurns.delete(roleId);
       this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "The target role could not answer the private message");
@@ -1341,6 +1455,7 @@ export class LocalRoundtableHost {
 
   async #startNextPublicTurn(): Promise<void> {
     if (
+      this.#runtimeOwner.stopRequested ||
       this.#activeRoleId !== undefined ||
       this.#phase !== "live" ||
       (this.#discussionScheduler.configured &&
@@ -1359,7 +1474,7 @@ export class LocalRoundtableHost {
         continue;
       }
       if (this.#discussionScheduler.configured) {
-        this.#emit("floor.granted", this.#runtimeId, next.roleId, next.commandId, {
+        this.#emit("floor.granted", this.runtimeId, next.roleId, next.commandId, {
           requestId: next.floorRequestId ?? next.commandId,
           kind: next.requestKind ?? "host",
           reason: next.requestReason ?? "scheduled",
@@ -1368,7 +1483,7 @@ export class LocalRoundtableHost {
         });
       }
       this.#expectedTurns.set(next.roleId, { commandId: next.commandId, visibility: "public" });
-      const result = await role.adapter.execute({
+      const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
         kind: "turn.prompt",
         commandId: next.commandId,
         roleId: next.roleId,
@@ -1378,13 +1493,16 @@ export class LocalRoundtableHost {
         ),
         delivery: "immediate",
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return;
+      }
       if (result.accepted) {
         this.#armTurnTimeout(next.roleId, next.commandId);
         return;
       }
       this.#expectedTurns.delete(next.roleId);
       if (this.#discussionScheduler.configured) {
-        this.#emit("floor.rejected", this.#runtimeId, next.roleId, next.commandId, {
+        this.#emit("floor.rejected", this.runtimeId, next.roleId, next.commandId, {
           requestId: next.floorRequestId ?? next.commandId,
           reason: "runtime_rejected",
         });
@@ -1413,6 +1531,7 @@ export class LocalRoundtableHost {
 
   async #startNextSubagentContinuation(): Promise<void> {
     if (
+      this.#runtimeOwner.stopRequested ||
       this.#activeRoleId !== undefined ||
       this.#expectedTurns.size > 0 ||
       this.#phase !== "live"
@@ -1437,7 +1556,7 @@ export class LocalRoundtableHost {
         commandId,
         visibility: "public",
       });
-      const result = await parent.adapter.execute({
+      const result = await this.#executeAdapterUntilStopRequested(parent.adapter, {
         kind: "turn.prompt",
         commandId,
         roleId: next.parentRoleId,
@@ -1450,6 +1569,9 @@ export class LocalRoundtableHost {
         ].join("\n\n"),
         delivery: "immediate",
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return;
+      }
       if (result.accepted) {
         this.#armTurnTimeout(next.parentRoleId, commandId);
         return;
@@ -1458,7 +1580,7 @@ export class LocalRoundtableHost {
       if (
         result.errorCode === "runtime_busy" &&
         next.busyRetryCount < SUBAGENT_CONTINUATION_BUSY_RETRY_LIMIT &&
-        !this.#stopped &&
+        !this.#runtimeOwner.stopped &&
         this.#phase === "live"
       ) {
         next.busyRetryCount += 1;
@@ -1620,6 +1742,7 @@ export class LocalRoundtableHost {
 
   #queueConvergenceTurn(causationId: string | null): void {
     if (
+      this.#runtimeOwner.stopRequested ||
       this.#discussionScheduler.mode !== "convergence" ||
       this.#discussionScheduler.pendingRequestCount > 0 ||
       this.#pendingPublicTurns.length > 0 ||
@@ -1631,7 +1754,7 @@ export class LocalRoundtableHost {
     if (roleId === undefined) {
       const transition = this.#discussionScheduler.pause("facilitator_unavailable");
       if (transition !== undefined) {
-        this.#emitDiscussionTransition(transition, causationId, this.#runtimeId);
+        this.#emitDiscussionTransition(transition, causationId, this.runtimeId);
       }
       return;
     }
@@ -1675,19 +1798,22 @@ export class LocalRoundtableHost {
     progressKinds: readonly DiscussionProgressKind[],
     causationId: string | null,
   ): void {
-    if (!this.#discussionScheduler.configured) {
+    if (this.#runtimeOwner.stopRequested || !this.#discussionScheduler.configured) {
       return;
     }
     const modeBefore = this.#discussionScheduler.mode;
     const result = this.#discussionScheduler.recordTurn(roleId, progressKinds);
-    this.#emit("discussion.budget_updated", this.#runtimeId, roleId, causationId, {
+    this.#emit("discussion.budget_updated", this.runtimeId, roleId, causationId, {
       mode: this.#discussionScheduler.mode,
       progressKinds: [...progressKinds],
       ...this.#discussionCountersPayload(result.counters),
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return;
+    }
     if (result.transition !== undefined) {
-      this.#emitDiscussionTransition(result.transition, causationId, this.#runtimeId);
-      if (result.transition.mode === "convergence") {
+      this.#emitDiscussionTransition(result.transition, causationId, this.runtimeId);
+      if (!this.#runtimeOwner.stopRequested && result.transition.mode === "convergence") {
         this.#queueConvergenceTurn(causationId);
       }
       return;
@@ -1698,9 +1824,12 @@ export class LocalRoundtableHost {
         complete: true,
         automatic: true,
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return;
+      }
       const transition = this.#discussionScheduler.setMode("completed", "convergence_turn_completed");
       if (transition !== undefined) {
-        this.#emitDiscussionTransition(transition, causationId, this.#runtimeId);
+        this.#emitDiscussionTransition(transition, causationId, this.runtimeId);
       }
     }
   }
@@ -1787,7 +1916,8 @@ export class LocalRoundtableHost {
     speechComplete: boolean,
   ): void {
     if (
-      this.#stopped ||
+      this.#runtimeOwner.stopRequested ||
+      this.#runtimeOwner.stopped ||
       this.#discussionScheduler.mode !== "free_discussion"
     ) {
       return;
@@ -1810,12 +1940,15 @@ export class LocalRoundtableHost {
         break;
       }
       this.#rememberScheduledObservation(observationId);
-      this.#emit("discussion.budget_updated", this.#runtimeId, candidateRoleId, correlationId, {
+      this.#emit("discussion.budget_updated", this.runtimeId, candidateRoleId, correlationId, {
         mode: this.#discussionScheduler.mode,
         observerRoleId: candidateRoleId,
         observedSpeakerRoleId: speakerRoleId,
         ...this.#discussionCountersPayload(this.#discussionScheduler.snapshot().counters),
       });
+      if (this.#runtimeOwner.stopRequested) {
+        return;
+      }
       const controller = new AbortController();
       const completion = this.#discussionObserverLimiter.run(controller.signal, () =>
         this.#discussionObserver.observe({
@@ -1878,7 +2011,7 @@ export class LocalRoundtableHost {
   ): Promise<void> {
     const decisionKey = `${observedCorrelationId}\u0000${candidateRoleId}`;
     if (
-      this.#stopped ||
+      this.#runtimeOwner.stopped ||
       this.#discussionScheduler.mode !== "free_discussion" ||
       decision.action === "none" ||
       decision.kind === undefined ||
@@ -1912,7 +2045,7 @@ export class LocalRoundtableHost {
       commandId: `observer-floor:${observationId}`,
       kind: "floor.request",
       issuedAt: this.#now().toISOString(),
-      runtimeGeneration: this.#runtimeGeneration,
+      runtimeGeneration: this.runtimeGeneration,
       actorId: candidateRoleId,
       targetId: observedSpeakerRoleId,
       payload: {
@@ -1980,7 +2113,7 @@ export class LocalRoundtableHost {
     this.#deferredTerminalEvents = deferred;
     let result: RuntimeCommandResult;
     try {
-      result = await target.adapter.execute({
+      result = await this.#executeAdapterUntilStopRequested(target.adapter, {
         kind: "turn.cancel",
         commandId: `${command.commandId}:cancel`,
         roleId: targetId,
@@ -1991,6 +2124,10 @@ export class LocalRoundtableHost {
       throw error;
     }
     this.#deferredTerminalEvents = undefined;
+    if (this.#runtimeOwner.stopRequested) {
+      this.#pendingHandoff = undefined;
+      return this.#fromRuntimeResult(command, result);
+    }
     if (!result.accepted && deferred.events.length === 0) {
       this.#pendingHandoff = undefined;
       return this.#fromRuntimeResult(command, result);
@@ -2020,11 +2157,14 @@ export class LocalRoundtableHost {
     if (roleId === undefined || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
     }
-    const result = await role.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
       kind: "turn.cancel",
       commandId: command.commandId,
       roleId,
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#fromRuntimeResult(command, result);
+    }
     if (result.accepted) {
       this.#expectedTurns.delete(roleId);
       if (this.#activeRoleId !== roleId) {
@@ -2048,13 +2188,16 @@ export class LocalRoundtableHost {
       commandId: handoff.commandId,
       visibility: "public",
     });
-    const result = await interruptor.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(interruptor.adapter, {
       kind: "turn.prompt",
       commandId: handoff.commandId,
       roleId: handoff.interruptorId,
       message: this.#withUnseenPublicContext(handoff.interruptorId, handoff.message),
       delivery: "immediate",
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return;
+    }
     if (!result.accepted) {
       if (this.#expectedTurns.get(handoff.interruptorId)?.commandId === handoff.commandId) {
         this.#expectedTurns.delete(handoff.interruptorId);
@@ -2069,6 +2212,11 @@ export class LocalRoundtableHost {
   }
 
   #onRuntimeEvent(roleId: string, event: RuntimeEvent): void {
+    // Once stop is requested, no retained or misbehaving adapter callback may
+    // create another authoritative event for this runtime generation.
+    if (this.#runtimeOwner.stopRequested || this.#runtimeOwner.stopped) {
+      return;
+    }
     if (
       this.#deferredTerminalEvents?.roleId === roleId &&
       (event.kind === "turn.completed" || event.kind === "turn.cancelled")
@@ -2139,6 +2287,9 @@ export class LocalRoundtableHost {
             : event.payload,
           event.kind === "turn.cancelled" ? roleId : null,
         );
+        if (this.#runtimeOwner.stopRequested) {
+          return;
+        }
         const completedVisibility = this.#activeTurnVisibility;
         const completedOutput = this.#activePublicOutput.trim();
         if (
@@ -2247,7 +2398,7 @@ export class LocalRoundtableHost {
     }
     const plugins = resolvePiPluginSet(configuration.skillPaths, configuration.mcpServers);
     const options = {
-      runtimeId: `${this.#runtimeId}:${roleId}`,
+      runtimeId: `${this.runtimeId}:${roleId}`,
       roleId,
       providerId: configuration.providerId,
       providerName: configuration.providerName,
@@ -2285,6 +2436,106 @@ export class LocalRoundtableHost {
     return new PiRuntimeAdapter(
       this.#options.cwd === undefined ? options : { ...options, cwd: this.#options.cwd },
     );
+  }
+
+  async #startAdapterUntilStopRequested(
+    adapter: RuntimeAdapter,
+  ): Promise<"started" | "stop_requested"> {
+    if (this.#runtimeOwner.stopRequested) {
+      return "stop_requested";
+    }
+    const startPromise = adapter.start();
+    return Promise.race([
+      startPromise.then(() => "started" as const),
+      this.#runtimeOwner.waitForStopRequest().then(() => "stop_requested" as const),
+    ]);
+  }
+
+  async #executeAdapterUntilStopRequested(
+    adapter: RuntimeAdapter,
+    command: RuntimeCommand,
+  ): Promise<RuntimeCommandResult> {
+    if (this.#runtimeOwner.stopRequested) {
+      return this.#runtimeStoppedResult(command.commandId);
+    }
+    const executePromise = adapter.execute(command);
+    const outcome = await Promise.race([
+      executePromise.then((result) => ({ kind: "result" as const, result })),
+      this.#runtimeOwner.waitForStopRequest().then(() => ({ kind: "stop_requested" as const })),
+    ]);
+    if (outcome.kind === "stop_requested" || this.#runtimeOwner.stopRequested) {
+      this.#requestAdapterStop(adapter);
+      return this.#runtimeStoppedResult(command.commandId);
+    }
+    return outcome.result;
+  }
+
+  #runtimeStoppedResult(commandId: string): RuntimeCommandResult {
+    return {
+      commandId,
+      accepted: false,
+      errorCode: "runtime_stopped",
+      message: "Runtime is stopped",
+    };
+  }
+
+  #requestAdapterStop(adapter: RuntimeAdapter): void {
+    void this.#stopAdapter(adapter).catch(() => undefined);
+  }
+
+  #stopAdapter(adapter: RuntimeAdapter): Promise<void> {
+    const activeStop = this.#adapterStopPromises.get(adapter);
+    if (activeStop !== undefined) {
+      return activeStop;
+    }
+    let stopPromise: Promise<void>;
+    try {
+      stopPromise = Promise.resolve(adapter.stop());
+    } catch (error) {
+      stopPromise = Promise.reject(error);
+    }
+    this.#adapterStopPromises.set(adapter, stopPromise);
+    return stopPromise;
+  }
+
+  async #stopAdapterWithGrace(adapter: RuntimeAdapter): Promise<boolean> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<false>((resolve) => {
+      timeout = setTimeout(() => resolve(false), ROLE_STOP_GRACE_MS);
+    });
+    try {
+      return await Promise.race([
+        this.#stopAdapter(adapter).then(
+          () => true as const,
+          () => false as const,
+        ),
+        deadline,
+      ]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  async #waitForBackgroundCleanup(completions: readonly Promise<void>[]): Promise<void> {
+    if (completions.length === 0) {
+      return;
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, ROLE_STOP_GRACE_MS);
+    });
+    try {
+      await Promise.race([
+        Promise.allSettled(completions).then(() => undefined),
+        deadline,
+      ]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   #resolveRoleRuntimeConfiguration(
@@ -2640,11 +2891,14 @@ export class LocalRoundtableHost {
       return;
     }
     this.#timedOutTurnCommands.add(commandId);
-    const result = await role.adapter.execute({
+    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
       kind: "turn.cancel",
       commandId: `${commandId}:timeout`,
       roleId,
     });
+    if (this.#runtimeOwner.stopRequested) {
+      return;
+    }
     if (!result.accepted) {
       this.#timedOutTurnCommands.delete(commandId);
       this.#expectedTurns.delete(roleId);
@@ -2665,7 +2919,15 @@ export class LocalRoundtableHost {
   }
 
   #enqueueInternal(operation: () => Promise<void>): void {
-    void this.#enqueueOperation(operation).catch(() => {
+    void this.#enqueueOperation(async () => {
+      // A callback can enqueue continuation work while stop is already behind
+      // the current operation. Fence again at execution so nothing mutates the
+      // meeting or emits after the authoritative lease has been released.
+      if (this.#runtimeOwner.stopRequested || this.#runtimeOwner.stopped) {
+        return;
+      }
+      await operation();
+    }).catch(() => {
       this.#diagnose("internal_operation_failed", "The local host could not continue the meeting flow");
     });
   }
@@ -2673,7 +2935,7 @@ export class LocalRoundtableHost {
   #scheduleSubagentContinuationRetry(): void {
     if (
       this.#subagentContinuationRetry !== undefined ||
-      this.#stopped ||
+      this.#runtimeOwner.stopRequested ||
       this.#phase !== "live" ||
       this.#pendingSubagentContinuations.length === 0
     ) {
@@ -2698,6 +2960,14 @@ export class LocalRoundtableHost {
     this.#subagentContinuationRetry = undefined;
   }
 
+  #clearAllTurnTimeouts(): void {
+    for (const timeout of this.#turnTimeouts.values()) {
+      clearTimeout(timeout.handle);
+    }
+    this.#turnTimeouts.clear();
+    this.#timedOutTurnCommands.clear();
+  }
+
   async #stopAllRoles(): Promise<void> {
     const roles = [...this.#roles.values()];
     this.#roles.clear();
@@ -2705,16 +2975,14 @@ export class LocalRoundtableHost {
     this.#pendingPublicTurns.length = 0;
     this.#pendingSubagentContinuations.length = 0;
     this.#clearSubagentContinuationRetry();
-    for (const timeout of this.#turnTimeouts.values()) {
-      clearTimeout(timeout.handle);
-    }
-    this.#turnTimeouts.clear();
-    this.#timedOutTurnCommands.clear();
+    this.#clearAllTurnTimeouts();
     await Promise.all(
       roles.map(async (role) => {
         role.unsubscribe();
         try {
-          await role.adapter.stop();
+          if (!await this.#stopAdapterWithGrace(role.adapter)) {
+            throw new Error("role stop failed or timed out");
+          }
         } catch {
           this.#diagnose("role_stop_failed", "A role runtime did not stop cleanly");
         }
@@ -2730,7 +2998,11 @@ export class LocalRoundtableHost {
     payload: JsonObject,
     visibility: "public" | "private" = "public",
     audience?: string[],
-  ): MeetingEvent {
+    allowDuringStop = false,
+  ): void {
+    if (this.#runtimeOwner.stopRequested && !allowDuringStop) {
+      return;
+    }
     const event: MeetingEvent = {
       protocolVersion: PROTOCOL_VERSION,
       meetingId: this.meetingId,
@@ -2761,7 +3033,6 @@ export class LocalRoundtableHost {
         // Presentation and transport listeners cannot corrupt authoritative state.
       }
     }
-    return event;
   }
 
   #accepted(command: MeetingCommand): CommandReceipt {

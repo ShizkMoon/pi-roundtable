@@ -21,6 +21,8 @@ import type {
 class ObserverRuntimeAdapter implements RuntimeAdapter {
   readonly #listeners = new Set<RuntimeEventListener>();
   stopCount = 0;
+  onStart?: () => Promise<RuntimeSessionInfo>;
+  onStop?: () => Promise<void>;
 
   constructor(
     readonly options: PiRuntimeAdapterOptions,
@@ -29,6 +31,9 @@ class ObserverRuntimeAdapter implements RuntimeAdapter {
   ) {}
 
   async start(): Promise<RuntimeSessionInfo> {
+    if (this.onStart !== undefined) {
+      return this.onStart();
+    }
     return {
       runtimeId: this.options.runtimeId ?? "observer-runtime",
       sessionId: this.options.sessionId ?? "observer-session",
@@ -45,6 +50,7 @@ class ObserverRuntimeAdapter implements RuntimeAdapter {
 
   async stop(): Promise<void> {
     ++this.stopCount;
+    await this.onStop?.();
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -196,5 +202,32 @@ test("times out a stalled observer and stops it exactly once", async () => {
   });
 
   await assert.rejects(observer.observe(REQUEST), /cancelled/);
+  assert.equal(adapter?.stopCount, 1);
+});
+
+test("cancels an observer whose adapter startup never settles", async () => {
+  const controller = new AbortController();
+  let adapter: ObserverRuntimeAdapter | undefined;
+  let startResolve: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    startResolve = resolve;
+  });
+  const observer = new PiDiscussionObserver({
+    adapterFactory: (options) => {
+      adapter = new ObserverRuntimeAdapter(options, "", false);
+      adapter.onStart = () => {
+        startResolve?.();
+        return new Promise<RuntimeSessionInfo>(() => undefined);
+      };
+      adapter.onStop = () => Promise.reject(new Error("test stop failure"));
+      return adapter;
+    },
+  });
+
+  const observing = observer.observe(REQUEST, controller.signal);
+  await started;
+  controller.abort();
+
+  await assert.rejects(observing, /cancelled/);
   assert.equal(adapter?.stopCount, 1);
 });

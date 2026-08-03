@@ -55,6 +55,7 @@ export class PiSubagentRunner implements SubagentRunner {
     onProgress: (progress: SubagentRunProgress) => void,
     signal: AbortSignal,
   ): Promise<string> {
+    signal.throwIfAborted();
     const adapter = this.#adapterFactory({
       roleId: request.parentRoleId,
       runtimeId: `subagent-runtime:${request.subagentId}`,
@@ -95,6 +96,10 @@ export class PiSubagentRunner implements SubagentRunner {
       terminalResolve = resolve;
       terminalReject = reject;
     });
+    let abortReject!: (error: Error) => void;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      abortReject = reject;
+    });
     // Startup failures emit runtime.failed before adapter.start() rejects. Attach
     // a handler immediately so that this early terminal rejection cannot become
     // an unhandled rejection while run() is still awaiting adapter.start().
@@ -110,20 +115,34 @@ export class PiSubagentRunner implements SubagentRunner {
         terminalReject(new Error("The isolated Pi SubAgent failed"));
       }
     });
+    let abortHandled = false;
     const abort = (): void => {
-      terminalReject(new Error("The isolated Pi SubAgent was cancelled"));
-      void adapter.stop();
+      if (abortHandled) {
+        return;
+      }
+      abortHandled = true;
+      const error = new Error("The isolated Pi SubAgent was cancelled");
+      terminalReject(error);
+      abortReject(error);
+      this.#requestStopWithoutWaiting(adapter);
     };
     signal.addEventListener("abort", abort, { once: true });
     try {
-      await adapter.start();
-      const receipt = await adapter.execute({
-        kind: "turn.prompt",
-        commandId: `subagent-task:${request.subagentId}`,
-        roleId: request.parentRoleId,
-        message: request.task,
-        delivery: "immediate",
-      });
+      if (signal.aborted) {
+        abort();
+        signal.throwIfAborted();
+      }
+      await Promise.race([adapter.start(), aborted]);
+      const receipt = await Promise.race([
+        adapter.execute({
+          kind: "turn.prompt",
+          commandId: `subagent-task:${request.subagentId}`,
+          roleId: request.parentRoleId,
+          message: request.task,
+          delivery: "immediate",
+        }),
+        aborted,
+      ]);
       if (!receipt.accepted) {
         throw new Error("The isolated Pi SubAgent rejected its task");
       }
@@ -132,7 +151,20 @@ export class PiSubagentRunner implements SubagentRunner {
     } finally {
       signal.removeEventListener("abort", abort);
       unsubscribe();
-      await adapter.stop();
+      if (abortHandled) {
+        // abort() already requested cancellation without waiting for a possibly
+        // unbounded startup Promise.
+      } else {
+        await adapter.stop();
+      }
+    }
+  }
+
+  #requestStopWithoutWaiting(adapter: RuntimeAdapter): void {
+    try {
+      void adapter.stop().catch(() => undefined);
+    } catch {
+      // The caller observes cancellation, not a secondary cleanup failure.
     }
   }
 }

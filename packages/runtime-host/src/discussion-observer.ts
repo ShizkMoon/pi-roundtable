@@ -157,6 +157,10 @@ export class PiDiscussionObserver implements DiscussionObserver {
       terminalResolve = resolve;
       terminalReject = reject;
     });
+    let cancellationReject!: (error: Error) => void;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      cancellationReject = reject;
+    });
     void terminal.catch(() => undefined);
     const unsubscribe = adapter.subscribe((event: RuntimeEvent) => {
       if (event.kind === "turn.delta" && typeof event.payload.delta === "string") {
@@ -175,38 +179,53 @@ export class PiDiscussionObserver implements DiscussionObserver {
       stopPromise ??= adapter.stop();
       return stopPromise;
     };
+    let cancellationRequested = false;
     const abort = (): void => {
-      terminalReject(new Error("Discussion observer was cancelled"));
-      void stopAdapter().catch(() => undefined);
+      if (cancellationRequested) {
+        return;
+      }
+      cancellationRequested = true;
+      const error = new Error("Discussion observer was cancelled");
+      terminalReject(error);
+      cancellationReject(error);
+      try {
+        void stopAdapter().catch(() => undefined);
+      } catch {
+        // Cancellation is authoritative even if a custom adapter throws while
+        // receiving its best-effort stop request.
+      }
     };
     signal?.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(abort, this.#timeoutMs);
     timeout.unref();
     try {
-      await adapter.start();
-      const receipt = await adapter.execute({
-        kind: "turn.prompt",
-        commandId: `discussion-observe:${request.observationId}`,
-        roleId,
-        message: JSON.stringify({
-          roleProfile: {
-            roleId: request.candidateRoleId,
-            displayName: request.candidateDisplayName,
-            instructions: request.candidateInstructions,
-          },
-          candidateRoleId: request.candidateRoleId,
-          speakerRoleId: request.speakerRoleId,
-          speakerDisplayName: request.speakerDisplayName,
-          speechComplete: request.speechComplete,
-          meetingContext,
-          observedText,
+      await Promise.race([adapter.start(), cancellation]);
+      const receipt = await Promise.race([
+        adapter.execute({
+          kind: "turn.prompt",
+          commandId: `discussion-observe:${request.observationId}`,
+          roleId,
+          message: JSON.stringify({
+            roleProfile: {
+              roleId: request.candidateRoleId,
+              displayName: request.candidateDisplayName,
+              instructions: request.candidateInstructions,
+            },
+            candidateRoleId: request.candidateRoleId,
+            speakerRoleId: request.speakerRoleId,
+            speakerDisplayName: request.speakerDisplayName,
+            speechComplete: request.speechComplete,
+            meetingContext,
+            observedText,
+          }),
+          delivery: "immediate",
         }),
-        delivery: "immediate",
-      });
+        cancellation,
+      ]);
       if (!receipt.accepted) {
         throw new Error("Discussion observer rejected its task");
       }
-      await terminal;
+      await Promise.race([terminal, cancellation]);
       const decision = reportedDecision ?? parseObserverJson(output);
       return validateDiscussionObservation(
         decision,
@@ -218,7 +237,9 @@ export class PiDiscussionObserver implements DiscussionObserver {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
       unsubscribe();
-      await stopAdapter();
+      if (!cancellationRequested) {
+        await stopAdapter();
+      }
     }
   }
 }
