@@ -128,6 +128,10 @@ export class PiPublicMessagePlanner implements PublicMessagePlanner {
       terminalResolve = resolve;
       terminalReject = reject;
     });
+    let cancellationReject!: (error: Error) => void;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      cancellationReject = reject;
+    });
     void terminal.catch(() => undefined);
     const unsubscribe = adapter.subscribe((event: RuntimeEvent) => {
       if (event.kind === "turn.delta" && typeof event.payload.delta === "string") {
@@ -146,32 +150,49 @@ export class PiPublicMessagePlanner implements PublicMessagePlanner {
       stopPromise ??= adapter.stop();
       return stopPromise;
     };
+    let cancellationRequested = false;
     const abort = (): void => {
-      terminalReject(new Error("Semantic planner was cancelled"));
-      void stopAdapter().catch(() => undefined);
+      if (cancellationRequested) {
+        return;
+      }
+      cancellationRequested = true;
+      const error = new Error("Semantic planner was cancelled");
+      terminalReject(error);
+      cancellationReject(error);
+      try {
+        void stopAdapter().catch(() => undefined);
+      } catch {
+        // Cancellation is authoritative even if a custom adapter throws while
+        // receiving its best-effort stop request.
+      }
     };
     signal?.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(abort, this.#timeoutMs);
     timeout.unref();
     try {
-      await adapter.start();
-      const receipt = await adapter.execute({
-        kind: "turn.prompt",
-        commandId: `semantic-plan:${request.commandId}`,
-        roleId,
-        message: JSON.stringify({ roles: request.roles, message: request.message }),
-        delivery: "immediate",
-      });
+      await Promise.race([adapter.start(), cancellation]);
+      const receipt = await Promise.race([
+        adapter.execute({
+          kind: "turn.prompt",
+          commandId: `semantic-plan:${request.commandId}`,
+          roleId,
+          message: JSON.stringify({ roles: request.roles, message: request.message }),
+          delivery: "immediate",
+        }),
+        cancellation,
+      ]);
       if (!receipt.accepted) {
         throw new Error("Semantic planner rejected its task");
       }
-      await terminal;
+      await Promise.race([terminal, cancellation]);
       return validatePublicMessagePlan(parsePlannerJson(output), request.message, request.roles);
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
       unsubscribe();
-      await stopAdapter();
+      if (!cancellationRequested) {
+        await stopAdapter();
+      }
     }
   }
 }

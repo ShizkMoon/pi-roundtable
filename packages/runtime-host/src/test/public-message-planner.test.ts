@@ -21,6 +21,8 @@ import type { PiRuntimeAdapterOptions } from "../pi-runtime-adapter.js";
 class PlannerRuntimeAdapter implements RuntimeAdapter {
   readonly #listeners = new Set<RuntimeEventListener>();
   stopCount = 0;
+  onStart?: () => Promise<RuntimeSessionInfo>;
+  onStop?: () => Promise<void>;
 
   constructor(
     readonly options: PiRuntimeAdapterOptions,
@@ -29,6 +31,9 @@ class PlannerRuntimeAdapter implements RuntimeAdapter {
   ) {}
 
   async start(): Promise<RuntimeSessionInfo> {
+    if (this.onStart !== undefined) {
+      return this.onStart();
+    }
     return {
       runtimeId: this.options.runtimeId ?? "planner-runtime",
       sessionId: this.options.sessionId ?? "planner-session",
@@ -45,6 +50,7 @@ class PlannerRuntimeAdapter implements RuntimeAdapter {
 
   async stop(): Promise<void> {
     ++this.stopCount;
+    await this.onStop?.();
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -207,4 +213,31 @@ test("rejects an already-cancelled request before creating a Pi session", async 
 
   await assert.rejects(planner.plan(REQUEST, controller.signal), /cancelled/);
   assert.equal(adapterCreated, false);
+});
+
+test("cancels a planner whose adapter startup never settles", async () => {
+  const controller = new AbortController();
+  let adapter: PlannerRuntimeAdapter | undefined;
+  let startResolve: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    startResolve = resolve;
+  });
+  const planner = new PiPublicMessagePlanner({
+    adapterFactory: (options) => {
+      adapter = new PlannerRuntimeAdapter(options, "", false);
+      adapter.onStart = () => {
+        startResolve?.();
+        return new Promise<RuntimeSessionInfo>(() => undefined);
+      };
+      adapter.onStop = () => Promise.reject(new Error("test stop failure"));
+      return adapter;
+    },
+  });
+
+  const planning = planner.plan(REQUEST, controller.signal);
+  await started;
+  controller.abort();
+
+  await assert.rejects(planning, /cancelled/);
+  assert.equal(adapter?.stopCount, 1);
 });

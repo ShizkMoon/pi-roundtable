@@ -49,12 +49,18 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly #listeners = new Set<RuntimeEventListener>();
   startCount = 0;
   stopCount = 0;
-  onExecute: ((command: RuntimeCommand) => RuntimeCommandResult | undefined) | undefined;
+  retainListenersAfterUnsubscribe = false;
+  onStart: (() => Promise<void>) | undefined;
+  onStop: (() => Promise<void>) | undefined;
+  onExecute:
+    | ((command: RuntimeCommand) => RuntimeCommandResult | Promise<RuntimeCommandResult | undefined> | undefined)
+    | undefined;
 
   constructor(readonly roleId: string) {}
 
   async start(): Promise<RuntimeSessionInfo> {
     ++this.startCount;
+    await this.onStart?.();
     return {
       runtimeId: `runtime:${this.roleId}`,
       sessionId: `session:${this.roleId}`,
@@ -71,16 +77,21 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
 
   async stop(): Promise<void> {
     ++this.stopCount;
+    await this.onStop?.();
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
     this.#listeners.add(listener);
-    return () => this.#listeners.delete(listener);
+    return () => {
+      if (!this.retainListenersAfterUnsubscribe) {
+        this.#listeners.delete(listener);
+      }
+    };
   }
 
   async execute(command: RuntimeCommand): Promise<RuntimeCommandResult> {
     this.commands.push(command);
-    return this.onExecute?.(command) ?? { commandId: command.commandId, accepted: true };
+    return (await this.onExecute?.(command)) ?? { commandId: command.commandId, accepted: true };
   }
 
   emit(
@@ -131,6 +142,20 @@ class ControlledPublicMessagePlanner implements PublicMessagePlanner {
       throw this.outcome;
     }
     return structuredClone(this.outcome);
+  }
+}
+
+class StalledPublicMessagePlanner implements PublicMessagePlanner {
+  readonly requests: PublicMessagePlanningRequest[] = [];
+  readonly started = createDeferredSignal();
+
+  async plan(
+    request: PublicMessagePlanningRequest,
+    _signal?: AbortSignal,
+  ): Promise<PublicMessagePlan> {
+    this.requests.push(structuredClone(request));
+    this.started.resolve();
+    return new Promise<never>(() => undefined);
   }
 }
 
@@ -290,6 +315,31 @@ function createHost(
     },
   });
   return { host, adapters };
+}
+
+function createDeferredSignal(): { promise: Promise<void>; resolve: () => void } {
+  let resolveSignal: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolveSignal = resolve;
+  });
+  return {
+    promise,
+    resolve: () => resolveSignal?.(),
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>, message: string, timeoutMs = 1_000): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 async function waitFor(
@@ -1637,6 +1687,95 @@ test("runs at most two isolated SubAgents and returns results only to the parent
   }
 });
 
+test("a reentrant stop on SubAgent completion prevents parent continuation", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  let stopping: Promise<void> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "subagent.completed") {
+      stopping = host.stop();
+    }
+  });
+
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-reentrant-subagent-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-reentrant-subagent"))).status, "accepted");
+  assert.equal((await host.execute(command("subagent.spawn", "spawn-reentrant-subagent", {
+    actorId: "participant.secretary",
+    payload: { task: "complete before reentrant stop" },
+  }))).status, "accepted");
+  await waitFor(() => runner.pending.length === 1, "the SubAgent should start");
+
+  runner.pending[0]!.resolve("result that must not reach the stopped parent");
+  await waitFor(() => stopping !== undefined, "the completion listener should request stop");
+  await stopping;
+
+  assert.equal(
+    adapters.get("participant.secretary")?.commands.some((runtimeCommand) =>
+      runtimeCommand.kind === "turn.prompt" &&
+      runtimeCommand.commandId.startsWith("subagent-result:")),
+    false,
+  );
+});
+
+test("a reentrant stop on SubAgent spawn prevents the isolated runner from starting", async () => {
+  const runner = new ControlledSubagentRunner();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    subagentRunner: runner,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  let stopping: Promise<void> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "subagent.spawned") {
+      stopping = host.stop();
+    }
+  });
+
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-spawn-stop-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-spawn-stop"))).status, "accepted");
+  const receipt = await host.execute(command("subagent.spawn", "spawn-before-reentrant-stop", {
+    actorId: "participant.secretary",
+    payload: { task: "must never reach the isolated runner" },
+  }));
+  assert.ok(stopping !== undefined);
+  await stopping;
+
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.equal(runner.requests.length, 0);
+});
+
 test("retries a failed SubAgent continuation after the parent Pi dispatch settles", async () => {
   const runner = new ControlledSubagentRunner();
   const adapters = new Map<string, FakeRuntimeAdapter>();
@@ -1882,6 +2021,337 @@ test("bounds repeated runtime_busy responses while resuming a failed SubAgent", 
   } finally {
     await host.stop();
   }
+});
+
+test("a stop request immediately fences later initialization, start, and commands", async () => {
+  const { host } = createHost();
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+
+  const stopping = host.stop();
+  assert.throws(
+    () => host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {}),
+    /Runtime configuration is already initialized/,
+  );
+  assert.throws(
+    () => host.start(),
+    /Local Roundtable Host cannot be started again/,
+  );
+  const lateCommand = host.execute(command("meeting.open", "open-after-stop-request"));
+
+  await stopping;
+  const receipt = await lateCommand;
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.deepEqual(events, []);
+});
+
+test("a stop request cancels dynamic role startup before registration", async () => {
+  const adapter = new FakeRuntimeAdapter("role.late");
+  const startGate = createDeferredSignal();
+  const adapterStopGate = createDeferredSignal();
+  adapter.onStart = () => startGate.promise;
+  adapter.onStop = () => adapterStopGate.promise;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+
+  const adding = host.execute(command("role.add", "add-during-stop", {
+    actorId: "role.late",
+    payload: { displayName: "Late role" },
+  }));
+  await waitFor(() => adapter.startCount === 1, "dynamic role startup should begin");
+  const stopping = host.stop();
+  const receipt = await withTimeout(adding, "dynamic role startup did not observe stop");
+  await withTimeout(stopping, "owner cleanup waited for dynamic role startup");
+
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.equal(adapter.stopCount, 1);
+  assert.deepEqual(events.map((event) => event.kind), [
+    "runtime.lease_acquired",
+    "runtime.lease_released",
+  ]);
+  adapterStopGate.resolve();
+  startGate.resolve();
+});
+
+test("stop aborts broadcast planning and fences commands that were already queued", async () => {
+  const planner = new StalledPublicMessagePlanner();
+  const { host } = createHost(undefined, planner);
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-planned-stop-role", {
+    actorId: "role.host",
+    payload: { displayName: "Host" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-planned-stop"))).status, "accepted");
+
+  const broadcasting = host.execute(command("speech.broadcast", "broadcast-before-stop", {
+    actorId: "user.direct_host",
+    payload: { message: "Do not publish after stop", mentions: ["role.host"] },
+  }));
+  await planner.started.promise;
+  const queuedClose = host.execute(command("meeting.close", "close-queued-before-stop"));
+  const stopping = host.stop();
+
+  const [broadcastReceipt, closeReceipt] = await Promise.all([broadcasting, queuedClose]);
+  await stopping;
+  assert.equal(broadcastReceipt.errorCode, "runtime_stopped");
+  assert.equal(closeReceipt.errorCode, "runtime_stopped");
+  assert.deepEqual(events.map((event) => event.kind), [
+    "runtime.lease_acquired",
+    "role.registered",
+    "meeting.opened",
+    "runtime.lease_released",
+  ]);
+});
+
+test("a reentrant stop from a published-event listener fences later turn dispatch", async () => {
+  const { host, adapters } = createHost();
+  const events: MeetingEvent[] = [];
+  let stopping: Promise<void> | undefined;
+  host.subscribe((event) => {
+    events.push(event);
+    if (event.kind === "message.published") {
+      stopping = host.stop();
+    }
+  });
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-reentrant-stop-role", {
+    actorId: "role.host",
+    payload: { displayName: "Host" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-reentrant-stop"))).status, "accepted");
+
+  const receipt = await host.execute(command("speech.broadcast", "broadcast-reentrant-stop", {
+    actorId: "user.direct_host",
+    payload: { message: "Stop from the publication listener", mentions: ["role.host"] },
+  }));
+  assert.ok(stopping !== undefined);
+  await stopping;
+
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.equal(
+    adapters.get("role.host")?.commands.some((runtimeCommand) => runtimeCommand.kind === "turn.prompt"),
+    false,
+  );
+  assert.deepEqual(events.map((event) => event.kind), [
+    "runtime.lease_acquired",
+    "role.registered",
+    "meeting.opened",
+    "message.published",
+    "runtime.lease_released",
+  ]);
+});
+
+test("a reentrant stop from a floor-request listener fences the queued floor turn", async () => {
+  const { host, adapters } = createHost();
+  let stopping: Promise<void> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "floor.requested") {
+      stopping = host.stop();
+    }
+  });
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-floor-stop-role", {
+    actorId: "role.host",
+    payload: { displayName: "Host" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-floor-stop"))).status, "accepted");
+  assert.equal((await host.execute(command("discussion.configure", "configure-floor-stop", {
+    actorId: "user.direct_host",
+    payload: { agendaItems: ["Floor stop ordering"] },
+  }))).status, "accepted");
+
+  const receipt = await host.execute(command("floor.request", "request-before-reentrant-stop", {
+    actorId: "role.host",
+    payload: { kind: "normal", reason: "Need one bounded reply", message: "Reply once" },
+  }));
+  assert.ok(stopping !== undefined);
+  await stopping;
+
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.equal(
+    adapters.get("role.host")?.commands.some((runtimeCommand) => runtimeCommand.kind === "turn.prompt"),
+    false,
+  );
+});
+
+test("a stop request cancels an in-flight configured-role startup without leaving a role", async () => {
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  const startGate = createDeferredSignal();
+  const adapterStopGate = createDeferredSignal();
+  adapter.onStart = () => startGate.promise;
+  adapter.onStop = () => adapterStopGate.promise;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+
+  const restoring = host.restoreConfiguredRoles();
+  await waitFor(() => adapter.startCount === 1, "configured role restoration should start");
+  const stopping = host.stop();
+  assert.equal(adapter.stopCount, 0);
+
+  await withTimeout(
+    assert.rejects(restoring, /Configured role restoration was stopped/),
+    "role restoration did not observe the stop request",
+  );
+  await withTimeout(stopping, "owner cleanup waited for an unbounded adapter startup");
+  assert.equal(adapter.startCount, 1);
+  assert.equal(adapter.stopCount, 1);
+  adapterStopGate.resolve();
+  startGate.resolve();
+});
+
+test("does not start configured roles when stop is requested before restoration begins", async () => {
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+
+  const restoring = host.restoreConfiguredRoles();
+  const stopping = host.stop();
+  await assert.rejects(
+    restoring,
+    /Configured roles can only be restored for an active live meeting/,
+  );
+  await stopping;
+  assert.equal(adapter.startCount, 0);
+  assert.equal(adapter.stopCount, 0);
+});
+
+test("checks configured-role restoration eligibility at call time", async () => {
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+
+  const restoring = host.restoreConfiguredRoles();
+  host.start();
+  await assert.rejects(
+    restoring,
+    /Configured roles can only be restored for an active live meeting/,
+  );
+  assert.equal(adapter.startCount, 0);
+  await host.stop();
+});
+
+test("drops retained adapter callbacks as soon as stop is requested", async () => {
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  await host.restoreConfiguredRoles();
+
+  const stopGate = createDeferredSignal();
+  adapter.retainListenersAfterUnsubscribe = true;
+  adapter.onStop = () => stopGate.promise;
+  const stopping = host.stop();
+  adapter.emit("tool.approval_requested", { approvalId: "early-approval" }, "early-command");
+  await waitFor(() => adapter.stopCount === 1, "serialized stop cleanup should reach the role");
+  adapter.emit("tool.approval_requested", { approvalId: "late-approval" }, "late-command");
+  assert.equal(events.some((event) => event.kind === "tool.approval_requested"), false);
+  stopGate.resolve();
+  await stopping;
+  adapter.emit("tool.approval_requested", { approvalId: "later-approval" }, "later-command");
+
+  assert.deepEqual(events.map((event) => event.kind), [
+    "runtime.lease_acquired",
+    "runtime.lease_released",
+  ]);
+});
+
+test("drops an already-queued internal continuation once stop is requested", async () => {
+  const { host, adapters } = createHost();
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-stop-facilitator", {
+    actorId: "role.host",
+    payload: { displayName: "Facilitator" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-stop-continuation"))).status, "accepted");
+  assert.equal((await host.execute(command("discussion.configure", "configure-stop-continuation", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["Stop ordering"],
+      limits: { noProgressTurnLimit: 1, maxObserverProbesPerSegment: 0 },
+    },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("agenda.advance", "advance-stop-continuation", {
+    actorId: "user.direct_host",
+    payload: { reason: "enter_free_discussion" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("speech.prompt", "turn-before-stop", {
+    actorId: "role.host",
+    payload: { message: "Give one final update" },
+  }))).status, "accepted");
+
+  const adapter = adapters.get("role.host");
+  assert.ok(adapter !== undefined);
+  adapter.emit("turn.started", {}, "turn-before-stop");
+  const cancelResult = new Promise<RuntimeCommandResult>(() => undefined);
+  adapter.onExecute = (runtimeCommand) =>
+    runtimeCommand.kind === "turn.cancel" ? cancelResult : undefined;
+  const cancelling = host.execute(command("generation.cancel", "cancel-before-stop", {
+    targetId: "role.host",
+  }));
+  await waitFor(
+    () => adapter.commands.some((runtimeCommand) => runtimeCommand.kind === "turn.cancel"),
+    "cancel operation should block ahead of stop",
+  );
+  adapter.emit("turn.completed", {}, "turn-before-stop");
+  const eventCountAtStopRequest = events.length;
+  const stopping = host.stop();
+
+  const cancelReceipt = await withTimeout(cancelling, "adapter command did not observe stop");
+  await stopping;
+  await host.execute(command("meeting.open", "barrier-after-stop"));
+  assert.equal(cancelReceipt.errorCode, "runtime_stopped");
+  assert.equal(adapter.stopCount, 1);
+  assert.deepEqual(
+    events.slice(eventCountAtStopRequest).map((event) => event.kind),
+    ["runtime.lease_released"],
+  );
 });
 
 test("stdio suspend continues sequence without closing a live meeting", async () => {
