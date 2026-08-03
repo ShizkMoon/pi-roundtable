@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using PiRoundtable.Distribution;
 
 namespace PiRoundtable.Windows.Services.Updater;
 
@@ -89,7 +90,24 @@ internal sealed class WindowsUpdateService : IDisposable
         ValidateInitialUri(_options.ManifestUri);
         using var response = await SendWithRedirectsAsync(_options.ManifestUri, cancellationToken);
         response.EnsureSuccessStatusCode();
-        var json = await ReadBoundedAsync(response, UpdateManifestVerifier.MaximumManifestBytes, cancellationToken);
+        if (response.Content.Headers.ContentLength is long contentLength &&
+            contentLength > UpdateManifestVerifier.MaximumManifestBytes)
+        {
+            throw new InvalidDataException("更新清单超过大小限制。");
+        }
+        await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        byte[] json;
+        try
+        {
+            json = await BoundedContent.ReadAllBytesAsync(
+                responseStream,
+                UpdateManifestVerifier.MaximumManifestBytes,
+                cancellationToken);
+        }
+        catch (ArtifactIntegrityException exception) when (exception.Failure == ArtifactIntegrityFailure.ContentTooLarge)
+        {
+            throw new InvalidDataException("更新清单超过大小限制。", exception);
+        }
         var manifest = _manifestVerifier.ParseAndVerify(json, DateTimeOffset.UtcNow);
         var availability = manifest.Version > _options.CurrentVersion
             ? UpdateAvailability.Available
@@ -109,7 +127,10 @@ internal sealed class WindowsUpdateService : IDisposable
 
         var finalPath = Path.Combine(versionDirectory, manifest.Document.Asset.FileName);
         var partialPath = finalPath + ".partial";
-        if (File.Exists(finalPath) && await VerifyFileAsync(finalPath, manifest, cancellationToken))
+        var verificationSpec = new ArtifactVerificationSpec(
+            manifest.Document.Asset.Size,
+            manifest.ExpectedSha256);
+        if (await ArtifactVerifier.MatchesFileAsync(finalPath, verificationSpec, cancellationToken))
         {
             return new StagedUpdatePackage(manifest, finalPath);
         }
@@ -135,33 +156,22 @@ internal sealed class WindowsUpdateService : IDisposable
                 FileShare.None,
                 128 * 1024,
                 FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough))
-            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
             {
-                var buffer = new byte[128 * 1024];
-                long total = 0;
-                while (true)
+                try
                 {
-                    var read = await source.ReadAsync(buffer, cancellationToken);
-                    if (read == 0)
-                    {
-                        break;
-                    }
-                    total += read;
-                    if (total > manifest.Document.Asset.Size)
-                    {
-                        throw new InvalidDataException("更新包超过签名清单声明的大小。");
-                    }
-                    hash.AppendData(buffer.AsSpan(0, read));
-                    await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-                    progress?.Report((double)total / manifest.Document.Asset.Size);
+                    await ArtifactVerifier.CopyAndVerifyAsync(
+                        source,
+                        destination,
+                        verificationSpec,
+                        progress is null ? null : new DownloadProgress(progress, manifest.Document.Asset.Size),
+                        cancellationToken);
+                }
+                catch (ArtifactIntegrityException exception)
+                {
+                    throw new InvalidDataException("更新包大小或 SHA-256 与签名清单不一致。", exception);
                 }
                 await destination.FlushAsync(cancellationToken);
                 destination.Flush(flushToDisk: true);
-                if (total != manifest.Document.Asset.Size ||
-                    !CryptographicOperations.FixedTimeEquals(hash.GetHashAndReset(), manifest.ExpectedSha256))
-                {
-                    throw new InvalidDataException("更新包大小或 SHA-256 与签名清单不一致。");
-                }
             }
 
             if (manifest.Document.Asset.AuthenticodeRequired && !_authenticodeVerifier.IsTrusted(partialPath))
@@ -274,48 +284,6 @@ internal sealed class WindowsUpdateService : IDisposable
         }
     }
 
-    private static async Task<byte[]> ReadBoundedAsync(
-        HttpResponseMessage response,
-        int maximumBytes,
-        CancellationToken cancellationToken)
-    {
-        if (response.Content.Headers.ContentLength is long contentLength && contentLength > maximumBytes)
-        {
-            throw new InvalidDataException("更新清单超过大小限制。");
-        }
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        using var memory = new MemoryStream();
-        var buffer = new byte[16 * 1024];
-        while (true)
-        {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
-            if (read == 0)
-            {
-                return memory.ToArray();
-            }
-            if (memory.Length + read > maximumBytes)
-            {
-                throw new InvalidDataException("更新清单超过大小限制。");
-            }
-            await memory.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-        }
-    }
-
-    private static async Task<bool> VerifyFileAsync(
-        string path,
-        VerifiedUpdateManifest manifest,
-        CancellationToken cancellationToken)
-    {
-        var info = new FileInfo(path);
-        if (info.Length != manifest.Document.Asset.Size || (info.Attributes & FileAttributes.ReparsePoint) != 0)
-        {
-            return false;
-        }
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, true);
-        var hash = await SHA256.HashDataAsync(stream, cancellationToken);
-        return CryptographicOperations.FixedTimeEquals(hash, manifest.ExpectedSha256);
-    }
-
     private static async Task WriteStateAsync(
         string directory,
         VerifiedUpdateManifest manifest,
@@ -383,6 +351,14 @@ internal sealed class WindowsUpdateService : IDisposable
         }
         catch (UnauthorizedAccessException)
         {
+        }
+    }
+
+    private sealed class DownloadProgress(IProgress<double> progress, long expectedSize) : IProgress<long>
+    {
+        public void Report(long value)
+        {
+            progress.Report(expectedSize == 0 ? 1 : (double)value / expectedSize);
         }
     }
 }

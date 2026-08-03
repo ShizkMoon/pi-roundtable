@@ -10,6 +10,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\PiRoundtable.Distribution\PiRoundtable.Distribution.csproj" />
     <ProjectReference Include="..\..\PiRoundtable.Windows\PiRoundtable.Windows.csproj" />
     <ProjectReference Include="..\..\PiRoundtable.Updater\PiRoundtable.Updater.csproj" />
   </ItemGroup>
