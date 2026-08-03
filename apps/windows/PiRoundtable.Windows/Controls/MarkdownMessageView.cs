@@ -124,7 +124,7 @@ public sealed class MarkdownMessageView : ContentControl
             Text = block.Marker ?? "•",
             MinWidth = 22,
             FontSize = 14,
-            Foreground = ThemeBrush("TextFillColorSecondaryBrush"),
+            Opacity = 0.72,
         };
         var body = CreateTextBlock(block.Inlines);
         Grid.SetColumn(body, 1);
@@ -170,7 +170,7 @@ public sealed class MarkdownMessageView : ContentControl
         return new Border
         {
             Padding = new Thickness(12, 10, 12, 10),
-            Background = ThemeBrush("LayerFillColorAltBrush"),
+            Background = ThemeBrush("SubtleFillColorSecondaryBrush"),
             BorderBrush = ThemeBrush("CardStrokeColorDefaultBrush"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
@@ -195,7 +195,7 @@ public sealed class MarkdownMessageView : ContentControl
         return new Border
         {
             Padding = new Thickness(12, 9, 12, 9),
-            Background = ThemeBrush("LayerFillColorAltBrush"),
+            Background = ThemeBrush("SubtleFillColorSecondaryBrush"),
             BorderBrush = ThemeBrush("CardStrokeColorDefaultBrush"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(8),
@@ -230,9 +230,7 @@ public sealed class MarkdownMessageView : ContentControl
                 var cell = new Border
                 {
                     Padding = new Thickness(10, 7, 10, 7),
-                    Background = ThemeBrush(row.IsHeader
-                        ? "SubtleFillColorSecondaryBrush"
-                        : "LayerFillColorAltBrush"),
+                    Background = ThemeBrush("SubtleFillColorSecondaryBrush"),
                     Child = cellText,
                 };
                 Grid.SetRow(cell, rowIndex);
@@ -266,7 +264,7 @@ public sealed class MarkdownMessageView : ContentControl
             Text = labelText,
             FontSize = 11,
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = ThemeBrush("TextFillColorSecondaryBrush"),
+            Opacity = 0.72,
         });
         var copyButton = new Button
         {
@@ -374,6 +372,8 @@ public sealed class MarkdownMessageView : ContentControl
         {
             return fallbackBrush;
         }
-        return new SolidColorBrush(Microsoft.UI.Colors.Gray);
+        var systemForeground = new global::Windows.UI.ViewManagement.UISettings().GetColorValue(
+            global::Windows.UI.ViewManagement.UIColorType.Foreground);
+        return new SolidColorBrush(systemForeground);
     }
 }

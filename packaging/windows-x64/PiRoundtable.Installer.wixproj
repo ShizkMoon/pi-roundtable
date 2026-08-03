@@ -2,11 +2,17 @@
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <InstallerPlatform>x64</InstallerPlatform>
-    <OutputName>PiRoundtable-$(ProductVersion)-win-x64</OutputName>
+    <OutputName>$(OutputNamePrefix)-$(ProductVersion)-win-x64</OutputName>
     <ProductVersion Condition="'$(ProductVersion)' == ''">0.2.2</ProductVersion>
+    <ProductName Condition="'$(ProductName)' == ''">Pi Roundtable</ProductName>
+    <Manufacturer Condition="'$(Manufacturer)' == ''">Pi Roundtable</Manufacturer>
+    <UpgradeCode Condition="'$(UpgradeCode)' == ''">8F84BF2C-3DBB-4F28-8B97-78D8B384365A</UpgradeCode>
+    <InstallFolderName Condition="'$(InstallFolderName)' == ''">Pi Roundtable</InstallFolderName>
+    <RegistryKeyPath Condition="'$(RegistryKeyPath)' == ''">Software\PiRoundtable</RegistryKeyPath>
+    <OutputNamePrefix Condition="'$(OutputNamePrefix)' == ''">PiRoundtable</OutputNamePrefix>
     <PublishDir Condition="'$(PublishDir)' == ''">$(MSBuildProjectDirectory)\..\..\out\package\windows-x64\app</PublishDir>
     <GeneratedWxs Condition="'$(GeneratedWxs)' == ''">$(MSBuildProjectDirectory)\..\..\out\package\windows-x64\GeneratedFiles.wxs</GeneratedWxs>
-    <DefineConstants>PublishDir=$(PublishDir);ProductVersion=$(ProductVersion)</DefineConstants>
+    <DefineConstants>PublishDir=$(PublishDir);ProductVersion=$(ProductVersion);ProductName=$(ProductName);Manufacturer=$(Manufacturer);UpgradeCode=$(UpgradeCode);InstallFolderName=$(InstallFolderName);RegistryKeyPath=$(RegistryKeyPath)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="$(GeneratedWxs)" />

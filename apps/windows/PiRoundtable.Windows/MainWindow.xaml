@@ -334,7 +334,7 @@
                                                 <TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding SelectedRole.DisplayName}" TextWrapping="Wrap" />
                                                 <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding SelectedRole.Summary}" TextWrapping="Wrap" />
                                             </StackPanel>
-                                            <Border Padding="12" Background="#120F6CBD" CornerRadius="10">
+                                            <Border Padding="12" Background="{ThemeResource LayerFillColorDefaultBrush}" CornerRadius="10">
                                                 <StackPanel Spacing="4">
                                                     <TextBlock FontWeight="SemiBold" Text="运行活动" />
                                                     <TextBlock Text="{Binding SelectedRole.ActivitySummary}" TextWrapping="Wrap" />
@@ -499,7 +499,7 @@
                                                                 </Grid>
                                                                 <TextBlock Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind ServerName}" TextWrapping="Wrap" ToolTipService.ToolTip="{x:Bind ServerName}" />
                                                                 <TextBlock FontSize="11" Text="{x:Bind RoleName}" TextWrapping="Wrap" ToolTipService.ToolTip="{x:Bind RoleName}" />
-                                                                <TextBlock FontSize="11" Foreground="#9A6700" Text="{x:Bind ExpiryLabel, Mode=OneWay}" TextWrapping="Wrap" />
+                                                                <TextBlock FontSize="11" Foreground="{ThemeResource SystemFillColorCautionBrush}" Text="{x:Bind ExpiryLabel, Mode=OneWay}" TextWrapping="Wrap" />
                                                                 <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
                                                                     <Button Click="DenyToolApproval_Click" Content="拒绝" IsEnabled="{x:Bind CanResolve, Mode=OneWay}" Tag="{x:Bind ApprovalId}" />
                                                                     <Button Click="ApproveToolApproval_Click" Content="批准一次" IsEnabled="{x:Bind CanResolve, Mode=OneWay}" Style="{StaticResource AccentButtonStyle}" Tag="{x:Bind ApprovalId}" />

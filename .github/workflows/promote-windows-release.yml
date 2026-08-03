@@ -20,12 +20,13 @@ permissions:
 jobs:
   promote:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ github.token }}
       REPOSITORY: ${{ github.repository }}
       RUN_ID: ${{ inputs.run_id }}
       RELEASE_TAG: ${{ inputs.release_tag }}
+      WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,12 +72,40 @@ jobs:
           if (!$release.isDraft) {
             throw "Release $env:RELEASE_TAG must remain a draft during artifact promotion."
           }
+          function Assert-ReleaseMsi {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string]$Path,
+              [Parameter(Mandatory = $true)]
+              [object]$Manifest,
+              [string]$ExpectedSigner = ''
+            )
+            $file = Get-Item -LiteralPath $Path
+            $sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($file.Length -ne [int64]$Manifest.asset.size -or
+                $sha256 -ne ([string]$Manifest.asset.sha256).ToUpperInvariant()) {
+              throw "$($file.FullName) does not match the manifest size and SHA-256."
+            }
+            if ($Manifest.asset.authenticodeRequired) {
+              $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
+              if ($signature.Status -ne 'Valid' -or
+                  $null -eq $signature.SignerCertificate -or
+                  $null -eq $signature.TimeStamperCertificate -or
+                  $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $ExpectedSigner) {
+                throw "$($file.FullName) does not have the required trusted, timestamped Authenticode signature. Status=$($signature.Status)."
+              }
+            }
+          }
           $msiPath = Join-Path 'release-asset' $manifest.asset.fileName
           $msi = Get-Item -LiteralPath $msiPath
-          $sha256 = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
-          if ($msi.Length -ne [int64]$manifest.asset.size -or $sha256 -ne $manifest.asset.sha256) {
-            throw "Downloaded MSI does not match the signed manifest size and SHA-256."
+          $expectedSigner = ''
+          if ($manifest.asset.authenticodeRequired) {
+            $expectedSigner = ($env:WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+            if ($expectedSigner -notmatch '^[0-9A-F]{40}$') {
+              throw 'Repository variable WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT must contain the production signing certificate SHA-1 thumbprint.'
+            }
           }
+          Assert-ReleaseMsi -Path $msi.FullName -Manifest $manifest -ExpectedSigner $expectedSigner
           gh release upload $env:RELEASE_TAG $msi.FullName --clobber
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to upload $($msi.Name) to release $env:RELEASE_TAG."
@@ -87,3 +116,11 @@ jobs:
           if ($null -eq $asset -or [int64]$asset.size -ne $msi.Length) {
             throw 'Uploaded GitHub release asset size does not match the verified MSI.'
           }
+          $uploadedAssetDirectory = Join-Path $env:RUNNER_TEMP "pi-roundtable-upload-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path $uploadedAssetDirectory | Out-Null
+          gh release download $env:RELEASE_TAG --pattern $msi.Name --dir $uploadedAssetDirectory
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to download the uploaded GitHub release asset for independent verification.'
+          }
+          $uploadedMsi = Get-Item -LiteralPath (Join-Path $uploadedAssetDirectory $msi.Name)
+          Assert-ReleaseMsi -Path $uploadedMsi.FullName -Manifest $manifest -ExpectedSigner $expectedSigner

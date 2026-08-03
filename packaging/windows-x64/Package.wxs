@@ -1,48 +1,26 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="Pi Roundtable"
-      Manufacturer="Pi Roundtable"
+      Name="$(var.ProductName)"
+      Manufacturer="$(var.Manufacturer)"
       Version="$(var.ProductVersion)"
-      UpgradeCode="8F84BF2C-3DBB-4F28-8B97-78D8B384365A"
+      UpgradeCode="$(var.UpgradeCode)"
       Language="2052"
       Scope="perMachine">
-    <SummaryInformation Description="Pi-only Windows local roundtable client" Manufacturer="Pi Roundtable" />
-    <MajorUpgrade DowngradeErrorMessage="已安装较新版本的 Pi Roundtable。" />
+    <SummaryInformation Description="Pi-only Windows local roundtable client" Manufacturer="$(var.Manufacturer)" />
+    <MajorUpgrade DowngradeErrorMessage="已安装较新版本的 $(var.ProductName)。" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <Feature Id="MainFeature" Title="Pi Roundtable" Level="1">
+    <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
       <ComponentGroupRef Id="PublishedFiles" />
-      <ComponentRef Id="StartMenuShortcutComponent" />
     </Feature>
   </Package>
 
   <Fragment>
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Pi Roundtable" />
+      <Directory Id="INSTALLFOLDER" Name="$(var.InstallFolderName)" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="Pi Roundtable" />
+      <Directory Id="ApplicationProgramsFolder" Name="$(var.ProductName)" />
     </StandardDirectory>
-  </Fragment>
-
-  <Fragment>
-    <DirectoryRef Id="ApplicationProgramsFolder">
-      <Component Id="StartMenuShortcutComponent" Guid="*">
-        <Shortcut
-            Id="ApplicationStartMenuShortcut"
-            Name="Pi Roundtable"
-            Description="打开 Pi Roundtable"
-            Target="[INSTALLFOLDER]PiRoundtable.Windows.exe"
-            WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
-        <RegistryValue
-            Root="HKCU"
-            Key="Software\PiRoundtable"
-            Name="StartMenuShortcut"
-            Type="integer"
-            Value="1"
-            KeyPath="yes" />
-      </Component>
-    </DirectoryRef>
   </Fragment>
 </Wix>

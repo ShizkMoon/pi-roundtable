@@ -18,7 +18,55 @@ Outputs:
 
 The client updater uses a signed canonical manifest with an ECDSA P-256 public key pinned in the application. It then verifies the exact MSI byte count and SHA-256 before atomically promoting a staged package. If a manifest declares `authenticodeRequired: true`, Windows Authenticode trust must also succeed; otherwise installation fails closed. `scripts/New-WindowsUpdateManifest.ps1` signs a release manifest using a private key outside the repository. Never commit that private key.
 
-The current MSI itself remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false` until an Authenticode certificate is integrated. Administrative extraction and an extracted-payload launch are safe verification gates that do not register the product. Real install/uninstall and upgrade/repair matrices remain release gates; ARM64 packaging remains pending. When testing administrative extraction, use a short target path or a temporary drive mapping because some production Node dependencies have deep paths even though their normal `C:\Program Files\Pi Roundtable` paths remain below the Windows Installer limit.
+Without an external production certificate the MSI remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD`, imported non-exportable for the build, and removed in `finally`:
+
+```powershell
+$env:PI_ROUNDTABLE_SIGNING_PFX_PASSWORD = '<secret from CI secret store>'
+pwsh -File .\scripts\build-signed-windows-x64.ps1 `
+  -Version 0.2.2 `
+  -PfxPath C:\secure\pi-roundtable-release.pfx `
+  -TimestampUrl https://timestamp.example.com
+```
+
+The build signs first-party EXE/DLL files before generating `GeneratedFiles.wxs`, signs the MSI after WiX linking, verifies the selected signer and timestamp, and calculates release hashes last. Pull-request/local mechanics can be tested without retaining a certificate:
+
+```powershell
+pwsh -File .\scripts\test-windows-signing-pipeline.ps1
+```
+
+That smoke test creates a one-day, non-exportable self-signed certificate in `CurrentUser\My`, signs copies of an application binary and MSI without modifying the originals, verifies signer identity, and removes the certificate in `finally`. Its report explicitly records that it is not trusted production signing.
+
+When `asset.authenticodeRequired` becomes `true`, the promotion workflow also requires the repository variable `WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT` to contain the expected 40-hex production leaf-certificate thumbprint. A merely trusted, timestamped signature from a different signer fails closed. After uploading a draft release asset, promotion downloads it again and repeats the size, SHA-256, signer, trust, and timestamp checks against the manifest. PFX imports snapshot `CurrentUser\My`, clear the password environment variable before spawning the child build, and remove every certificate newly added to that store before exit.
+
+The isolated lifecycle harness never registers the production UpgradeCode. By default it builds a compact MSI from the real WinUI application shell so CI can deterministically exercise the Windows Installer state machine; release machines should also run `-UseFullPayload` against all bundled runtime files:
+
+```powershell
+pwsh -File .\scripts\test-windows-msi-lifecycle.ps1
+pwsh -File .\scripts\test-windows-msi-lifecycle.ps1 -UseFullPayload
+```
+
+Both modes cover baseline install, responsive app launch when enabled, file deletion and `/fomus` repair, major upgrade, blocked downgrade with candidate preservation, a second repair, uninstall, product/registry/shortcut/folder cleanup, and production-registration invariance. Administrative extraction remains a non-registering complementary gate. When testing extraction or the full lifecycle payload, use a short target path or a temporary drive mapping because some production Node dependencies have deep paths even though their normal `C:\Program Files\Pi Roundtable` paths remain below the Windows Installer limit.
+
+The current Windows workstation has verified both modes, including the complete 22,594-file payload: baseline and candidate launches were responsive; the major upgrade completed; downgrade returned 1603 without mutating the candidate; both deliberate file deletions were repaired; uninstall left no QA ProductCode, directory, registry key, or Start Menu folder; and the production 0.2.2 registration was unchanged. These are local, time-bounded release-gate results rather than a permanent guarantee for later payloads.
+
+Compact operations have a 12-minute per-`msiexec` limit; `-UseFullPayload` raises it to 45 minutes because a major upgrade must transact more than 22,000 components. `-MsiTimeoutMinutes` may override the limit on a slower release machine. If the limit is exceeded, the harness waits a bounded consistency grace period (and, if necessary, terminates and waits for the exact client process) before it attempts product enumeration or cleanup; it never disposes a live `msiexec` handle and reports a false-clean state.
+
+Theme and scaling evidence is collected separately for each real desktop DPI:
+
+```powershell
+pwsh -File .\scripts\run-windows-theme-visual-qa.ps1 `
+  -AppRoot .\out\package\windows-x64\app `
+  -OutputRoot .\out\e2e\visual-144 `
+  -ExpectedDpi 144
+
+.\scripts\merge-windows-visual-matrix.ps1 -ReportPath @(
+  '.\out\e2e\visual-96\theme-visual-qa-report.json'
+  '.\out\e2e\visual-144\theme-visual-qa-report.json'
+  '.\out\e2e\visual-192\theme-visual-qa-report.json'
+)
+```
+
+The per-session script verifies light, dark, and real Windows high contrast at 720/900/1280/1520 DIP, restores the original high-contrast flags and scheme, and records actual `GetDpiForWindow` output. The aggregate gate requires exactly the real 96/144/192 DPI evidence; it does not emulate scaling. ARM64 packaging remains pending.
 
 WiX cannot encode the embedded nonnumeric language metadata in the Windows App SDK MUI files for `gd-gb`, `mi-NZ`, and `ug-CN`; the MSI omits those six localized MUI files and Windows falls back to neutral resources for those locales. Simplified Chinese, English, and the other published resources remain included.
 
