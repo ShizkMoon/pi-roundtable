@@ -1,6 +1,6 @@
 # Pi Roundtable 基础能力与 Windows 优先路线图
 
-- 更新日期：2026-08-03
+- 更新日期：2026-08-04
 - 适用范围：Pi-only、Windows local-first；Android 维持 UI-only
 - 状态口径：`implemented` 表示代码与自动化存在，`connected` 表示用户路径可达，
   `verified` 表示相应验收已在当前候选版本完成，`pending` 不得写成已交付
@@ -31,7 +31,7 @@ Pi Roundtable 的基础能力不是把更多第三方实现直接塞进桌面进
 | 自动上下文压缩 | implemented | connected | runtime-host 单元/集成测试 | 真实长会话记录压缩前后 token、遗漏率和延迟 |
 | 稳定前缀与 provider cache affinity | implemented | connected | 参数与稳定提示词测试 | 由真实 provider usage 验证 cache read/write，未支持的 provider 必须安全忽略 |
 | 角色长期记忆修订库 | implemented | pending | Windows 加密、迁移、并发和重启测试 | 管理 UI、人工审核写入、受限召回注入、无事件/导出泄漏 |
-| 结构化本地存储 | implemented v2 | connected for events; pending for memory UI | SQLite 迁移与 DPAPI 测试 | 备份/恢复、损坏隔离、数据保留和可选全文索引 |
+| 结构化本地存储 | implemented v2 | connected for events; pending for memory UI | SQLite 精确 schema、新建/迁移/回滚/并发与 DPAPI 测试 | 备份/恢复、损坏隔离、数据保留和可选全文索引 |
 | Pi Skill | implemented | connected | 已核验路径和 digest 测试 | 安装/更新/撤销的用户反馈与审计记录 |
 | MCP 工具插件 | implemented | connected | allowlist、审批、传输和冲突配置测试 | 运行配额、可取消任务和内容安全诊断 |
 | raw Pi extension | intentionally unsupported in-process | unavailable | 能力声明测试 | 只有隔离进程 + 规范化工具桥完成后才可重新评估 |
@@ -78,6 +78,8 @@ Pi Roundtable 的基础能力不是把更多第三方实现直接塞进桌面进
 - 来源会议/事件、置信度、创建与更新时间；
 - 基于 expected revision 的 compare-and-swap，避免并发覆盖；
 - 当前 Windows 用户 DPAPI 加密；迁移后的 SQLite schema v2 与事件库共享写入门。
+- `roundtable.db` v3 与独立 `platform.db` 的表所有权、迁移日志和备份边界已在
+  [ADR 0013](../adr/0013-local-database-ownership-and-forward-migrations.md) 评审；生产表仍分别等待 v0.5/v0.6 迁移。
 
 ### 4.2 接线策略
 

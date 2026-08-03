@@ -126,7 +126,9 @@ internal sealed partial class RoleMemoryStore : IRoleMemoryStore
             await _writeGate.WaitAsync(cancellationToken);
             try
             {
-                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await using var connection = await OpenConnectionAsync(
+                    cancellationToken,
+                    busyTimeoutMilliseconds: 1_000);
                 await ExecuteNonQueryAsync(connection, null, "PRAGMA journal_mode=WAL;", cancellationToken);
                 await ExecuteNonQueryAsync(connection, null, "PRAGMA synchronous=FULL;", cancellationToken);
                 await LocalDatabaseSchema.InitializeAsync(connection, cancellationToken);
@@ -306,19 +308,34 @@ internal sealed partial class RoleMemoryStore : IRoleMemoryStore
         }
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    private async Task<SqliteConnection> OpenConnectionAsync(
+        CancellationToken cancellationToken,
+        int busyTimeoutMilliseconds = 5_000)
     {
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = DatabasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared,
+            Cache = SqliteCacheMode.Private,
             Pooling = false,
+            DefaultTimeout = Math.Max(1, (int)Math.Ceiling(busyTimeoutMilliseconds / 1_000d)),
         }.ToString());
-        await connection.OpenAsync(cancellationToken);
-        await ExecuteNonQueryAsync(connection, null, "PRAGMA busy_timeout=5000;", cancellationToken);
-        await ExecuteNonQueryAsync(connection, null, "PRAGMA foreign_keys=ON;", cancellationToken);
-        return connection;
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+            await ExecuteNonQueryAsync(
+                connection,
+                null,
+                $"PRAGMA busy_timeout={busyTimeoutMilliseconds};",
+                cancellationToken);
+            await ExecuteNonQueryAsync(connection, null, "PRAGMA foreign_keys=ON;", cancellationToken);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
     }
 
     private async Task<IReadOnlyList<RoleMemoryEntry>> ReadEntriesAsync(
