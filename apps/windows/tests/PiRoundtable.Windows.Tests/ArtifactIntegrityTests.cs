@@ -183,6 +183,192 @@ public sealed class ArtifactIntegrityTests
     }
 
     [TestMethod]
+    public async Task Staging_uses_one_locked_handle_for_copy_verify_and_atomic_promotion()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pi-roundtable-staging-{Guid.NewGuid():N}");
+        var directory = Path.Combine(root, "nested", "version");
+        var payload = Encoding.UTF8.GetBytes("handle-relative-payload");
+        var spec = new ArtifactVerificationSpec(payload.Length, SHA256.HashData(payload));
+        string temporaryPath;
+        try
+        {
+            await using (var staging = ArtifactStager.CreateNew(directory, "update.msi"))
+            {
+                temporaryPath = staging.CurrentPath;
+                await using var source = new MemoryStream(payload, writable: false);
+                await staging.CopyAndVerifyAsync(source, spec);
+
+                var observed = new byte[payload.Length];
+                Assert.AreEqual(
+                    payload.Length,
+                    RandomAccess.Read(staging.FileHandle, observed, fileOffset: 0));
+                CollectionAssert.AreEqual(payload, observed);
+                Assert.IsTrue(File.Exists(temporaryPath));
+                Assert.ThrowsExactly<IOException>(() =>
+                    Directory.Move(directory, directory + "-moved"));
+                Assert.ThrowsExactly<IOException>(() =>
+                    Directory.Move(Path.Combine(root, "nested"), Path.Combine(root, "nested-moved")));
+                Assert.ThrowsExactly<IOException>(() =>
+                    Directory.Move(root, root + "-moved"));
+
+                staging.Promote();
+
+                Assert.IsTrue(staging.IsPromoted);
+                Assert.AreEqual(Path.Combine(directory, "update.msi"), staging.CurrentPath);
+                Assert.IsFalse(File.Exists(temporaryPath));
+                Assert.ThrowsExactly<IOException>(() =>
+                    new FileStream(staging.CurrentPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite).Dispose());
+            }
+
+            CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(Path.Combine(directory, "update.msi")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task Promotion_replaces_existing_leaf_and_unpromoted_disposal_deletes_by_handle()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pi-roundtable-staging-replace-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var finalPath = Path.Combine(root, "update.msi");
+        await File.WriteAllBytesAsync(finalPath, [9, 9, 9]);
+        byte[] payload = [1, 2, 3, 4];
+        var spec = new ArtifactVerificationSpec(payload.Length, SHA256.HashData(payload));
+        try
+        {
+            await using (var abandoned = ArtifactStager.CreateNew(root, "abandoned.msi"))
+            {
+                var abandonedPath = abandoned.CurrentPath;
+                await using var source = new MemoryStream(payload, writable: false);
+                await abandoned.CopyAndVerifyAsync(source, spec);
+                Assert.IsTrue(File.Exists(abandonedPath));
+            }
+            Assert.HasCount(0, Directory.GetFiles(root, "*.partial.msi"));
+
+            await using (var staging = ArtifactStager.CreateNew(root, "update.msi"))
+            {
+                await using var source = new MemoryStream(payload, writable: false);
+                await staging.CopyAndVerifyAsync(source, spec);
+                staging.Promote();
+                Assert.IsFalse(staging.TryDiscard());
+            }
+
+            CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(finalPath));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public void Staging_rejects_a_reparse_directory_before_creating_an_artifact()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pi-roundtable-staging-link-{Guid.NewGuid():N}");
+        var outside = Path.Combine(root, "outside");
+        var link = Path.Combine(root, "linked");
+        Directory.CreateDirectory(outside);
+        Directory.CreateSymbolicLink(link, outside);
+        try
+        {
+            var exception = Assert.ThrowsExactly<ArtifactIntegrityException>(() =>
+                ArtifactStager.CreateNew(Path.Combine(link, "version"), "update.msi"));
+
+            Assert.AreEqual(ArtifactIntegrityFailure.ReparsePoint, exception.Failure);
+            Assert.HasCount(0, Directory.GetFileSystemEntries(outside, "*", SearchOption.AllDirectories));
+        }
+        finally
+        {
+            Directory.Delete(link);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task Directory_lease_serializes_waiters_and_cleans_only_owned_orphans()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pi-roundtable-staging-lease-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var stalePath = Path.Combine(root, $"update.{Guid.NewGuid():N}.partial.msi");
+        var unrelatedPath = Path.Combine(root, "update.not-a-guid.partial.msi");
+        await File.WriteAllBytesAsync(stalePath, [1, 2, 3]);
+        await File.WriteAllBytesAsync(unrelatedPath, [4, 5, 6]);
+        try
+        {
+            await using (var owner = await ArtifactStager.AcquireDirectoryAsync(root))
+            {
+                using (var reader = new FileStream(stalePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    Assert.AreEqual(0, owner.DeleteStaleArtifactsFor("update.msi"));
+                    Assert.IsTrue(File.Exists(stalePath));
+                }
+
+                Assert.AreEqual(1, owner.DeleteStaleArtifactsFor("update.msi"));
+                Assert.IsFalse(File.Exists(stalePath));
+                Assert.IsTrue(File.Exists(unrelatedPath));
+                await Assert.ThrowsExactlyAsync<TimeoutException>(() =>
+                    ArtifactStager.AcquireDirectoryAsync(
+                        root,
+                        timeout: TimeSpan.FromMilliseconds(150)));
+
+                using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+                await Assert.ThrowsExactlyAsync<TaskCanceledException>(() =>
+                    ArtifactStager.AcquireDirectoryAsync(
+                        root,
+                        timeout: TimeSpan.FromSeconds(5),
+                        cancellationToken: cancellation.Token));
+            }
+
+            await using var successor = await ArtifactStager.AcquireDirectoryAsync(
+                root,
+                timeout: TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [TestMethod]
+    public async Task Promotion_supports_extended_length_destination_paths()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"pi-roundtable-staging-long-{Guid.NewGuid():N}");
+        var directory = root;
+        while (directory.Length < 280)
+        {
+            directory = Path.Combine(directory, new string('a', 36));
+        }
+        byte[] payload = [7, 8, 9];
+        var spec = new ArtifactVerificationSpec(payload.Length, SHA256.HashData(payload));
+        try
+        {
+            await using (var staging = ArtifactStager.CreateNew(directory, "update.msi"))
+            {
+                await using var source = new MemoryStream(payload, writable: false);
+                await staging.CopyAndVerifyAsync(source, spec);
+                staging.Promote();
+            }
+
+            CollectionAssert.AreEqual(
+                payload,
+                await File.ReadAllBytesAsync(Path.Combine(directory, "update.msi")));
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
     public void Verification_spec_rejects_invalid_hash_material()
     {
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ArtifactVerificationSpec(-1, new byte[32]));

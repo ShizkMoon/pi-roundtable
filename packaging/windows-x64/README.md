@@ -16,7 +16,7 @@ Outputs:
 - generated WiX manifest: `out\package\windows-x64\GeneratedFiles.wxs`
 - installer: `out\installer\PiRoundtable-<version>-win-x64.msi`
 
-The client updater uses a signed canonical manifest with an ECDSA P-256 public key pinned in the application. It then verifies the exact MSI byte count and SHA-256 before atomically promoting a staged package. If a manifest declares `authenticodeRequired: true`, Windows Authenticode trust must also succeed; otherwise installation fails closed. `scripts/New-WindowsUpdateManifest.ps1` signs a release manifest using a private key outside the repository. Never commit that private key.
+The client updater uses a signed canonical manifest with an ECDSA P-256 public key pinned in the application. It then holds a cross-process directory lease and one no-follow package handle through bounded download, post-flush size/SHA-256 re-verification, and atomic promotion; strictly named crash-orphan leaves are cleaned only while that lease is held. If a manifest declares `authenticodeRequired: true`, Windows Authenticode trust must also succeed against that same locked file object; otherwise installation fails closed. `scripts/New-WindowsUpdateManifest.ps1` signs a release manifest using a private key outside the repository. Never commit that private key.
 
 Without an external production certificate the MSI remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from the process-scoped `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD` (persisted user/machine values are rejected), imported non-exportable for the build, and removed in `finally`:
 
