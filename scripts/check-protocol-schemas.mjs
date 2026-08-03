@@ -104,14 +104,26 @@ function resolveReference(source, reference) {
     return;
   }
 
-  const decoded = decodeURIComponent(fragment.slice(1));
+  let decoded;
+  try {
+    decoded = decodeURIComponent(fragment.slice(1));
+  } catch (error) {
+    throw new Error(`${source.fileName}: $ref ${reference} contains invalid percent encoding.`, { cause: error });
+  }
   if (!decoded.startsWith("/")) {
     throw new Error(`${source.fileName}: $ref ${reference} must use a JSON Pointer fragment.`);
   }
   let current = target.schema;
   for (const encodedToken of decoded.slice(1).split("/")) {
     const token = encodedToken.replaceAll("~1", "/").replaceAll("~0", "~");
-    if (!isRecord(current) && !Array.isArray(current)) {
+    if (Array.isArray(current)) {
+      if (!/^(0|[1-9]\d*)$/.test(token) || Number(token) >= current.length) {
+        throw new Error(`${source.fileName}: $ref ${reference} contains an invalid array index.`);
+      }
+      current = current[Number(token)];
+      continue;
+    }
+    if (!isRecord(current)) {
       throw new Error(`${source.fileName}: $ref ${reference} traverses a non-container value.`);
     }
     if (!Object.hasOwn(current, token)) {
