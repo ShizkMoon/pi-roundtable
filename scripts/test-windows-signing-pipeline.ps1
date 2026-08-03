@@ -1,7 +1,7 @@
 ﻿param(
     [string]$AppRoot = 'out\package\windows-x64\app',
 
-    [string]$MsiPath = 'out\installer\PiRoundtable-0.2.2-win-x64.msi',
+    [string]$MsiPath = 'out\installer\PiRoundtable-0.3.0-win-x64.msi',
 
     [string]$OutputRoot = 'out\e2e\signing-pipeline'
 )

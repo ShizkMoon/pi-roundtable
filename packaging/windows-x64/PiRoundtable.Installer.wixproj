@@ -3,7 +3,7 @@
     <OutputType>Package</OutputType>
     <InstallerPlatform>x64</InstallerPlatform>
     <OutputName>$(OutputNamePrefix)-$(ProductVersion)-win-x64</OutputName>
-    <ProductVersion Condition="'$(ProductVersion)' == ''">0.2.2</ProductVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.3.0</ProductVersion>
     <ProductName Condition="'$(ProductName)' == ''">Pi Roundtable</ProductName>
     <Manufacturer Condition="'$(Manufacturer)' == ''">Pi Roundtable</Manufacturer>
     <UpgradeCode Condition="'$(UpgradeCode)' == ''">8F84BF2C-3DBB-4F28-8B97-78D8B384365A</UpgradeCode>

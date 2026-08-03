@@ -23,7 +23,7 @@ Without an external production certificate the MSI remains an unsigned local-alp
 ```powershell
 $env:PI_ROUNDTABLE_SIGNING_PFX_PASSWORD = '<secret from CI secret store>'
 pwsh -File .\scripts\build-signed-windows-x64.ps1 `
-  -Version 0.2.2 `
+  -Version 0.3.0 `
   -PfxPath C:\secure\pi-roundtable-release.pfx `
   -TimestampUrl https://timestamp.example.com
 ```

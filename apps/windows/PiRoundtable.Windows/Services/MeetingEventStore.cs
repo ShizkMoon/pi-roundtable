@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -86,10 +85,7 @@ internal sealed class DpapiContentProtector : IContentProtector
 
 internal sealed class MeetingEventStore : IMeetingEventStore
 {
-    private const int SchemaVersion = 1;
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
-    private static readonly ConcurrentDictionary<string, SemaphoreSlim> WriteGates =
-        new(StringComparer.OrdinalIgnoreCase);
     private readonly IContentProtector _protector;
     private readonly SemaphoreSlim _initializationGate = new(1, 1);
     private readonly SemaphoreSlim _writeGate;
@@ -100,7 +96,7 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         var root = LocalDataRoot.Resolve(rootDirectory);
         DatabasePath = Path.Combine(root, "data", "roundtable.db");
         _protector = protector ?? new DpapiContentProtector();
-        _writeGate = WriteGates.GetOrAdd(Path.GetFullPath(DatabasePath), static _ => new SemaphoreSlim(1, 1));
+        _writeGate = LocalDatabaseWriteGate.For(DatabasePath);
     }
 
     public string DatabasePath { get; }
@@ -121,81 +117,20 @@ internal sealed class MeetingEventStore : IMeetingEventStore
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(DatabasePath)!);
-            await using var connection = await OpenConnectionAsync(cancellationToken);
-            await ExecuteNonQueryAsync(connection, null, "PRAGMA journal_mode=WAL;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, null, "PRAGMA synchronous=FULL;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, null, "PRAGMA foreign_keys=ON;", cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            await ExecuteNonQueryAsync(connection, transaction, """
-                CREATE TABLE IF NOT EXISTS schema_info (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    schema_version INTEGER NOT NULL
-                );
-                INSERT INTO schema_info(singleton, schema_version)
-                VALUES (1, 1)
-                ON CONFLICT(singleton) DO NOTHING;
-
-                CREATE TABLE IF NOT EXISTS meeting_events (
-                    meeting_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    runtime_generation INTEGER NOT NULL,
-                    event_kind TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    visibility TEXT NOT NULL,
-                    protected_event BLOB NOT NULL,
-                    PRIMARY KEY (meeting_id, sequence),
-                    UNIQUE (event_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS command_journal (
-                    meeting_id TEXT NOT NULL,
-                    command_id TEXT NOT NULL,
-                    fingerprint TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    sequence INTEGER,
-                    protected_receipt BLOB,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (meeting_id, command_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS runtime_checkpoints (
-                    meeting_id TEXT PRIMARY KEY,
-                    last_sequence INTEGER NOT NULL,
-                    runtime_generation INTEGER NOT NULL,
-                    clean_shutdown INTEGER NOT NULL,
-                    is_closed INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS subagent_runs (
-                    meeting_id TEXT NOT NULL,
-                    subagent_id TEXT NOT NULL,
-                    parent_role_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    result_delivered INTEGER NOT NULL,
-                    protected_state BLOB NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (meeting_id, subagent_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS legacy_projections (
-                    meeting_id TEXT PRIMARY KEY,
-                    protected_projection BLOB NOT NULL,
-                    imported_at TEXT NOT NULL
-                );
-                """, cancellationToken);
-
-            await using var versionCommand = connection.CreateCommand();
-            versionCommand.Transaction = transaction;
-            versionCommand.CommandText = "SELECT schema_version FROM schema_info WHERE singleton = 1";
-            var version = Convert.ToInt32(await versionCommand.ExecuteScalarAsync(cancellationToken));
-            if (version != SchemaVersion)
+            await _writeGate.WaitAsync(cancellationToken);
+            try
             {
-                throw new InvalidDataException($"不支持的本地事件库版本：{version}。");
+                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await ExecuteNonQueryAsync(connection, null, "PRAGMA journal_mode=WAL;", cancellationToken);
+                await ExecuteNonQueryAsync(connection, null, "PRAGMA synchronous=FULL;", cancellationToken);
+                await ExecuteNonQueryAsync(connection, null, "PRAGMA foreign_keys=ON;", cancellationToken);
+                await LocalDatabaseSchema.InitializeAsync(connection, cancellationToken);
+                _initialized = true;
             }
-            await transaction.CommitAsync(cancellationToken);
-            _initialized = true;
+            finally
+            {
+                _writeGate.Release();
+            }
         }
         finally
         {

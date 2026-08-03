@@ -10,7 +10,7 @@ on:
       release_tag:
         description: Existing draft release tag
         required: true
-        default: v0.2.2
+        default: v0.3.0
         type: string
 
 permissions:
