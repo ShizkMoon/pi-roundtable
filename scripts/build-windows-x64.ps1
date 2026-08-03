@@ -4,16 +4,45 @@
 
     [string]$OutputRoot,
 
+    [string]$InstallerOutputRoot,
+
     [string]$NuGetConfigFile,
 
     [switch]$SkipVerification,
 
-    [switch]$SuppressMsiValidation
+    [switch]$SuppressMsiValidation,
+
+    [ValidatePattern('^[^<>:"/\\|?*;=]{1,60}$')]
+    [string]$ProductName = 'Pi Roundtable',
+
+    [ValidatePattern('^[^<>:"/\\|?*;=]{1,60}$')]
+    [string]$Manufacturer = 'Pi Roundtable',
+
+    [Guid]$UpgradeCode = [Guid]'8F84BF2C-3DBB-4F28-8B97-78D8B384365A',
+
+    [ValidatePattern('^[^<>:"/\\|?*;=]{1,60}$')]
+    [string]$InstallFolderName = 'Pi Roundtable',
+
+    [ValidatePattern('^[A-Za-z0-9_.\\-]{1,120}$')]
+    [string]$RegistryKeyPath = 'Software\PiRoundtable',
+
+    [ValidatePattern('^[A-Za-z0-9._-]{1,60}$')]
+    [string]$OutputNamePrefix = 'PiRoundtable',
+
+    [ValidatePattern('^[0-9A-Fa-f]{40}$')]
+    [string]$SigningCertificateThumbprint,
+
+    [ValidatePattern('^https?://')]
+    [string]$TimestampUrl,
+
+    [switch]$RequireTrustedSignature
 )
 
 $ErrorActionPreference = 'Stop'
 $dependencyStage = $null
 $temporaryWixNuGetConfig = $null
+. (Join-Path $PSScriptRoot 'windows-packaging.ps1')
+. (Join-Path $PSScriptRoot 'windows-signing.ps1')
 
 function Invoke-Checked {
     param(
@@ -88,102 +117,6 @@ function Invoke-CheckedWixBuild {
     }
 }
 
-function Get-StableWixId {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Prefix,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Value
-    )
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value.ToLowerInvariant())
-    $hash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes))
-    return "$Prefix$($hash.Substring(0, 24))"
-}
-
-function ConvertTo-XmlAttribute {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    return [System.Security.SecurityElement]::Escape($Value)
-}
-
-function Test-PathIsStrictChild {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Root
-    )
-
-    $resolvedPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
-        [System.IO.Path]::DirectorySeparatorChar,
-        [System.IO.Path]::AltDirectorySeparatorChar)
-    $resolvedRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd(
-        [System.IO.Path]::DirectorySeparatorChar,
-        [System.IO.Path]::AltDirectorySeparatorChar)
-    return $resolvedPath.StartsWith(
-        $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar,
-        [StringComparison]::OrdinalIgnoreCase)
-}
-
-function Write-WixFileManifest {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourceRoot,
-
-        [Parameter(Mandatory = $true)]
-        [string]$OutputPath
-    )
-
-    $resolvedRoot = [System.IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
-    $directories = Get-ChildItem -LiteralPath $resolvedRoot -Directory -Recurse |
-        Sort-Object FullName
-    $directoryIds = @{ $resolvedRoot = 'INSTALLFOLDER' }
-    $builder = [System.Text.StringBuilder]::new()
-    [void]$builder.AppendLine('<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">')
-    [void]$builder.AppendLine('  <Fragment>')
-    foreach ($directory in $directories) {
-        $relative = [System.IO.Path]::GetRelativePath($resolvedRoot, $directory.FullName)
-        $directoryId = Get-StableWixId 'dir' $relative
-        $directoryIds[$directory.FullName] = $directoryId
-        $parentPath = [System.IO.Path]::GetFullPath($directory.Parent.FullName).TrimEnd('\')
-        $parentId = $directoryIds[$parentPath]
-        if ([string]::IsNullOrWhiteSpace($parentId)) {
-            throw "Missing WiX parent directory for $relative."
-        }
-        [void]$builder.AppendLine(('    <DirectoryRef Id="{0}">' -f $parentId))
-        [void]$builder.AppendLine(('      <Directory Id="{0}" Name="{1}" />' -f $directoryId, (ConvertTo-XmlAttribute $directory.Name)))
-        [void]$builder.AppendLine('    </DirectoryRef>')
-    }
-    [void]$builder.AppendLine('  </Fragment>')
-    [void]$builder.AppendLine('  <Fragment>')
-    [void]$builder.AppendLine('    <ComponentGroup Id="PublishedFiles">')
-    $msiUnsupportedMuiCultures = @('gd-gb', 'mi-NZ', 'ug-CN')
-    $files = Get-ChildItem -LiteralPath $resolvedRoot -File -Recurse |
-        Where-Object {
-            $_.Extension -ne '.pdb' -and
-            !($_.Extension -ieq '.mui' -and $_.Directory.Name -cin $msiUnsupportedMuiCultures)
-        } |
-        Sort-Object FullName
-    foreach ($file in $files) {
-        $relative = [System.IO.Path]::GetRelativePath($resolvedRoot, $file.FullName)
-        $directoryPath = [System.IO.Path]::GetFullPath($file.DirectoryName).TrimEnd('\')
-        $directoryId = $directoryIds[$directoryPath]
-        $componentId = Get-StableWixId 'cmp' $relative
-        $fileId = Get-StableWixId 'fil' $relative
-        $source = ConvertTo-XmlAttribute $file.FullName
-        $ignoreInvalidEmbeddedLanguage = $file.Extension -ieq '.mui' -or
-            $file.Name -iin @('Microsoft.ui.xaml.dll', 'Microsoft.UI.Xaml.Phone.dll')
-        $defaultLanguage = if ($ignoreInvalidEmbeddedLanguage) { ' DefaultLanguage="0"' } else { '' }
-        [void]$builder.AppendLine(('      <Component Id="{0}" Directory="{1}" Guid="*">' -f $componentId, $directoryId))
-        [void]$builder.AppendLine(('        <File Id="{0}" Source="{1}" KeyPath="yes"{2} />' -f $fileId, $source, $defaultLanguage))
-        [void]$builder.AppendLine('      </Component>')
-    }
-    [void]$builder.AppendLine('    </ComponentGroup>')
-    [void]$builder.AppendLine('  </Fragment>')
-    [void]$builder.AppendLine('</Wix>')
-    [System.IO.File]::WriteAllText($OutputPath, $builder.ToString(), [System.Text.UTF8Encoding]::new($true))
-    Write-Host "Generated WiX manifest for $($files.Count) files and $($directories.Count) directories."
-}
-
 try {
     $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
     $packageRoot = if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -208,7 +141,11 @@ try {
     $updaterStage = Join-Path $packageRoot 'updater'
     $runtimeHostStage = Join-Path $appStage 'runtime-host'
     $runtimeStage = Join-Path $appStage 'runtime'
-    $installerOutput = Join-Path $repoRoot 'out\installer'
+    $installerOutput = if ([string]::IsNullOrWhiteSpace($InstallerOutputRoot)) {
+        Join-Path $repoRoot 'out\installer'
+    } else {
+        [System.IO.Path]::GetFullPath($InstallerOutputRoot)
+    }
     foreach ($path in @($packageRoot, $installerOutput)) {
         $resolved = [System.IO.Path]::GetFullPath($path)
         if (!(Test-PathIsStrictChild -Path $resolved -Root $approvedOutputRoot)) {
@@ -363,6 +300,20 @@ try {
         "await import('@pi-roundtable/protocol')"
     ) $runtimeHostStage
 
+    if (![string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        $firstPartyArtifacts = @(
+            (Join-Path $appStage 'PiRoundtable.Windows.exe'),
+            (Join-Path $appStage 'PiRoundtable.Windows.dll'),
+            (Join-Path $appStage 'PiRoundtable.Updater.exe'),
+            (Join-Path $appStage 'pi_roundtable_core.dll')
+        )
+        Invoke-WindowsArtifactSigning `
+            -Path $firstPartyArtifacts `
+            -CertificateThumbprint $SigningCertificateThumbprint `
+            -TimestampUrl $TimestampUrl `
+            -RequireTrustedSignature:$RequireTrustedSignature | Out-Host
+    }
+
     $generatedWxs = Join-Path $packageRoot 'GeneratedFiles.wxs'
     Write-WixFileManifest -SourceRoot $appStage -OutputPath $generatedWxs
 
@@ -391,6 +342,12 @@ try {
         'build', $wixProject,
         '--configuration', 'Release',
         "-p:ProductVersion=$Version",
+        "-p:ProductName=$ProductName",
+        "-p:Manufacturer=$Manufacturer",
+        "-p:UpgradeCode=$($UpgradeCode.ToString().ToUpperInvariant())",
+        "-p:InstallFolderName=$InstallFolderName",
+        "-p:RegistryKeyPath=$RegistryKeyPath",
+        "-p:OutputNamePrefix=$OutputNamePrefix",
         "-p:PublishDir=$appStage",
         "-p:GeneratedWxs=$generatedWxs",
         "-p:OutputPath=$installerOutput"
@@ -412,6 +369,13 @@ try {
         Select-Object -First 1
     if ($null -eq $msi) {
         throw 'WiX build completed without producing an MSI.'
+    }
+    if (![string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)) {
+        Invoke-WindowsArtifactSigning `
+            -Path $msi.FullName `
+            -CertificateThumbprint $SigningCertificateThumbprint `
+            -TimestampUrl $TimestampUrl `
+            -RequireTrustedSignature:$RequireTrustedSignature | Out-Host
     }
     $hash = Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256
     Write-Host "MSI: $($msi.FullName)"

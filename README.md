@@ -11,9 +11,9 @@ Pi Roundtable 是一个原生 GUI 优先的多角色圆桌会议平台。当前�
 | `packages/runtime-host` | 已实现本地多角色 Host | 固定 Pi SDK；每角色一会话；按冻结清单解析模型、System Prompt、Skill 与精确 MCP tool allowlist；公开 `@` 目标语义编排且每个目标只以自身身份作答；确定性议程/自由讨论/收敛、优先级与公平性队列、有界角色观察/抢答、短轮次和防无限讨论预算；MCP 工具发现/调用及私有审批；不可递归、每父角色最多 2 个的隔离 SubAgent；stdio JSONL v3；持久命令回执、全局序号/代次与规范化事件 |
 | `packages/sync-server` | 已实现受控远端基础 | 所有 `/v1` 路由使用签名设备令牌；运行时租约、代次围栏、游标回放、私有 audience 过滤、HTTP/SSE；可选 PostgreSQL 事务存储，无数据库时明确退回仅限开发的内存实现 |
 | `apps/android` | 脚手架已验证 | Kotlin + Jetpack Compose Material 3，自适应手机/平板界面；Debug APK 与单元测试已在本机通过，尚未接入同步服务 |
-| `apps/windows` | 已实现本地 alpha 闭环 | .NET 10 + WinUI 3；自适应会话轨道、严格单/多角色 `@`、公开/私聊、自动主持模式/议题/预算/队列状态带、审批到期与 SubAgent 活动；安全原生 Markdown、LaTeX 源码回退、长记录虚拟化/跟随/跳到最新；会话 JSON/Markdown 导出与非破坏性导入预检；逐角色模型/System Prompt/Skill/MCP；Credential Manager；DPAPI + SQLite 重放、调度快照与代次恢复；自包含 x64 MSI；ECDSA 签名更新清单、固定公钥、大小/SHA-256 校验及独立更新辅助程序 |
+| `apps/windows` | 已实现本地 alpha 闭环 | .NET 10 + WinUI 3；自适应会话轨道、严格单/多角色 `@`、公开/私聊、自动主持模式/议题/预算/队列状态带、审批到期与 SubAgent 活动；安全原生 Markdown、LaTeX 源码回退、长记录虚拟化/跟随/跳到最新；系统/亮色/暗色与高对比主题策略；会话 JSON/Markdown 导出与非破坏性导入预检；逐角色模型/System Prompt/Skill/MCP；Credential Manager；DPAPI + SQLite 重放、调度快照与代次恢复；自包含 x64 MSI；ECDSA 签名更新清单、固定公钥、大小/SHA-256 校验及独立更新辅助程序 |
 
-“已实现/已验证”描述当前工作站和仓库测试面，不表示已经生产部署。仓库不保存提供商凭据；真实提供商验收结果只保留在被忽略的本机 `out/`。托管桌面会话无法截图时，功能状态与视觉状态会分开记录，UIA 结构快照不能冒充像素级视觉验收。MSI Authenticode 签名、真正的公式排版引擎、ARM64、客户端远端同步接入、E2EE、TLS/限流/保留任务、多副本通知、推送和生产级重连仍是后续工作。
+“已实现/已验证”描述当前工作站和仓库测试面，不表示已经生产部署。仓库不保存提供商凭据；真实提供商验收结果只保留在被忽略的本机 `out/`。托管桌面会话无法截图时，功能状态与视觉状态会分开记录，UIA 结构快照不能冒充像素级视觉验收。Windows 代码签名流水线已实现且以临时证书验证机制，但正式可信证书、时间戳发布验收及 100%/200% 真实 DPI 证据仍依赖发布环境；真正的公式排版引擎、ARM64、客户端远端同步接入、E2EE、TLS/限流/保留任务、多副本通知、推送和生产级重连仍是后续工作。
 
 ## 架构边界
 
@@ -89,7 +89,27 @@ dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.2.2
 ```
 
-脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.2.2-win-x64.msi` 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256；当前 MSI 仍未做 Authenticode 签名，因此清单必须保持 `authenticodeRequired: false`。真实安装/卸载与 0.1→0.2.2 升级由发布验收执行；修复矩阵、代码签名和 ARM64 MSI 仍为 pending。
+脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.2.2-win-x64.msi` 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，清单必须保持 `authenticodeRequired: false`。
+
+Windows 发布门禁现提供三组自动化：
+
+```powershell
+# 以一次性、非导出自签名证书验证“先签二进制、再构建、最后签 MSI”的机械链路；不构成生产信任
+pwsh -File .\scripts\test-windows-signing-pipeline.ps1
+
+# 使用隔离 UpgradeCode/ProductName 跑安装、启动、修复、升级、降级阻止、再修复和卸载；默认用真实 WinUI 壳的精简负载
+pwsh -File .\scripts\test-windows-msi-lifecycle.ps1
+# 发布机可显式使用完整生产负载
+pwsh -File .\scripts\test-windows-msi-lifecycle.ps1 -UseFullPayload
+
+# 在当前真实 DPI 会话核验亮色、暗色和系统高对比，并在 finally 中恢复系统设置
+pwsh -File .\scripts\run-windows-theme-visual-qa.ps1 `
+  -AppRoot .\out\package\windows-x64\app -ExpectedDpi 144
+```
+
+`merge-windows-visual-matrix.ps1` 只接受真实 96/144/192 DPI 会话分别生成的三主题报告；任何缺失或实际 DPI 不符都会失败。正式签名使用 `build-signed-windows-x64.ps1`，证书必须来自仓库外的 PFX 或证书存储，密码只从环境变量读取，并要求 RFC 3161 时间戳与可信链验证。完整操作和证据口径见 [`packaging/windows-x64/README.md`](packaging/windows-x64/README.md)。ARM64 MSI 仍为 pending。
+
+当前 Windows 工作站已分别 verified 精简 WinUI 壳和完整 22,594 文件生产负载的隔离生命周期；这证明自动化及当前 0.2.1→0.2.2 QA 包可完成安装、修复、升级、降级阻止和卸载，但每个新的 release candidate 仍必须重新运行，不能沿用本次现场结果。
 
 已有测试凭据时，可对发布目录执行一次不回显 Key 的真实 DeepSeek/Pi 三角色、三轮全链路验收：
 

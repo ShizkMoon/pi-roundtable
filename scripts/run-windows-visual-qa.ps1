@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$AppRoot = 'apps\windows\PiRoundtable.Windows\bin\x64\Debug\net10.0-windows10.0.26100.0\win-x64',
 
     [string]$OutputRoot = 'artifacts\visual-qa\viewport-matrix',
@@ -7,7 +7,16 @@ param(
     [int[]]$ViewportWidths = @(720, 900, 1280, 1520),
 
     [ValidateRange(560, 1000)]
-    [int]$ViewportHeight = 800
+    [int]$ViewportHeight = 800,
+
+    [ValidateSet('system', 'light', 'dark')]
+    [string]$ThemeMode = 'system',
+
+    [ValidateSet(0, 96, 144, 192)]
+    [int]$ExpectedDpi = 0,
+
+    [ValidateSet('any', 'off', 'on')]
+    [string]$ExpectedHighContrast = 'any'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,6 +107,7 @@ $session = [ordered]@{
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 if ($null -eq ('PiRoundtableVisualCapture' -as [type])) {
     Add-Type @'
 using System;
@@ -152,6 +162,76 @@ function Save-WindowCapture {
     }
 }
 
+function Get-ImageMetrics {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $bitmap = [Drawing.Bitmap]::new($Path)
+    try {
+        $stepX = [Math]::Max(1, [int][Math]::Floor($bitmap.Width / 96))
+        $stepY = [Math]::Max(1, [int][Math]::Floor($bitmap.Height / 72))
+        $sampleCount = 0
+        $luminanceTotal = 0.0
+        $minimum = 1.0
+        $maximum = 0.0
+        $darkCount = 0
+        $lightCount = 0
+        $quantizedColors = [System.Collections.Generic.HashSet[int]]::new()
+        for ($y = 0; $y -lt $bitmap.Height; $y += $stepY) {
+            for ($x = 0; $x -lt $bitmap.Width; $x += $stepX) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                $luminance = (0.2126 * $pixel.R + 0.7152 * $pixel.G + 0.0722 * $pixel.B) / 255.0
+                $sampleCount++
+                $luminanceTotal += $luminance
+                $minimum = [Math]::Min($minimum, $luminance)
+                $maximum = [Math]::Max($maximum, $luminance)
+                if ($luminance -le 0.20) { $darkCount++ }
+                if ($luminance -ge 0.80) { $lightCount++ }
+                $quantized = (($pixel.R -shr 4) -shl 8) -bor (($pixel.G -shr 4) -shl 4) -bor ($pixel.B -shr 4)
+                [void]$quantizedColors.Add($quantized)
+            }
+        }
+        return [ordered]@{
+            averageLuminance = [Math]::Round($luminanceTotal / $sampleCount, 4)
+            minimumLuminance = [Math]::Round($minimum, 4)
+            maximumLuminance = [Math]::Round($maximum, 4)
+            luminanceRange = [Math]::Round($maximum - $minimum, 4)
+            darkSampleRatio = [Math]::Round($darkCount / $sampleCount, 4)
+            lightSampleRatio = [Math]::Round($lightCount / $sampleCount, 4)
+            quantizedColorCount = $quantizedColors.Count
+            sampleCount = $sampleCount
+        }
+    } finally {
+        $bitmap.Dispose()
+    }
+}
+
+function Assert-ThemeMetrics {
+    param(
+        [Parameter(Mandatory = $true)]$Metrics,
+        [Parameter(Mandatory = $true)][string]$RequestedTheme,
+        [Parameter(Mandatory = $true)][bool]$HighContrast,
+        [Parameter(Mandatory = $true)][int]$ViewportWidth
+    )
+
+    if ($Metrics.quantizedColorCount -lt 8 -or $Metrics.luminanceRange -lt 0.35) {
+        throw "The $ViewportWidth DIP capture is visually degenerate and cannot prove a rendered UI."
+    }
+    if ($HighContrast) {
+        if ($Metrics.luminanceRange -lt 0.75 -or
+            $Metrics.darkSampleRatio -lt 0.02 -or
+            $Metrics.lightSampleRatio -lt 0.02) {
+            throw "The $ViewportWidth DIP capture does not show a credible high-contrast palette."
+        }
+        return
+    }
+    if ($RequestedTheme -eq 'dark' -and $Metrics.averageLuminance -ge 0.58) {
+        throw "The $ViewportWidth DIP capture is too bright for the requested dark theme."
+    }
+    if ($RequestedTheme -eq 'light' -and $Metrics.averageLuminance -le 0.42) {
+        throw "The $ViewportWidth DIP capture is too dark for the requested light theme."
+    }
+}
+
 function Invoke-AutomationButton {
     param([System.Windows.Automation.AutomationElement]$Element)
     if ($null -eq $Element) {
@@ -174,6 +254,8 @@ $startInfo = [System.Diagnostics.ProcessStartInfo]::new($executable)
 $startInfo.WorkingDirectory = $resolvedAppRoot
 $startInfo.UseShellExecute = $false
 $startInfo.Environment['PI_ROUNDTABLE_DATA_ROOT'] = $dataRoot
+$startInfo.Environment['PI_ROUNDTABLE_VISUAL_QA'] = '1'
+$startInfo.Environment['PI_ROUNDTABLE_VISUAL_QA_THEME'] = $ThemeMode
 $process = [System.Diagnostics.Process]::Start($startInfo)
 try {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
@@ -195,6 +277,16 @@ try {
     $dpi = [PiRoundtableVisualCapture]::GetDpiForWindow($process.MainWindowHandle)
     if ($dpi -lt 96) {
         throw "Unexpected window DPI: $dpi"
+    }
+    if ($ExpectedDpi -ne 0 -and [Math]::Abs([int]$dpi - $ExpectedDpi) -gt 1) {
+        throw "This desktop rendered the window at $dpi DPI, but the QA run requires $ExpectedDpi DPI. Use a real matching display, session, or VM."
+    }
+    $highContrast = [System.Windows.Forms.SystemInformation]::HighContrast
+    if ($ExpectedHighContrast -eq 'on' -and !$highContrast) {
+        throw 'The QA run requires Windows high contrast, but the interactive desktop reports it is disabled.'
+    }
+    if ($ExpectedHighContrast -eq 'off' -and $highContrast) {
+        throw 'The QA run requires normal contrast, but the interactive desktop reports Windows high contrast is enabled.'
     }
     $scale = $dpi / 96.0
     $initialWindowRect = New-Object PiRoundtableVisualCapture+RECT
@@ -238,6 +330,8 @@ try {
         $privateChatVisible = Get-VisibilityByName -Root $root -Name '私聊发言输入'
         $capturePath = Join-Path $resolvedOutput "meeting-$viewportWidth-dip.png"
         Save-WindowCapture -Handle $process.MainWindowHandle -Path $capturePath
+        $imageMetrics = Get-ImageMetrics -Path $capturePath
+        Assert-ThemeMetrics -Metrics $imageMetrics -RequestedTheme $ThemeMode -HighContrast $highContrast -ViewportWidth $viewportWidth
         $measurements.Add([ordered]@{
             viewportWidthDip = $viewportWidth
             actualWidthDip = $actualWidth
@@ -248,6 +342,7 @@ try {
             meetingHeaderHeightDip = $headerHeightDip
             privateChatVisible = $privateChatVisible
             responding = $process.Responding
+            imageMetrics = $imageMetrics
             screenshot = $capturePath
         })
         if ([Math]::Abs($actualWidth - $viewportWidth) -gt 3 -or !$process.Responding) {
@@ -353,9 +448,14 @@ try {
     }
 
     $report = [ordered]@{
+        visualStatus = 'verified'
+        captureMethod = 'PrintWindow'
         dpi = $dpi
+        expectedDpi = $(if ($ExpectedDpi -eq 0) { $null } else { $ExpectedDpi })
         rasterizationScale = $scale
-        highContrast = [System.Windows.Forms.SystemInformation]::HighContrast
+        requestedTheme = $ThemeMode
+        highContrast = $highContrast
+        expectedHighContrast = $ExpectedHighContrast
         viewportHeightDip = $ViewportHeight
         measurements = $measurements
         markdownBottomScreenshot = $markdownBottomCapture

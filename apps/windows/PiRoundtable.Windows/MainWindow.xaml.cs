@@ -62,8 +62,19 @@ public sealed partial class MainWindow : Window
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
         SystemBackdrop = new MicaBackdrop();
+        Activated += MainWindow_Activated;
         AppWindow.Closing += MainWindow_Closing;
         CurrentVersionText.Text = $"当前版本 {_updateService.CurrentVersion.ToString(3)} · stable · {System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}";
+    }
+
+    private void MainWindow_Activated(object sender, WindowActivatedEventArgs args)
+    {
+        // Re-evaluate the Win32 high-contrast state when the user returns from
+        // Windows Settings. ElementTheme.Default continues to track system colors.
+        if (_initialized && args.WindowActivationState != WindowActivationState.Deactivated)
+        {
+            ApplyTheme();
+        }
     }
 
     private object RootDataContext
@@ -1339,7 +1350,13 @@ public sealed partial class MainWindow : Window
 
     private void ApplyTheme()
     {
-        Root.RequestedTheme = ViewModel.ThemeMode switch
+        var mode = ThemePolicy.ResolveMode(
+            ViewModel.ThemeMode,
+            ThemePolicy.IsWindowsHighContrastEnabled(),
+            ThemePolicy.GetVisualQaOverride(
+                Environment.GetEnvironmentVariable(ThemePolicy.VisualQaEnabledVariable),
+                Environment.GetEnvironmentVariable(ThemePolicy.VisualQaOverrideVariable)));
+        Root.RequestedTheme = mode switch
         {
             "light" => ElementTheme.Light,
             "dark" => ElementTheme.Dark,

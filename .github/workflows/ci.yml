@@ -39,7 +39,7 @@ jobs:
 
   windows-client:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -63,14 +63,45 @@ jobs:
         run: ctest --preset dev
       - name: Test Windows client
         run: dotnet test apps/windows/tests/PiRoundtable.Windows.Tests/PiRoundtable.Windows.Tests.csproj --configuration Release
+      - name: Parse PowerShell automation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem scripts -Filter '*.ps1' -File | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors)
+            if ($errors.Count -gt 0) {
+              throw "$($_.Name): $($errors[0].Message)"
+            }
+          }
       - name: Build self-contained Windows x64 MSI
         shell: pwsh
         # GitHub's Windows runner closes the WiX ICE validation pipe for this
         # large self-contained package. Release builds keep validation on;
         # CI still compiles the complete MSI after tests have passed.
         run: ./scripts/build-windows-x64.ps1 -Version 0.2.2 -SkipVerification -SuppressMsiValidation
+      - name: Test Authenticode signing pipeline on copies
+        shell: pwsh
+        run: ./scripts/test-windows-signing-pipeline.ps1
+      - name: Test isolated MSI lifecycle
+        shell: pwsh
+        run: ./scripts/test-windows-msi-lifecycle.ps1 -SkipLaunch
       - uses: actions/upload-artifact@v4
         with:
           name: PiRoundtable-0.2.2-win-x64
           path: out/installer/PiRoundtable-0.2.2-win-x64.msi
           if-no-files-found: error
+      - name: Upload Windows release QA evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PiRoundtable-windows-release-qa-${{ github.sha }}
+          path: |
+            out/e2e/signing-pipeline/signing-pipeline-report.json
+            out/e2e/msi-lifecycle-*/msi-lifecycle-report.json
+            out/e2e/msi-lifecycle-*/logs/*.log
+          if-no-files-found: warn
