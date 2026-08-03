@@ -73,6 +73,48 @@ public sealed class ArtifactVerificationSpec
 }
 
 /// <summary>
+/// Owns the verified file handle and, on Windows, the no-delete parent
+/// directory handles used to keep every resolved path component stable until
+/// the consumer finishes using the artifact.
+/// </summary>
+public sealed class VerifiedArtifactLease : IAsyncDisposable
+{
+    private FileStream? _stream;
+    private List<SafeFileHandle>? _pathLocks;
+
+    internal VerifiedArtifactLease(FileStream stream, List<SafeFileHandle>? pathLocks = null)
+    {
+        _stream = stream;
+        _pathLocks = pathLocks;
+    }
+
+    public FileStream Stream => _stream ?? throw new ObjectDisposedException(nameof(VerifiedArtifactLease));
+
+    public async ValueTask DisposeAsync()
+    {
+        var stream = Interlocked.Exchange(ref _stream, null);
+        var pathLocks = Interlocked.Exchange(ref _pathLocks, null);
+        try
+        {
+            if (stream is not null)
+            {
+                await stream.DisposeAsync();
+            }
+        }
+        finally
+        {
+            if (pathLocks is not null)
+            {
+                for (var index = pathLocks.Count - 1; index >= 0; index--)
+                {
+                    pathLocks[index].Dispose();
+                }
+            }
+        }
+    }
+}
+
+/// <summary>
 /// Dependency-free byte-count and SHA-256 verification shared by the desktop
 /// updater, module catalog, offline layout, and artifact workers. This class
 /// deliberately does not decide manifest trust, URI policy, Authenticode, or
@@ -144,7 +186,7 @@ public static class ArtifactVerifier
     /// the returned handle with <see cref="FileShare.Read"/> prevents write or
     /// delete replacement between verification and use.
     /// </summary>
-    public static async Task<FileStream> OpenVerifiedReadAsync(
+    public static async Task<VerifiedArtifactLease> OpenVerifiedReadAsync(
         string path,
         ArtifactVerificationSpec spec,
         FileShare fileShare = FileShare.Read,
@@ -152,18 +194,18 @@ public static class ArtifactVerifier
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(spec);
-        var stream = OperatingSystem.IsWindows()
+        var lease = OperatingSystem.IsWindows()
             ? WindowsNoFollowFile.OpenRead(path, fileShare, BufferSize)
             : OpenPortableRead(path, fileShare);
         try
         {
-            await VerifyAsync(stream, spec, cancellationToken);
-            stream.Position = 0;
-            return stream;
+            await VerifyAsync(lease.Stream, spec, cancellationToken);
+            lease.Stream.Position = 0;
+            return lease;
         }
         catch
         {
-            await stream.DisposeAsync();
+            await lease.DisposeAsync();
             throw;
         }
     }
@@ -253,7 +295,7 @@ public static class ArtifactVerifier
         }
     }
 
-    private static FileStream OpenPortableRead(string path, FileShare fileShare)
+    private static VerifiedArtifactLease OpenPortableRead(string path, FileShare fileShare)
     {
         var attributes = File.GetAttributes(path);
         if ((attributes & FileAttributes.ReparsePoint) != 0)
@@ -262,13 +304,13 @@ public static class ArtifactVerifier
                 ArtifactIntegrityFailure.ReparsePoint,
                 "Artifact leaf cannot be a reparse point.");
         }
-        return new FileStream(
+        return new VerifiedArtifactLease(new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             fileShare,
             BufferSize,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+            FileOptions.Asynchronous | FileOptions.SequentialScan));
     }
 }
 
@@ -282,41 +324,36 @@ internal static class WindowsNoFollowFile
     private const uint FileFlagOverlapped = 0x40000000;
     private const int FileAttributeTagInfoClass = 9;
 
-    public static FileStream OpenRead(string path, FileShare fileShare, int bufferSize)
+    public static VerifiedArtifactLease OpenRead(string path, FileShare fileShare, int bufferSize)
     {
         var fullPath = Path.GetFullPath(path);
         var parentHandles = OpenParentDirectories(fullPath);
+        var fileHandle = CreateFileW(
+            ToExtendedPath(fullPath),
+            GenericRead,
+            (uint)fileShare,
+            nint.Zero,
+            OpenExisting,
+            FileFlagOpenReparsePoint | FileFlagSequentialScan | FileFlagOverlapped,
+            nint.Zero);
+        if (fileHandle.IsInvalid)
+        {
+            var error = Marshal.GetLastPInvokeError();
+            fileHandle.Dispose();
+            DisposeHandles(parentHandles);
+            throw new Win32Exception(error);
+        }
         try
         {
-            var fileHandle = CreateFileW(
-                ToExtendedPath(fullPath),
-                GenericRead,
-                (uint)fileShare,
-                nint.Zero,
-                OpenExisting,
-                FileFlagOpenReparsePoint | FileFlagSequentialScan | FileFlagOverlapped,
-                nint.Zero);
-            if (fileHandle.IsInvalid)
-            {
-                ThrowLastWin32Error();
-            }
-            try
-            {
-                RejectReparsePoint(fileHandle);
-                return new FileStream(fileHandle, FileAccess.Read, bufferSize, isAsync: true);
-            }
-            catch
-            {
-                fileHandle.Dispose();
-                throw;
-            }
+            RejectReparsePoint(fileHandle);
+            var stream = new FileStream(fileHandle, FileAccess.Read, bufferSize, isAsync: true);
+            return new VerifiedArtifactLease(stream, parentHandles);
         }
-        finally
+        catch
         {
-            foreach (var handle in parentHandles)
-            {
-                handle.Dispose();
-            }
+            fileHandle.Dispose();
+            DisposeHandles(parentHandles);
+            throw;
         }
     }
 
@@ -345,7 +382,9 @@ internal static class WindowsNoFollowFile
                     nint.Zero);
                 if (handle.IsInvalid)
                 {
-                    ThrowLastWin32Error();
+                    var error = Marshal.GetLastPInvokeError();
+                    handle.Dispose();
+                    throw new Win32Exception(error);
                 }
                 try
                 {
@@ -362,10 +401,7 @@ internal static class WindowsNoFollowFile
         }
         catch
         {
-            foreach (var handle in handles)
-            {
-                handle.Dispose();
-            }
+            DisposeHandles(handles);
             throw;
         }
     }
@@ -378,7 +414,7 @@ internal static class WindowsNoFollowFile
                 out var information,
                 (uint)Marshal.SizeOf<FileAttributeTagInfo>()))
         {
-            ThrowLastWin32Error();
+            throw new Win32Exception(Marshal.GetLastPInvokeError());
         }
         if ((information.FileAttributes & (uint)FileAttributes.ReparsePoint) != 0)
         {
@@ -401,9 +437,12 @@ internal static class WindowsNoFollowFile
         return $"\\\\?\\{path}";
     }
 
-    private static void ThrowLastWin32Error()
+    private static void DisposeHandles(List<SafeFileHandle> handles)
     {
-        throw new Win32Exception(Marshal.GetLastPInvokeError());
+        for (var index = handles.Count - 1; index >= 0; index--)
+        {
+            handles[index].Dispose();
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]

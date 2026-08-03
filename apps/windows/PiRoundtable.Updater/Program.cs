@@ -244,7 +244,7 @@ internal static class Program
 
 public static class VerifiedPackageLock
 {
-    public static async Task<FileStream> OpenAsync(
+    public static async Task<VerifiedArtifactLease> OpenAsync(
         string path,
         long expectedSize,
         ReadOnlyMemory<byte> expectedSha256,

@@ -138,6 +138,7 @@ internal sealed class WindowsUpdateService : IDisposable
         TryDelete(partialPath);
         TryDelete(finalPath);
         ValidateInitialUri(manifest.AssetUri);
+        var finalPromoted = false;
         try
         {
             using var response = await SendWithRedirectsAsync(manifest.AssetUri, cancellationToken);
@@ -174,19 +175,34 @@ internal sealed class WindowsUpdateService : IDisposable
                 destination.Flush(flushToDisk: true);
             }
 
-            if (manifest.Document.Asset.AuthenticodeRequired && !_authenticodeVerifier.IsTrusted(partialPath))
-            {
-                throw new CryptographicException("更新清单要求 Authenticode，但安装包签名不受 Windows 信任。");
-            }
-
             File.Move(partialPath, finalPath, overwrite: true);
-            await WriteStateAsync(versionDirectory, manifest, finalPath, cancellationToken);
+            finalPromoted = true;
+            await using (var verifiedPackage = await ArtifactVerifier.OpenVerifiedReadAsync(
+                finalPath,
+                verificationSpec,
+                FileShare.Read,
+                cancellationToken))
+            {
+                // Keep both the verified leaf and its parent path locked while
+                // WinVerifyTrust resolves the path, so signature verification
+                // cannot observe a replacement that differs from the bytes
+                // reverified above.
+                if (manifest.Document.Asset.AuthenticodeRequired && !_authenticodeVerifier.IsTrusted(finalPath))
+                {
+                    throw new CryptographicException("更新清单要求 Authenticode，但安装包签名不受 Windows 信任。");
+                }
+                await WriteStateAsync(versionDirectory, manifest, finalPath, cancellationToken);
+            }
             progress?.Report(1);
             return new StagedUpdatePackage(manifest, finalPath);
         }
         catch
         {
             TryDelete(partialPath);
+            if (finalPromoted)
+            {
+                TryDelete(finalPath);
+            }
             throw;
         }
     }

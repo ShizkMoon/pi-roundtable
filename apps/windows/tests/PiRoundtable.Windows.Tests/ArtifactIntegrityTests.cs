@@ -85,7 +85,7 @@ public sealed class ArtifactIntegrityTests
             var spec = new ArtifactVerificationSpec(payload.Length, SHA256.HashData(payload));
             await using var verified = await ArtifactVerifier.OpenVerifiedReadAsync(path, spec);
 
-            Assert.AreEqual(0, verified.Position);
+            Assert.AreEqual(0, verified.Stream.Position);
             Assert.ThrowsExactly<IOException>(() =>
                 new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite).Dispose());
         }
