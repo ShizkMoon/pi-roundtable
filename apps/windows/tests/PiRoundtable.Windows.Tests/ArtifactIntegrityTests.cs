@@ -165,6 +165,24 @@ public sealed class ArtifactIntegrityTests
     }
 
     [TestMethod]
+    public async Task Maximum_numeric_limits_do_not_overflow_sentinel_reads()
+    {
+        var hugeSpec = new ArtifactVerificationSpec(long.MaxValue, new byte[ArtifactVerifier.Sha256Length]);
+        await using var emptySource = new MemoryStream([], writable: false);
+        await using var destination = new MemoryStream();
+
+        var sizeException = await Assert.ThrowsExactlyAsync<ArtifactIntegrityException>(() =>
+            ArtifactVerifier.CopyAndVerifyAsync(emptySource, destination, hugeSpec));
+
+        Assert.AreEqual(ArtifactIntegrityFailure.SizeMismatch, sizeException.Failure);
+
+        await using var oneByte = new MemoryStream([42], writable: false);
+        CollectionAssert.AreEqual(
+            new byte[] { 42 },
+            await BoundedContent.ReadAllBytesAsync(oneByte, int.MaxValue));
+    }
+
+    [TestMethod]
     public void Verification_spec_rejects_invalid_hash_material()
     {
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new ArtifactVerificationSpec(-1, new byte[32]));
