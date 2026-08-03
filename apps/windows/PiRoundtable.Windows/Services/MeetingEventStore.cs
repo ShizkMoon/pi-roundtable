@@ -120,7 +120,9 @@ internal sealed class MeetingEventStore : IMeetingEventStore
             await _writeGate.WaitAsync(cancellationToken);
             try
             {
-                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await using var connection = await OpenConnectionAsync(
+                    cancellationToken,
+                    busyTimeoutMilliseconds: 1_000);
                 await ExecuteNonQueryAsync(connection, null, "PRAGMA journal_mode=WAL;", cancellationToken);
                 await ExecuteNonQueryAsync(connection, null, "PRAGMA synchronous=FULL;", cancellationToken);
                 await ExecuteNonQueryAsync(connection, null, "PRAGMA foreign_keys=ON;", cancellationToken);
@@ -239,7 +241,9 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         ArgumentException.ThrowIfNullOrWhiteSpace(meetingId);
         await InitializeAsync(cancellationToken);
         await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = connection.BeginTransaction(deferred: true);
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             SELECT event_id, sequence, runtime_generation, event_kind,
                    occurred_at, visibility, protected_event
@@ -249,41 +253,48 @@ internal sealed class MeetingEventStore : IMeetingEventStore
             """;
         command.Parameters.AddWithValue("$meeting_id", meetingId);
         var events = new List<RuntimeMeetingEvent>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         ulong expectedSequence = 1;
-        while (await reader.ReadAsync(cancellationToken))
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
         {
-            var meetingEvent = DeserializeEvent((byte[])reader[6]);
-            var indexSequence = checked((ulong)reader.GetInt64(1));
-            var indexGeneration = checked((ulong)reader.GetInt64(2));
-            var indexOccurredAt = DateTimeOffset.Parse(
-                reader.GetString(4),
-                null,
-                System.Globalization.DateTimeStyles.RoundtripKind);
-            if (
-                !string.Equals(meetingEvent.MeetingId, meetingId, StringComparison.Ordinal) ||
-                !string.Equals(meetingEvent.EventId, reader.GetString(0), StringComparison.Ordinal) ||
-                meetingEvent.Sequence != indexSequence ||
-                meetingEvent.RuntimeGeneration != indexGeneration ||
-                !string.Equals(meetingEvent.Kind, reader.GetString(3), StringComparison.Ordinal) ||
-                meetingEvent.OccurredAt != indexOccurredAt ||
-                !string.Equals(meetingEvent.Visibility, reader.GetString(5), StringComparison.Ordinal))
+            while (await reader.ReadAsync(cancellationToken))
             {
-                throw new InvalidDataException("本地事件内容与索引不一致。");
+                var meetingEvent = DeserializeEvent((byte[])reader[6]);
+                var indexSequence = checked((ulong)reader.GetInt64(1));
+                var indexGeneration = checked((ulong)reader.GetInt64(2));
+                var indexOccurredAt = DateTimeOffset.Parse(
+                    reader.GetString(4),
+                    null,
+                    System.Globalization.DateTimeStyles.RoundtripKind);
+                if (
+                    !string.Equals(meetingEvent.MeetingId, meetingId, StringComparison.Ordinal) ||
+                    !string.Equals(meetingEvent.EventId, reader.GetString(0), StringComparison.Ordinal) ||
+                    meetingEvent.Sequence != indexSequence ||
+                    meetingEvent.RuntimeGeneration != indexGeneration ||
+                    !string.Equals(meetingEvent.Kind, reader.GetString(3), StringComparison.Ordinal) ||
+                    meetingEvent.OccurredAt != indexOccurredAt ||
+                    !string.Equals(meetingEvent.Visibility, reader.GetString(5), StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException("本地事件内容与索引不一致。");
+                }
+                if (meetingEvent.Sequence != expectedSequence)
+                {
+                    throw new InvalidDataException(
+                        $"本地事件序号不连续：期待 {expectedSequence}，读取到 {meetingEvent.Sequence}。");
+                }
+                events.Add(meetingEvent);
+                expectedSequence = checked(expectedSequence + 1);
             }
-            if (meetingEvent.Sequence != expectedSequence)
-            {
-                throw new InvalidDataException(
-                    $"本地事件序号不连续：期待 {expectedSequence}，读取到 {meetingEvent.Sequence}。");
-            }
-            events.Add(meetingEvent);
-            expectedSequence = checked(expectedSequence + 1);
         }
-        var checkpoint = await GetCheckpointAsync(meetingId, cancellationToken);
+        var checkpoint = await ReadCheckpointAsync(
+            connection,
+            transaction,
+            meetingId,
+            cancellationToken);
         if (checkpoint is not null && checkpoint.LastSequence != expectedSequence - 1)
         {
             throw new InvalidDataException("本地事件检查点与事件日志不一致。");
         }
+        await transaction.CommitAsync(cancellationToken);
         return events;
     }
 
@@ -500,18 +511,33 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         }
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    private async Task<SqliteConnection> OpenConnectionAsync(
+        CancellationToken cancellationToken,
+        int busyTimeoutMilliseconds = 5_000)
     {
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = DatabasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared,
+            Cache = SqliteCacheMode.Private,
             Pooling = false,
+            DefaultTimeout = Math.Max(1, (int)Math.Ceiling(busyTimeoutMilliseconds / 1_000d)),
         }.ToString());
-        await connection.OpenAsync(cancellationToken);
-        await ExecuteNonQueryAsync(connection, null, "PRAGMA busy_timeout=5000;", cancellationToken);
-        return connection;
+        try
+        {
+            await connection.OpenAsync(cancellationToken);
+            await ExecuteNonQueryAsync(
+                connection,
+                null,
+                $"PRAGMA busy_timeout={busyTimeoutMilliseconds};",
+                cancellationToken);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
     }
 
     private RuntimeMeetingEvent DeserializeEvent(byte[] ciphertext)
@@ -573,6 +599,7 @@ internal sealed class MeetingEventStore : IMeetingEventStore
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(meetingId);
         ArgumentException.ThrowIfNullOrWhiteSpace(commandId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(fingerprint);
         if (commandId.Length > 128)
         {
             throw new ArgumentOutOfRangeException(nameof(commandId), "命令 ID 过长。");

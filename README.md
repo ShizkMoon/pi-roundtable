@@ -97,7 +97,7 @@ dotnet restore apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 ```
 
-开发客户端会向上查找 `packages/runtime-host/dist/host-main.js`，并在 x64 构建时复制 `out/build/dev/core/pi_roundtable_core.dll`。源码 checkout/测试也可分别用 `PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT` 与 `PI_ROUNDTABLE_NODE_PATH` 指定路径；自包含发布版始终优先使用应用目录内的 Node 与 Runtime Host，不接受环境变量覆盖。非敏感工作区配置保存到 `%LOCALAPPDATA%\PiRoundtable\workspace.v1.json`，会话定义保存到 `%LOCALAPPDATA%\PiRoundtable\sessions\`；规范化事件与角色记忆修订写入版本化的 `%LOCALAPPDATA%\PiRoundtable\data\roundtable.db`，正文由当前 Windows 用户 DPAPI 加密。API Key 按 `credentialRef` 保存到 Windows Credential Manager，启动时只把本场角色所需凭据通过一次性 stdin 初始化帧交给本地子进程，不进入环境、事件或 JSON 配置。
+开发客户端会向上查找 `packages/runtime-host/dist/host-main.js`，并在 x64 构建时复制 `out/build/dev/core/pi_roundtable_core.dll`。源码 checkout/测试也可分别用 `PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT` 与 `PI_ROUNDTABLE_NODE_PATH` 指定路径；自包含发布版始终优先使用应用目录内的 Node 与 Runtime Host，不接受环境变量覆盖。非敏感工作区配置保存到 `%LOCALAPPDATA%\PiRoundtable\workspace.v1.json`，会话定义保存到 `%LOCALAPPDATA%\PiRoundtable\sessions\`；规范化事件与角色记忆修订写入版本化的 `%LOCALAPPDATA%\PiRoundtable\data\roundtable.db`，正文由当前 Windows 用户 DPAPI 加密并在打开时校验精确 schema。未来模块、工件元数据和本地诊断使用独立 `platform.db`，当前只完成所有权/迁移规范，尚未创建生产数据库；边界见 [`ADR 0013`](docs/adr/0013-local-database-ownership-and-forward-migrations.md)。API Key 按 `credentialRef` 保存到 Windows Credential Manager，启动时只把本场角色所需凭据通过一次性 stdin 初始化帧交给本地子进程，不进入环境、事件或 JSON 配置。
 
 生成未签名但可由签名清单安全分发的自包含 x64 MSI：
 

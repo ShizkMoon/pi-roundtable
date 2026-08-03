@@ -123,7 +123,7 @@ public sealed class MeetingEventStoreTests
             var first = CaptureAsync(() => firstStore.AppendAsync(Event(2, "meeting.opened", "one")));
             var second = CaptureAsync(() => secondStore.AppendAsync(
                 Event(2, "meeting.opened", "two") with { EventId = "event-two" }));
-            var outcomes = await Task.WhenAll(first, second);
+            var outcomes = await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(15));
 
             Assert.AreEqual(1, outcomes.Count(outcome => outcome is null));
             Assert.AreEqual(1, outcomes.Count(outcome => outcome is InvalidDataException));
@@ -131,6 +131,34 @@ public sealed class MeetingEventStoreTests
         }
         finally
         {
+            DeleteRoot(root);
+        }
+    }
+
+    [TestMethod]
+    public async Task Event_load_uses_one_snapshot_while_a_concurrent_append_commits()
+    {
+        var root = TestRoot();
+        var protector = new BlockingReadProtector();
+        try
+        {
+            var store = new MeetingEventStore(root, protector);
+            await store.AppendAsync(Event(1, "runtime.lease_acquired", "first"));
+
+            var load = Task.Run(() => store.LoadEventsAsync("meeting-test"));
+            await protector.WaitUntilReadBlocksAsync();
+            await store.AppendAsync(Event(2, "meeting.opened", "second"))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            protector.ReleaseRead();
+
+            var snapshot = await load.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.HasCount(1, snapshot);
+            Assert.AreEqual(1UL, snapshot[0].Sequence);
+            Assert.HasCount(2, await store.LoadEventsAsync("meeting-test"));
+        }
+        finally
+        {
+            protector.ReleaseRead();
             DeleteRoot(root);
         }
     }
@@ -277,6 +305,32 @@ public sealed class MeetingEventStoreTests
         {
             return error;
         }
+    }
+
+    private sealed class BlockingReadProtector : IContentProtector
+    {
+        private readonly TaskCompletionSource _readBlocked =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _readReleased =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _shouldBlock = 1;
+
+        public byte[] Protect(ReadOnlySpan<byte> plaintext) => plaintext.ToArray();
+
+        public byte[] Unprotect(ReadOnlySpan<byte> ciphertext)
+        {
+            if (Interlocked.Exchange(ref _shouldBlock, 0) == 1)
+            {
+                _readBlocked.TrySetResult();
+                _readReleased.Task.GetAwaiter().GetResult();
+            }
+            return ciphertext.ToArray();
+        }
+
+        public Task WaitUntilReadBlocksAsync() =>
+            _readBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        public void ReleaseRead() => _readReleased.TrySetResult();
     }
 
     private static void DeleteRoot(string root)
