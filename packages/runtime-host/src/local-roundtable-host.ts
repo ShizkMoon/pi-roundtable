@@ -30,7 +30,6 @@ import {
 } from "./mcp-client-manager.js";
 import type {
   RuntimeAdapter,
-  RuntimeCommand,
   RuntimeCommandResult,
   RuntimeEvent,
 } from "./runtime-adapter.js";
@@ -64,6 +63,13 @@ import { buildStableRoleSystemPrompt } from "./runtime-context-policy.js";
 import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
 import { RuntimeGenerationOwner } from "./runtime-generation-owner.js";
 import { MeetingCommandRouter } from "./meeting-command-router.js";
+import {
+  RoleSessionSupervisor,
+  type RoleChildToken,
+  type RoleSessionIdentity,
+  type RoleSessionView,
+} from "./role-session-supervisor.js";
+import { RoleCredentialLease } from "./role-credential-lease.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -93,10 +99,9 @@ export interface ResolvedRoleRuntimeConfiguration {
   contextWindow?: number;
   maxOutputTokens?: number;
   thinkingLevel?: ThinkingLevel;
-  apiKey: string;
   systemPrompt: string;
   skillPaths: string[];
-  mcpServers: ResolvedMcpServerRuntimeConfiguration[];
+  credentialLease: RoleCredentialLease;
   delegation: {
     networkAccess: "forbidden" | "subagent_required" | "subagent_preferred" | "direct_allowed";
     resultMode: "summary_with_citations" | "summary" | "full";
@@ -104,17 +109,13 @@ export interface ResolvedRoleRuntimeConfiguration {
   };
 }
 
-interface HostedRole {
-  displayName: string;
-  scope: RoleScope;
-  adapter: RuntimeAdapter;
-  unsubscribe: () => void;
-  configuration?: ResolvedRoleRuntimeConfiguration;
-}
-
 interface PendingHandoff {
   interruptorId: string;
+  interruptorRuntimeGeneration: number;
+  interruptorSessionToken: string;
   targetId: string;
+  targetRuntimeGeneration: number;
+  targetSessionToken: string;
   message: string;
   commandId: string;
 }
@@ -126,6 +127,8 @@ interface ExpectedTurn {
 
 interface PendingPublicTurn {
   roleId: string;
+  runtimeGeneration: number;
+  roleSessionToken: string;
   commandId: string;
   semanticInstruction?: string;
   floorRequestId?: string;
@@ -140,20 +143,11 @@ interface PublicHostMessage {
   speakerDisplayName?: string;
 }
 
-interface ActiveSubagentRun {
-  parentRoleId: string;
-  controller: AbortController;
-  completion: Promise<void>;
-}
-
-interface ActiveDiscussionObservation {
-  controller: AbortController;
-  completion: Promise<void>;
-}
-
 interface PendingSubagentContinuation {
   subagentId: string;
   parentRoleId: string;
+  runtimeGeneration: number;
+  parentSessionToken: string;
   result: string;
   failed: boolean;
   busyRetryCount: number;
@@ -166,7 +160,6 @@ const OBSERVER_TEXT_INTERVAL = 800;
 const MAX_OBSERVER_MEETING_CONTEXT = 8_192;
 const MAX_CONCURRENT_DISCUSSION_OBSERVERS = 3;
 const MAX_REMEMBERED_OBSERVATION_IDS = 1_024;
-const ROLE_STOP_GRACE_MS = 2_000;
 
 interface ActiveTurnTimeout {
   commandId: string;
@@ -181,10 +174,9 @@ export class LocalRoundtableHost {
   readonly #options: LocalRoundtableHostOptions;
   readonly #runtimeOwner: RuntimeGenerationOwner;
   readonly #commandRouter: MeetingCommandRouter;
+  readonly #roleSessions: RoleSessionSupervisor<ResolvedRoleRuntimeConfiguration>;
   readonly #now: () => Date;
   readonly #turnTimeoutMs: number;
-  readonly #roles = new Map<string, HostedRole>();
-  readonly #adapterStopPromises = new WeakMap<RuntimeAdapter, Promise<void>>();
   readonly #eventListeners = new Set<MeetingEventListener>();
   readonly #diagnosticListeners = new Set<HostDiagnosticListener>();
   readonly #expectedTurns = new Map<string, ExpectedTurn>();
@@ -196,8 +188,7 @@ export class LocalRoundtableHost {
   readonly #discussionScheduler: FacilitatedDiscussionScheduler;
   readonly #discussionObserver: DiscussionObserver;
   readonly #discussionObserverLimiter = new AsyncWorkLimiter(MAX_CONCURRENT_DISCUSSION_OBSERVERS);
-  readonly #subagentRuns = new Map<string, ActiveSubagentRun>();
-  readonly #discussionObservations = new Map<string, ActiveDiscussionObservation>();
+  readonly #discussionObservations = new Map<string, RoleChildToken>();
   readonly #scheduledDiscussionObservationIds = new Set<string>();
   readonly #acceptedObserverFloorRequests = new Set<string>();
   readonly #lastObservedLengths = new Map<string, number>();
@@ -238,6 +229,13 @@ export class LocalRoundtableHost {
     this.#publicMessagePlanner = options.publicMessagePlanner ?? new PiPublicMessagePlanner();
     this.#discussionScheduler = options.discussionScheduler ?? new FacilitatedDiscussionScheduler();
     this.#discussionObserver = options.discussionObserver ?? new PiDiscussionObserver();
+    this.#roleSessions = new RoleSessionSupervisor({
+      runtimeGeneration: this.runtimeGeneration,
+      rootStopSignal: this.#runtimeOwner.stopSignal,
+      adapterFactory: (identity, configuration) => this.#createAdapter(identity, configuration),
+      onEvent: (session, event) => this.#onRuntimeEvent(session.roleId, event),
+      releaseConfiguration: (configuration) => configuration.credentialLease.close(),
+    });
     this.#commandRouter = new MeetingCommandRouter({
       readState: () => ({
         meetingId: this.meetingId,
@@ -353,39 +351,19 @@ export class LocalRoundtableHost {
         throw new Error("Configured role restoration was stopped");
       }
       const roleId = participant.participantId;
-      if (this.#roles.has(roleId)) {
+      if (this.#roleSessions.has(roleId)) {
         throw new Error("Runtime session contains a duplicate role");
       }
       const configuration = this.#resolveRoleRuntimeConfiguration({}, roleId, participant.scope);
-      const adapter = this.#createAdapter(roleId, configuration);
-      const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
-      let startOutcome: "started" | "stop_requested";
-      try {
-        startOutcome = await this.#startAdapterUntilStopRequested(adapter);
-      } catch (error) {
-        unsubscribe();
-        try {
-          await this.#stopAdapterWithGrace(adapter);
-        } catch {
-          // The initialization failure below remains the stable process surface.
-        }
-        throw error;
-      }
-      if (startOutcome === "stop_requested" || this.#runtimeOwner.stopRequested) {
-        unsubscribe();
-        // Invoke cancellation immediately so adapters can enter their stopping
-        // state, but do not let an unbounded startup Promise hold owner cleanup.
-        // Promise.race already observes any later startup rejection.
-        this.#requestAdapterStop(adapter);
-        throw new Error("Configured role restoration was stopped");
-      }
-      this.#roles.set(roleId, {
+      const start = await this.#roleSessions.startRole({
+        roleId,
         displayName: configuration.displayName,
         scope: participant.scope,
-        adapter,
-        unsubscribe,
         configuration,
       });
+      if (start.status === "stop_requested" || this.#runtimeOwner.stopRequested) {
+        throw new Error("Configured role restoration was stopped");
+      }
       this.#rolePublicCursors.set(roleId, this.#publicMessages.length);
     }
   }
@@ -428,39 +406,14 @@ export class LocalRoundtableHost {
     this.#pendingSubagentContinuations.length = 0;
     this.#clearSubagentContinuationRetry();
     this.#clearAllTurnTimeouts();
-    const subagentRuns = [...this.#subagentRuns.values()];
-    for (const run of subagentRuns) {
-      run.controller.abort();
-    }
-    const discussionObservations = [...this.#discussionObservations.values()];
-    for (const observation of discussionObservations) {
-      observation.controller.abort();
-    }
-    await Promise.all([
-      this.#waitForBackgroundCleanup(subagentRuns.map((run) => run.completion)),
-      this.#waitForBackgroundCleanup(discussionObservations.map((run) => run.completion)),
-    ]);
-    this.#subagentRuns.clear();
+    const roleStops = await this.#roleSessions.stopAll();
+    this.#diagnoseRoleStopFailures(roleStops);
     this.#discussionObservations.clear();
     this.#lastObservedLengths.clear();
     this.#scheduledDiscussionObservationIds.clear();
     this.#acceptedObserverFloorRequests.clear();
     this.#publicMessages.length = 0;
     this.#rolePublicCursors.clear();
-    const roles = [...this.#roles.values()];
-    this.#roles.clear();
-    await Promise.all(
-      roles.map(async (role) => {
-        role.unsubscribe();
-        try {
-          if (!await this.#stopAdapterWithGrace(role.adapter)) {
-            throw new Error("role stop failed or timed out");
-          }
-        } catch {
-          this.#diagnose("role_stop_failed", "A role runtime did not stop cleanly");
-        }
-      }),
-    );
     if (mode === "close" && this.#phase === "live") {
       this.#phase = "closed";
       this.#emit("meeting.closed", this.runtimeId, null, null, {}, "public", undefined, true);
@@ -517,7 +470,7 @@ export class LocalRoundtableHost {
     const roleId = command.targetId;
     const approvalId = this.#readString(command.payload, "approvalId");
     const approved = command.payload.approved;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     if (role === undefined || approvalId === undefined || typeof approved !== "boolean") {
       return this.#receipt(
         command,
@@ -526,7 +479,7 @@ export class LocalRoundtableHost {
         "Tool approval requires a known target role, approvalId, and boolean decision",
       );
     }
-    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+    const result = await this.#roleSessions.execute(roleId!, {
       kind: "tool.approval.resolve",
       commandId: command.commandId,
       roleId: roleId!,
@@ -542,7 +495,7 @@ export class LocalRoundtableHost {
     }
     const parentRoleId = command.actorId;
     const task = this.#readString(command.payload, "task");
-    if (parentRoleId === undefined || parentRoleId === null || !this.#roles.has(parentRoleId)) {
+    if (parentRoleId === undefined || parentRoleId === null || !this.#roleSessions.has(parentRoleId)) {
       return this.#receipt(command, "rejected", "unknown_role", "SubAgent parent role does not exist");
     }
     if (task === undefined || task.length === 0 || task.length > 16_384) {
@@ -577,22 +530,52 @@ export class LocalRoundtableHost {
     task: string,
     causationId: string | null,
   ): string {
-    const parent = this.#roles.get(parentRoleId);
-    const configuration = parent?.configuration;
+    const parent = this.#roleSessions.get(parentRoleId);
     if (
       this.#phase !== "live" ||
       this.#runtimeOwner.stopRequested ||
       this.#runtimeOwner.stopped ||
-      parent === undefined ||
-      configuration === undefined ||
-      configuration.delegation.maxConcurrentSubagents < 1
+      parent === undefined
     ) {
       throw new Error("subagent_unavailable");
     }
-    const limit = Math.min(2, configuration.delegation.maxConcurrentSubagents);
-    const activeForParent = [...this.#subagentRuns.values()]
-      .filter((run) => run.parentRoleId === parentRoleId)
-      .length;
+    const prepared = this.#roleSessions.projectConfiguration(
+      parentRoleId,
+      (configuration, session) => {
+        const apiKey = configuration.credentialLease.resolveApiKey(configuration.providerId);
+        if (apiKey === undefined || configuration.delegation.maxConcurrentSubagents < 1) {
+          return undefined;
+        }
+        return {
+          limit: Math.min(2, configuration.delegation.maxConcurrentSubagents),
+          runtimeGeneration: session.runtimeGeneration,
+          providerId: configuration.providerId,
+          providerName: configuration.providerName,
+          apiFamily: configuration.apiFamily,
+          ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
+          modelId: configuration.modelId,
+          modelName: configuration.modelName,
+          modelCapabilities: [...configuration.modelCapabilities],
+          ...(configuration.contextWindow === undefined
+            ? {}
+            : { contextWindow: configuration.contextWindow }),
+          ...(configuration.maxOutputTokens === undefined
+            ? {}
+            : { maxOutputTokens: configuration.maxOutputTokens }),
+          ...(configuration.thinkingLevel === undefined
+            ? {}
+            : { thinkingLevel: configuration.thinkingLevel }),
+          apiKey,
+          systemPrompt: configuration.systemPrompt,
+          skillPaths: [...configuration.skillPaths],
+        };
+      },
+    );
+    if (prepared === undefined) {
+      throw new Error("subagent_unavailable");
+    }
+    const limit = prepared.limit;
+    const activeForParent = this.#roleSessions.countChildren(parentRoleId, "subagent");
     if (activeForParent >= limit) {
       throw new Error("subagent_limit");
     }
@@ -611,38 +594,40 @@ export class LocalRoundtableHost {
     if (this.#runtimeOwner.stopRequested) {
       throw new Error("runtime_stopped");
     }
+    let childToken!: RoleChildToken;
     const completion = Promise.resolve().then(async () => {
       try {
         const result = await this.#subagentRunner.run({
           subagentId,
           parentRoleId,
-          providerId: configuration.providerId,
-          providerName: configuration.providerName,
-          apiFamily: configuration.apiFamily,
-          ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
-          modelId: configuration.modelId,
-          modelName: configuration.modelName,
-          modelCapabilities: [...configuration.modelCapabilities],
-          ...(configuration.contextWindow === undefined
+          runtimeGeneration: prepared.runtimeGeneration,
+          providerId: prepared.providerId,
+          providerName: prepared.providerName,
+          apiFamily: prepared.apiFamily,
+          ...(prepared.endpoint === undefined ? {} : { endpoint: prepared.endpoint }),
+          modelId: prepared.modelId,
+          modelName: prepared.modelName,
+          modelCapabilities: prepared.modelCapabilities,
+          ...(prepared.contextWindow === undefined
             ? {}
-            : { contextWindow: configuration.contextWindow }),
-          ...(configuration.maxOutputTokens === undefined
+            : { contextWindow: prepared.contextWindow }),
+          ...(prepared.maxOutputTokens === undefined
             ? {}
-            : { maxOutputTokens: configuration.maxOutputTokens }),
-          ...(configuration.thinkingLevel === undefined
+            : { maxOutputTokens: prepared.maxOutputTokens }),
+          ...(prepared.thinkingLevel === undefined
             ? {}
-            : { thinkingLevel: configuration.thinkingLevel }),
-          apiKey: configuration.apiKey,
+            : { thinkingLevel: prepared.thinkingLevel }),
+          apiKey: prepared.apiKey,
           cwd: this.#options.cwd ?? process.cwd(),
-          systemPrompt: configuration.systemPrompt,
-          skillPaths: [...configuration.skillPaths],
+          systemPrompt: prepared.systemPrompt,
+          skillPaths: prepared.skillPaths,
           task,
         }, (progress) => {
           if (progress.updateCount % 16 !== 0) {
             return;
           }
           this.#enqueueInternal(async () => {
-            if (this.#runtimeOwner.stopped || !this.#subagentRuns.has(subagentId)) {
+            if (this.#runtimeOwner.stopped || !this.#roleSessions.isChildActive(childToken)) {
               return;
             }
             this.#emit(
@@ -657,7 +642,7 @@ export class LocalRoundtableHost {
           });
         }, controller.signal);
         this.#enqueueInternal(async () => {
-          if (this.#runtimeOwner.stopRequested || !this.#subagentRuns.delete(subagentId)) {
+          if (this.#runtimeOwner.stopRequested || !this.#roleSessions.releaseChild(childToken)) {
             return;
           }
           this.#emit(
@@ -675,6 +660,8 @@ export class LocalRoundtableHost {
           this.#pendingSubagentContinuations.push({
             subagentId,
             parentRoleId,
+            runtimeGeneration: childToken.runtimeGeneration,
+            parentSessionToken: childToken.parentSessionToken,
             result,
             failed: false,
             busyRetryCount: 0,
@@ -683,7 +670,7 @@ export class LocalRoundtableHost {
         });
       } catch {
         this.#enqueueInternal(async () => {
-          if (this.#runtimeOwner.stopRequested || !this.#subagentRuns.delete(subagentId)) {
+          if (this.#runtimeOwner.stopRequested || !this.#roleSessions.releaseChild(childToken)) {
             return;
           }
           this.#emit(
@@ -701,6 +688,8 @@ export class LocalRoundtableHost {
           this.#pendingSubagentContinuations.push({
             subagentId,
             parentRoleId,
+            runtimeGeneration: childToken.runtimeGeneration,
+            parentSessionToken: childToken.parentSessionToken,
             result: "The delegated SubAgent task failed without a usable result.",
             failed: true,
             busyRetryCount: 0,
@@ -709,7 +698,13 @@ export class LocalRoundtableHost {
         });
       }
     });
-    this.#subagentRuns.set(subagentId, { parentRoleId, controller, completion });
+    childToken = this.#roleSessions.registerChild(
+      "subagent",
+      subagentId,
+      parentRoleId,
+      controller,
+      completion,
+    );
     return subagentId;
   }
 
@@ -725,7 +720,7 @@ export class LocalRoundtableHost {
     if (roleId === undefined || roleId === null || roleId.length === 0) {
       return this.#receipt(command, "rejected", "invalid_role", "actorId is required");
     }
-    if (this.#roles.has(roleId)) {
+    if (this.#roleSessions.has(roleId)) {
       return this.#receipt(command, "rejected", "duplicate_role", "Role already exists");
     }
     let configuration: ResolvedRoleRuntimeConfiguration | undefined;
@@ -747,18 +742,17 @@ export class LocalRoundtableHost {
       }
     }
     const displayName = configuration?.displayName ?? this.#readString(command.payload, "displayName") ?? roleId;
-    const adapter = this.#createAdapter(roleId, configuration);
-    const unsubscribe = adapter.subscribe((event) => this.#onRuntimeEvent(roleId, event));
-    let startOutcome: "started" | "stop_requested";
+    let startOutcome:
+      | { status: "started"; session: RoleSessionView }
+      | { status: "stop_requested" };
     try {
-      startOutcome = await this.#startAdapterUntilStopRequested(adapter);
+      startOutcome = await this.#roleSessions.startRole({
+        roleId,
+        displayName,
+        scope,
+        ...(configuration === undefined ? {} : { configuration }),
+      });
     } catch (error) {
-      unsubscribe();
-      try {
-        await this.#stopAdapterWithGrace(adapter);
-      } catch {
-        // The stable receipt below is the public failure surface.
-      }
       const errorCode = this.#safeRuntimeErrorCode(
         error instanceof PiRuntimeError ? error.code : "role_runtime_failed",
       );
@@ -770,18 +764,9 @@ export class LocalRoundtableHost {
         "The role runtime could not be started",
       );
     }
-    if (startOutcome === "stop_requested" || this.#runtimeOwner.stopRequested) {
-      unsubscribe();
-      this.#requestAdapterStop(adapter);
+    if (startOutcome.status === "stop_requested" || this.#runtimeOwner.stopRequested) {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
-    this.#roles.set(roleId, {
-      displayName,
-      scope,
-      adapter,
-      unsubscribe,
-      ...(configuration === undefined ? {} : { configuration }),
-    });
     this.#rolePublicCursors.set(roleId, 0);
     this.#emit(eventKind, roleId, null, command.commandId, { displayName, scope });
     return this.#accepted(command);
@@ -789,7 +774,7 @@ export class LocalRoundtableHost {
 
   #promoteRole(command: MeetingCommand): CommandReceipt {
     const roleId = command.actorId;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     if (roleId === undefined || roleId === null || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
     }
@@ -801,19 +786,19 @@ export class LocalRoundtableHost {
         "Only a temporary role can be promoted",
       );
     }
-    role.scope = "long_term";
+    this.#roleSessions.updateScope(roleId, "long_term");
     this.#emit("role.promoted", roleId, null, command.commandId, {});
     return this.#accepted(command);
   }
 
   async #removeRole(command: MeetingCommand, archive: boolean): Promise<CommandReceipt> {
     const roleId = command.actorId;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     if (roleId === undefined || roleId === null || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
     }
     if (this.#activeRoleId === roleId) {
-      await this.#executeAdapterUntilStopRequested(role.adapter, {
+      await this.#roleSessions.execute(roleId, {
         kind: "turn.cancel",
         commandId: `${command.commandId}:archive-cancel`,
         roleId,
@@ -827,18 +812,24 @@ export class LocalRoundtableHost {
     this.#expectedTurns.delete(roleId);
     this.#clearTurnTimeout(roleId);
     this.#rolePublicCursors.delete(roleId);
-    role.unsubscribe();
-    try {
-      if (!await this.#stopAdapterWithGrace(role.adapter)) {
-        throw new Error("role stop failed or timed out");
-      }
-    } catch {
+    this.#discardQueuedWorkForSession(role);
+    if (
+      (this.#pendingHandoff?.interruptorId === role.roleId &&
+        this.#pendingHandoff.interruptorRuntimeGeneration === role.runtimeGeneration &&
+        this.#pendingHandoff.interruptorSessionToken === role.sessionToken) ||
+      (this.#pendingHandoff?.targetId === role.roleId &&
+        this.#pendingHandoff.targetRuntimeGeneration === role.runtimeGeneration &&
+        this.#pendingHandoff.targetSessionToken === role.sessionToken)
+    ) {
+      this.#pendingHandoff = undefined;
+    }
+    const stopped = await this.#roleSessions.stopRole(roleId);
+    if (stopped !== undefined && (!stopped.adapterStopped || !stopped.childrenSettled)) {
       this.#diagnose("role_stop_failed", "The role runtime did not stop cleanly");
     }
     if (this.#runtimeOwner.stopRequested) {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
-    this.#roles.delete(roleId);
     for (const request of this.#discussionScheduler.removeRole(roleId)) {
       this.#emit("floor.rejected", this.runtimeId, roleId, command.commandId, {
         requestId: request.requestId,
@@ -850,6 +841,32 @@ export class LocalRoundtableHost {
       scope: role.scope,
     });
     return this.#accepted(command);
+  }
+
+  #discardQueuedWorkForSession(role: RoleSessionView): void {
+    for (let index = this.#pendingPublicTurns.length - 1; index >= 0; --index) {
+      const pending = this.#pendingPublicTurns[index];
+      if (
+        pending?.roleId === role.roleId &&
+        pending.runtimeGeneration === role.runtimeGeneration &&
+        pending.roleSessionToken === role.sessionToken
+      ) {
+        this.#pendingPublicTurns.splice(index, 1);
+      }
+    }
+    for (let index = this.#pendingSubagentContinuations.length - 1; index >= 0; --index) {
+      const pending = this.#pendingSubagentContinuations[index];
+      if (
+        pending?.parentRoleId === role.roleId &&
+        pending.runtimeGeneration === role.runtimeGeneration &&
+        pending.parentSessionToken === role.sessionToken
+      ) {
+        this.#pendingSubagentContinuations.splice(index, 1);
+      }
+    }
+    if (this.#pendingSubagentContinuations.length === 0) {
+      this.#clearSubagentContinuationRetry();
+    }
   }
 
   async #configureDiscussion(command: MeetingCommand): Promise<CommandReceipt> {
@@ -875,7 +892,7 @@ export class LocalRoundtableHost {
     try {
       snapshot = this.#discussionScheduler.configure(
         agendaItems,
-        Math.max(1, this.#roles.size),
+        Math.max(1, this.#roleSessions.size),
         limits,
       );
     } catch {
@@ -991,7 +1008,7 @@ export class LocalRoundtableHost {
       return this.#invalidTransition(command);
     }
     const roleId = command.actorId === "user.direct_host" ? command.targetId : command.actorId;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     const kindText = this.#readString(command.payload, "kind") ?? "normal";
     const reason = this.#readString(command.payload, "reason")?.trim();
     const prompt = this.#readString(command.payload, "message")?.trim() ?? reason;
@@ -1093,7 +1110,7 @@ export class LocalRoundtableHost {
     if (!requestId) {
       return this.#receipt(command, "rejected", "invalid_floor_request", "requestId is required");
     }
-    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roles.keys()), requestId);
+    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roleSessions.keys()), requestId);
     if (request === undefined) {
       return this.#receipt(command, "rejected", "unknown_floor_request", "Floor request is unavailable");
     }
@@ -1127,7 +1144,7 @@ export class LocalRoundtableHost {
     if (
       this.#phase !== "live" ||
       (command.actorId !== "user.direct_host" &&
-        (command.actorId === undefined || command.actorId === null || !this.#roles.has(command.actorId)))
+        (command.actorId === undefined || command.actorId === null || !this.#roleSessions.has(command.actorId)))
     ) {
       return this.#invalidTransition(command);
     }
@@ -1165,7 +1182,7 @@ export class LocalRoundtableHost {
       return this.#invalidTransition(command);
     }
     const roleId = command.actorId;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     const message = this.#readString(command.payload, "message");
     if (roleId === undefined || roleId === null || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
@@ -1177,7 +1194,7 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "floor_busy", "Another role is speaking");
     }
     this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "public" });
-    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+    const result = await this.#roleSessions.execute(roleId, {
       kind: "turn.prompt",
       commandId: command.commandId,
       roleId,
@@ -1214,35 +1231,53 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "invalid_mentions", "Mentions must be an array of role identifiers");
     }
     const mentions = [...new Set(requestedMentions)];
-    if (mentions.some((roleId) => !this.#roles.has(roleId))) {
+    if (mentions.some((roleId) => !this.#roleSessions.has(roleId))) {
       return this.#receipt(command, "rejected", "unknown_role", "A mentioned role does not exist");
     }
-    const targets = mentions.length > 0 ? mentions : [...this.#roles.keys()];
+    const targets = mentions.length > 0 ? mentions : [...this.#roleSessions.keys()];
     const planningRoles = targets.map((roleId): PublicMessagePlanningRole => ({
       roleId,
-      displayName: this.#roles.get(roleId)?.displayName ?? roleId,
+      displayName: this.#roleSessions.get(roleId)?.displayName ?? roleId,
     }));
     let plan = createFallbackPublicMessagePlan(planningRoles);
     try {
       const planningModel = this.#selectPublicMessagePlanningModel(targets);
-      const planningPromise = this.#publicMessagePlanner.plan(
-        {
-          commandId: command.commandId,
-          message,
-          roles: planningRoles,
-          ...(planningModel === undefined ? {} : { model: planningModel }),
-          cwd: this.#options.cwd ?? process.cwd(),
-        },
-        this.#runtimeOwner.stopSignal,
-      );
-      const planningOutcome = await Promise.race([
-        planningPromise.then((planned) => ({ kind: "planned" as const, planned })),
-        this.#runtimeOwner.waitForStopRequest().then(() => ({ kind: "stop_requested" as const })),
-      ]);
-      if (planningOutcome.kind === "stop_requested") {
-        return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+      const planningOwnerRoleId = planningModel?.ownerRoleId ?? targets[0];
+      if (planningOwnerRoleId !== undefined) {
+        const controller = new AbortController();
+        const planningPromise = Promise.resolve().then(() => this.#publicMessagePlanner.plan(
+          {
+            commandId: command.commandId,
+            message,
+            roles: planningRoles,
+            ...(planningModel === undefined ? {} : { model: planningModel }),
+            cwd: this.#options.cwd ?? process.cwd(),
+          },
+          controller.signal,
+        ));
+        const planningToken = this.#roleSessions.registerChild(
+          "planner",
+          `planner:${command.commandId}`,
+          planningOwnerRoleId,
+          controller,
+          planningPromise.then(
+            () => undefined,
+            () => undefined,
+          ),
+        );
+        void planningPromise.then(
+          () => this.#roleSessions.releaseChild(planningToken),
+          () => this.#roleSessions.releaseChild(planningToken),
+        );
+        const planningOutcome = await Promise.race([
+          planningPromise.then((planned) => ({ kind: "planned" as const, planned })),
+          this.#runtimeOwner.waitForStopRequest().then(() => ({ kind: "stop_requested" as const })),
+        ]);
+        if (planningOutcome.kind === "stop_requested") {
+          return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+        }
+        plan = validatePublicMessagePlan(planningOutcome.planned, message, planningRoles);
       }
-      plan = validatePublicMessagePlan(planningOutcome.planned, message, planningRoles);
     } catch {
       // Semantic planning is an invisible enhancement. A bounded provider,
       // timeout, or validation failure falls back to the explicit mention set
@@ -1274,16 +1309,22 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
     this.#pendingPublicTurns.push(
-      ...plan.speakerOrder.map((roleId, index) => {
+      ...plan.speakerOrder.flatMap((roleId, index) => {
+        const session = this.#roleSessions.get(roleId);
+        if (session === undefined) {
+          return [];
+        }
         const semanticInstruction = this.#semanticInstructionForRole(plan, roleId);
-        return {
+        return [{
           roleId,
+          runtimeGeneration: session.runtimeGeneration,
+          roleSessionToken: session.sessionToken,
           commandId: `${command.commandId}:${index + 1}`,
           floorRequestId: `${command.commandId}:floor:${index + 1}`,
           requestKind: "host" as const,
           requestReason: "direct_host_broadcast",
           ...(semanticInstruction === undefined ? {} : { semanticInstruction }),
-        };
+        }];
       }),
     );
     await this.#startNextPublicTurn();
@@ -1301,7 +1342,7 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "invalid_actor", "Direct messages require the direct meeting host");
     }
     const roleId = command.targetId;
-    const role = roleId === undefined || roleId === null ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined || roleId === null ? undefined : this.#roleSessions.get(roleId);
     const message = this.#readString(command.payload, "message")?.trim();
     if (roleId === undefined || roleId === null || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Private target role does not exist");
@@ -1323,7 +1364,7 @@ export class LocalRoundtableHost {
       audience,
     );
     this.#expectedTurns.set(roleId, { commandId: command.commandId, visibility: "private" });
-    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+    const result = await this.#roleSessions.execute(roleId, {
       kind: "turn.prompt",
       commandId: command.commandId,
       roleId,
@@ -1361,8 +1402,12 @@ export class LocalRoundtableHost {
       if (next === undefined) {
         return;
       }
-      const role = this.#roles.get(next.roleId);
-      if (role === undefined) {
+      const role = this.#roleSessions.get(next.roleId);
+      if (
+        role === undefined ||
+        role.runtimeGeneration !== next.runtimeGeneration ||
+        role.sessionToken !== next.roleSessionToken
+      ) {
         continue;
       }
       if (this.#discussionScheduler.configured) {
@@ -1375,11 +1420,11 @@ export class LocalRoundtableHost {
         });
       }
       this.#expectedTurns.set(next.roleId, { commandId: next.commandId, visibility: "public" });
-      const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+      const result = await this.#roleSessions.execute(next.roleId, {
         kind: "turn.prompt",
         commandId: next.commandId,
         roleId: next.roleId,
-       message: this.#withUnseenPublicContext(
+        message: this.#withUnseenPublicContext(
           next.roleId,
           this.#publicTurnInstruction(next.roleId, role, next.semanticInstruction),
         ),
@@ -1404,7 +1449,7 @@ export class LocalRoundtableHost {
     if (!this.#discussionScheduler.configured) {
       return;
     }
-    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roles.keys()));
+    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roleSessions.keys()));
     if (request !== undefined) {
       this.#queueFloorRequest(request, request.requestId);
       await this.#startNextPublicTurn();
@@ -1436,8 +1481,12 @@ export class LocalRoundtableHost {
       if (next === undefined) {
         return;
       }
-      const parent = this.#roles.get(next.parentRoleId);
-      if (parent === undefined) {
+      const parent = this.#roleSessions.get(next.parentRoleId);
+      if (
+        parent === undefined ||
+        parent.runtimeGeneration !== next.runtimeGeneration ||
+        parent.sessionToken !== next.parentSessionToken
+      ) {
         continue;
       }
       const baseCommandId = `subagent-result:${next.subagentId}`;
@@ -1448,7 +1497,7 @@ export class LocalRoundtableHost {
         commandId,
         visibility: "public",
       });
-      const result = await this.#executeAdapterUntilStopRequested(parent.adapter, {
+      const result = await this.#roleSessions.execute(next.parentRoleId, {
         kind: "turn.prompt",
         commandId,
         roleId: next.parentRoleId,
@@ -1510,7 +1559,7 @@ export class LocalRoundtableHost {
 
   #publicTurnInstruction(
     roleId: string,
-    role: HostedRole,
+    role: RoleSessionView,
     semanticInstruction?: string,
   ): string {
     return [
@@ -1527,7 +1576,7 @@ export class LocalRoundtableHost {
   #selectPublicMessagePlanningModel(
     targets: readonly string[],
   ): PublicMessagePlanningModel | undefined {
-    const candidates = ["role.host", "role.secretary", ...targets, ...this.#roles.keys()];
+    const candidates = ["role.host", "role.secretary", ...targets, ...this.#roleSessions.keys()];
     for (const roleId of new Set(candidates)) {
       const model = this.#planningModelForRole(roleId);
       if (model !== undefined) {
@@ -1538,29 +1587,38 @@ export class LocalRoundtableHost {
   }
 
   #planningModelForRole(roleId: string): PublicMessagePlanningModel | undefined {
-    const configuration = this.#roles.get(roleId)?.configuration;
-    if (configuration === undefined) {
+    const role = this.#roleSessions.get(roleId);
+    if (role === undefined) {
       return undefined;
     }
-    return {
-      providerId: configuration.providerId,
-      providerName: configuration.providerName,
-      apiFamily: configuration.apiFamily,
-      ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
-      modelId: configuration.modelId,
-      modelName: configuration.modelName,
-      modelCapabilities: configuration.modelCapabilities,
-      ...(configuration.contextWindow === undefined
-        ? {}
-        : { contextWindow: configuration.contextWindow }),
-      ...(configuration.maxOutputTokens === undefined
-        ? {}
-        : { maxOutputTokens: configuration.maxOutputTokens }),
-      ...(configuration.thinkingLevel === undefined
-        ? {}
-        : { thinkingLevel: configuration.thinkingLevel }),
-      apiKey: configuration.apiKey,
-    };
+    return this.#roleSessions.projectConfiguration(roleId, (configuration, session) => {
+      const apiKey = configuration.credentialLease.resolveApiKey(configuration.providerId);
+      if (apiKey === undefined) {
+        return undefined;
+      }
+      return {
+        ownerRoleId: session.roleId,
+        runtimeGeneration: session.runtimeGeneration,
+        roleSessionToken: session.sessionToken,
+        providerId: configuration.providerId,
+        providerName: configuration.providerName,
+        apiFamily: configuration.apiFamily,
+        ...(configuration.endpoint === undefined ? {} : { endpoint: configuration.endpoint }),
+        modelId: configuration.modelId,
+        modelName: configuration.modelName,
+        modelCapabilities: [...configuration.modelCapabilities],
+        ...(configuration.contextWindow === undefined
+          ? {}
+          : { contextWindow: configuration.contextWindow }),
+        ...(configuration.maxOutputTokens === undefined
+          ? {}
+          : { maxOutputTokens: configuration.maxOutputTokens }),
+        ...(configuration.thinkingLevel === undefined
+          ? {}
+          : { thinkingLevel: configuration.thinkingLevel }),
+        apiKey,
+      };
+    });
   }
 
   #semanticInstructionForRole(plan: PublicMessagePlan, roleId: string): string | undefined {
@@ -1615,8 +1673,14 @@ export class LocalRoundtableHost {
   }
 
   #queueFloorRequest(request: DiscussionFloorRequest, commandId: string): void {
+    const session = this.#roleSessions.get(request.roleId);
+    if (session === undefined) {
+      return;
+    }
     this.#pendingPublicTurns.push({
       roleId: request.roleId,
+      runtimeGeneration: session.runtimeGeneration,
+      roleSessionToken: session.sessionToken,
       commandId: `floor-turn:${commandId}`,
       floorRequestId: request.requestId,
       requestKind: request.kind,
@@ -1677,8 +1741,8 @@ export class LocalRoundtableHost {
   }
 
   #selectFacilitatorRole(): string | undefined {
-    for (const roleId of ["role.host", "role.secretary", ...this.#roles.keys()]) {
-      if (this.#roles.has(roleId)) {
+    for (const roleId of ["role.host", "role.secretary", ...this.#roleSessions.keys()]) {
+      if (this.#roleSessions.has(roleId)) {
         return roleId;
       }
     }
@@ -1791,9 +1855,14 @@ export class LocalRoundtableHost {
       return;
     }
     this.#lastObservedLengths.set(correlationId, textLength);
+    const speakerSessionToken = this.#roleSessions.get(speakerRoleId)?.sessionToken;
+    if (speakerSessionToken === undefined) {
+      return;
+    }
     this.#enqueueInternal(async () => {
       this.#launchDiscussionObservers(
         speakerRoleId,
+        speakerSessionToken,
         correlationId,
         observedText,
         speechComplete,
@@ -1803,6 +1872,7 @@ export class LocalRoundtableHost {
 
   #launchDiscussionObservers(
     speakerRoleId: string,
+    speakerSessionToken: string,
     correlationId: string,
     observedText: string,
     speechComplete: boolean,
@@ -1810,14 +1880,18 @@ export class LocalRoundtableHost {
     if (
       this.#runtimeOwner.stopRequested ||
       this.#runtimeOwner.stopped ||
-      this.#discussionScheduler.mode !== "free_discussion"
+      this.#discussionScheduler.mode !== "free_discussion" ||
+      this.#roleSessions.get(speakerRoleId)?.sessionToken !== speakerSessionToken
     ) {
       return;
     }
-    const speakerDisplayName = this.#roles.get(speakerRoleId)?.displayName ?? speakerRoleId;
-    for (const [candidateRoleId, candidate] of this.#roles) {
-      const configuration = candidate.configuration;
-      if (candidateRoleId === speakerRoleId || configuration === undefined) {
+    const speakerDisplayName = this.#roleSessions.get(speakerRoleId)?.displayName ?? speakerRoleId;
+    for (const [candidateRoleId, candidate] of this.#roleSessions) {
+      const candidateInstructions = this.#roleSessions.projectConfiguration(
+        candidateRoleId,
+        (configuration) => configuration.systemPrompt.slice(0, 4_096),
+      );
+      if (candidateRoleId === speakerRoleId || candidateInstructions === undefined) {
         continue;
       }
       const model = this.#planningModelForRole(candidateRoleId);
@@ -1842,12 +1916,14 @@ export class LocalRoundtableHost {
         return;
       }
       const controller = new AbortController();
+      let observationToken: RoleChildToken | undefined;
+      let observationQueued = false;
       const completion = this.#discussionObserverLimiter.run(controller.signal, () =>
         this.#discussionObserver.observe({
           observationId,
           candidateRoleId,
           candidateDisplayName: candidate.displayName,
-          candidateInstructions: configuration.systemPrompt.slice(0, 4_096),
+          candidateInstructions,
           speakerRoleId,
           speakerDisplayName,
           observedText,
@@ -1857,7 +1933,17 @@ export class LocalRoundtableHost {
           cwd: this.#options.cwd ?? process.cwd(),
         }, controller.signal),
       ).then((decision) => {
+        if (
+          observationToken === undefined ||
+          !this.#roleSessions.isChildActive(observationToken)
+        ) {
+          return;
+        }
+        const queuedToken = observationToken;
+        observationQueued = true;
         this.#enqueueInternal(() => this.#applyDiscussionObservation(
+          queuedToken,
+          speakerSessionToken,
           observationId,
           correlationId,
           candidateRoleId,
@@ -1865,9 +1951,24 @@ export class LocalRoundtableHost {
           decision,
         ));
       }).catch(() => undefined).finally(() => {
-        this.#discussionObservations.delete(observationId);
+        if (!observationQueued && observationToken !== undefined) {
+          this.#roleSessions.releaseChild(observationToken);
+          this.#discussionObservations.delete(observationId);
+        }
       });
-      this.#discussionObservations.set(observationId, { controller, completion });
+      try {
+        observationToken = this.#roleSessions.registerChild(
+          "observer",
+          observationId,
+          candidateRoleId,
+          controller,
+          completion,
+        );
+      } catch {
+        controller.abort();
+        continue;
+      }
+      this.#discussionObservations.set(observationId, observationToken);
     }
   }
 
@@ -1895,21 +1996,29 @@ export class LocalRoundtableHost {
   }
 
   async #applyDiscussionObservation(
+    observationToken: RoleChildToken,
+    observedSpeakerSessionToken: string,
     observationId: string,
     observedCorrelationId: string,
     candidateRoleId: string,
     observedSpeakerRoleId: string,
     decision: DiscussionObservationDecision,
   ): Promise<void> {
+    const stillOwned = this.#roleSessions.releaseChild(observationToken);
+    this.#discussionObservations.delete(observationId);
+    if (!stillOwned) {
+      return;
+    }
     const decisionKey = `${observedCorrelationId}\u0000${candidateRoleId}`;
     if (
       this.#runtimeOwner.stopped ||
       this.#discussionScheduler.mode !== "free_discussion" ||
+      this.#roleSessions.get(observedSpeakerRoleId)?.sessionToken !== observedSpeakerSessionToken ||
       decision.action === "none" ||
       decision.kind === undefined ||
       decision.reason === undefined ||
       decision.prompt === undefined ||
-      !this.#roles.has(candidateRoleId) ||
+      !this.#roleSessions.has(candidateRoleId) ||
       this.#activeRoleId === candidateRoleId ||
       this.#acceptedObserverFloorRequests.has(decisionKey)
     ) {
@@ -1962,7 +2071,7 @@ export class LocalRoundtableHost {
     if (
       interruptorId === undefined ||
       interruptorId === null ||
-      !this.#roles.has(interruptorId)
+      !this.#roleSessions.has(interruptorId)
     ) {
       return this.#receipt(command, "rejected", "unknown_role", "Interruptor does not exist");
     }
@@ -1996,16 +2105,26 @@ export class LocalRoundtableHost {
     if (!this.#discussionScheduler.configured) {
       this.#pendingPublicTurns.length = 0;
     }
-    const target = this.#roles.get(targetId);
-    if (target === undefined) {
+    const target = this.#roleSessions.get(targetId);
+    const interruptor = this.#roleSessions.get(interruptorId);
+    if (target === undefined || interruptor === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Target role does not exist");
     }
-    this.#pendingHandoff = { interruptorId, targetId, message, commandId: command.commandId };
+    this.#pendingHandoff = {
+      interruptorId,
+      interruptorRuntimeGeneration: interruptor.runtimeGeneration,
+      interruptorSessionToken: interruptor.sessionToken,
+      targetId,
+      targetRuntimeGeneration: target.runtimeGeneration,
+      targetSessionToken: target.sessionToken,
+      message,
+      commandId: command.commandId,
+    };
     const deferred = { roleId: targetId, events: [] as RuntimeEvent[] };
     this.#deferredTerminalEvents = deferred;
     let result: RuntimeCommandResult;
     try {
-      result = await this.#executeAdapterUntilStopRequested(target.adapter, {
+      result = await this.#roleSessions.execute(targetId, {
         kind: "turn.cancel",
         commandId: `${command.commandId}:cancel`,
         roleId: targetId,
@@ -2045,11 +2164,11 @@ export class LocalRoundtableHost {
 
   async #cancel(command: MeetingCommand): Promise<CommandReceipt> {
     const roleId = command.targetId ?? command.actorId ?? this.#activeRoleId;
-    const role = roleId === undefined ? undefined : this.#roles.get(roleId);
+    const role = roleId === undefined ? undefined : this.#roleSessions.get(roleId);
     if (roleId === undefined || role === undefined) {
       return this.#receipt(command, "rejected", "unknown_role", "Role does not exist");
     }
-    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+    const result = await this.#roleSessions.execute(roleId, {
       kind: "turn.cancel",
       commandId: command.commandId,
       roleId,
@@ -2072,15 +2191,24 @@ export class LocalRoundtableHost {
       return;
     }
     this.#pendingHandoff = undefined;
-    const interruptor = this.#roles.get(handoff.interruptorId);
-    if (interruptor === undefined || this.#phase !== "live") {
+    const interruptor = this.#roleSessions.get(handoff.interruptorId);
+    const target = this.#roleSessions.get(handoff.targetId);
+    if (
+      interruptor === undefined ||
+      interruptor.runtimeGeneration !== handoff.interruptorRuntimeGeneration ||
+      interruptor.sessionToken !== handoff.interruptorSessionToken ||
+      target === undefined ||
+      target.runtimeGeneration !== handoff.targetRuntimeGeneration ||
+      target.sessionToken !== handoff.targetSessionToken ||
+      this.#phase !== "live"
+    ) {
       return;
     }
     this.#expectedTurns.set(handoff.interruptorId, {
       commandId: handoff.commandId,
       visibility: "public",
     });
-    const result = await this.#executeAdapterUntilStopRequested(interruptor.adapter, {
+    const result = await this.#roleSessions.execute(handoff.interruptorId, {
       kind: "turn.prompt",
       commandId: handoff.commandId,
       roleId: handoff.interruptorId,
@@ -2197,7 +2325,7 @@ export class LocalRoundtableHost {
           );
         }
         if (completedVisibility === "public" && completedOutput.length > 0) {
-          const role = this.#roles.get(roleId);
+          const role = this.#roleSessions.get(roleId);
           this.#publicMessages.push({
             message: completedOutput,
             mentions: [],
@@ -2279,18 +2407,23 @@ export class LocalRoundtableHost {
   }
 
   #createAdapter(
-    roleId: string,
+    identity: RoleSessionIdentity,
     configuration: ResolvedRoleRuntimeConfiguration | undefined,
   ): RuntimeAdapter {
+    const { roleId } = identity;
     if (this.#options.adapterFactory !== undefined) {
       return this.#options.adapterFactory(roleId, configuration);
     }
     if (configuration === undefined) {
       throw new Error("Resolved role runtime configuration is required");
     }
-    const plugins = resolvePiPluginSet(configuration.skillPaths, configuration.mcpServers);
+    const plugins = resolvePiPluginSet(
+      configuration.skillPaths,
+      configuration.credentialLease.materializeMcpServers(),
+    );
     const options = {
-      runtimeId: `${this.runtimeId}:${roleId}`,
+      runtimeId: `${this.runtimeId}:g${identity.runtimeGeneration}:${roleId}`,
+      sessionId: `role-session.${identity.sessionToken}`,
       roleId,
       providerId: configuration.providerId,
       providerName: configuration.providerName,
@@ -2322,112 +2455,12 @@ export class LocalRoundtableHost {
             Promise.resolve(this.#startSubagentForRole(roleId, task, null)) }),
       credentialProvider: {
         resolveApiKey: async (providerId: string) =>
-          providerId === configuration.providerId ? configuration.apiKey : undefined,
+          configuration.credentialLease.resolveApiKey(providerId),
       },
     };
     return new PiRuntimeAdapter(
       this.#options.cwd === undefined ? options : { ...options, cwd: this.#options.cwd },
     );
-  }
-
-  async #startAdapterUntilStopRequested(
-    adapter: RuntimeAdapter,
-  ): Promise<"started" | "stop_requested"> {
-    if (this.#runtimeOwner.stopRequested) {
-      return "stop_requested";
-    }
-    const startPromise = adapter.start();
-    return Promise.race([
-      startPromise.then(() => "started" as const),
-      this.#runtimeOwner.waitForStopRequest().then(() => "stop_requested" as const),
-    ]);
-  }
-
-  async #executeAdapterUntilStopRequested(
-    adapter: RuntimeAdapter,
-    command: RuntimeCommand,
-  ): Promise<RuntimeCommandResult> {
-    if (this.#runtimeOwner.stopRequested) {
-      return this.#runtimeStoppedResult(command.commandId);
-    }
-    const executePromise = adapter.execute(command);
-    const outcome = await Promise.race([
-      executePromise.then((result) => ({ kind: "result" as const, result })),
-      this.#runtimeOwner.waitForStopRequest().then(() => ({ kind: "stop_requested" as const })),
-    ]);
-    if (outcome.kind === "stop_requested" || this.#runtimeOwner.stopRequested) {
-      this.#requestAdapterStop(adapter);
-      return this.#runtimeStoppedResult(command.commandId);
-    }
-    return outcome.result;
-  }
-
-  #runtimeStoppedResult(commandId: string): RuntimeCommandResult {
-    return {
-      commandId,
-      accepted: false,
-      errorCode: "runtime_stopped",
-      message: "Runtime is stopped",
-    };
-  }
-
-  #requestAdapterStop(adapter: RuntimeAdapter): void {
-    void this.#stopAdapter(adapter).catch(() => undefined);
-  }
-
-  #stopAdapter(adapter: RuntimeAdapter): Promise<void> {
-    const activeStop = this.#adapterStopPromises.get(adapter);
-    if (activeStop !== undefined) {
-      return activeStop;
-    }
-    let stopPromise: Promise<void>;
-    try {
-      stopPromise = Promise.resolve(adapter.stop());
-    } catch (error) {
-      stopPromise = Promise.reject(error);
-    }
-    this.#adapterStopPromises.set(adapter, stopPromise);
-    return stopPromise;
-  }
-
-  async #stopAdapterWithGrace(adapter: RuntimeAdapter): Promise<boolean> {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<false>((resolve) => {
-      timeout = setTimeout(() => resolve(false), ROLE_STOP_GRACE_MS);
-    });
-    try {
-      return await Promise.race([
-        this.#stopAdapter(adapter).then(
-          () => true as const,
-          () => false as const,
-        ),
-        deadline,
-      ]);
-    } finally {
-      if (timeout !== undefined) {
-        clearTimeout(timeout);
-      }
-    }
-  }
-
-  async #waitForBackgroundCleanup(completions: readonly Promise<void>[]): Promise<void> {
-    if (completions.length === 0) {
-      return;
-    }
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<void>((resolve) => {
-      timeout = setTimeout(resolve, ROLE_STOP_GRACE_MS);
-    });
-    try {
-      await Promise.race([
-        Promise.allSettled(completions).then(() => undefined),
-        deadline,
-      ]);
-    } finally {
-      if (timeout !== undefined) {
-        clearTimeout(timeout);
-      }
-    }
   }
 
   #resolveRoleRuntimeConfiguration(
@@ -2465,7 +2498,7 @@ export class LocalRoundtableHost {
       }
       const inviter = candidate.invitation;
       if (inviter.inviterType === "role") {
-        if (this.#roles.get(inviter.inviterId)?.scope !== "long_term") {
+        if (this.#roleSessions.get(inviter.inviterId)?.scope !== "long_term") {
           throw new Error("Temporary roles require an active long-term role inviter");
         }
       } else if (inviter.inviterId !== "user.direct_host") {
@@ -2619,10 +2652,15 @@ export class LocalRoundtableHost {
         ? {}
         : { maxOutputTokens: participant.modelRouteSnapshot.maxOutputTokens }),
       thinkingLevel: participant.modelRouteSnapshot.thinkingLevel,
-      apiKey,
       systemPrompt,
       skillPaths,
-      mcpServers,
+      credentialLease: new RoleCredentialLease({
+        roleId,
+        runtimeGeneration: this.runtimeGeneration,
+        providerId: provider.runtimeProviderId,
+        apiKey,
+        mcpServers,
+      }),
       delegation: {
         networkAccess: participant.delegationSnapshot.networkAccess,
         resultMode: participant.delegationSnapshot.resultMode,
@@ -2777,13 +2815,13 @@ export class LocalRoundtableHost {
     if (!expected && !active) {
       return;
     }
-    const role = this.#roles.get(roleId);
+    const role = this.#roleSessions.get(roleId);
     if (role === undefined) {
       this.#expectedTurns.delete(roleId);
       return;
     }
     this.#timedOutTurnCommands.add(commandId);
-    const result = await this.#executeAdapterUntilStopRequested(role.adapter, {
+    const result = await this.#roleSessions.execute(roleId, {
       kind: "turn.cancel",
       commandId: `${commandId}:timeout`,
       roleId,
@@ -2851,26 +2889,23 @@ export class LocalRoundtableHost {
     this.#timedOutTurnCommands.clear();
   }
 
+  #diagnoseRoleStopFailures(
+    results: readonly { adapterStopped: boolean; childrenSettled: boolean }[],
+  ): void {
+    for (const result of results) {
+      if (!result.adapterStopped || !result.childrenSettled) {
+        this.#diagnose("role_stop_failed", "A role runtime did not stop cleanly");
+      }
+    }
+  }
+
   async #stopAllRoles(): Promise<void> {
-    const roles = [...this.#roles.values()];
-    this.#roles.clear();
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
     this.#pendingSubagentContinuations.length = 0;
     this.#clearSubagentContinuationRetry();
     this.#clearAllTurnTimeouts();
-    await Promise.all(
-      roles.map(async (role) => {
-        role.unsubscribe();
-        try {
-          if (!await this.#stopAdapterWithGrace(role.adapter)) {
-            throw new Error("role stop failed or timed out");
-          }
-        } catch {
-          this.#diagnose("role_stop_failed", "A role runtime did not stop cleanly");
-        }
-      }),
-    );
+    this.#diagnoseRoleStopFailures(await this.#roleSessions.stopAll());
   }
 
   #emit(
