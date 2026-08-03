@@ -37,7 +37,7 @@ flowchart LR
 - 角色打断是显式状态转换：请求打断 → 取消当前发言 → 新角色取得发言权。
 - 角色观察最多三路并发，公开话筒始终串行；模型返回速度不决定发言顺序，抢答必须经过 exact-evidence 和次数预算。
 
-更完整的边界见 [架构说明](docs/architecture.md)、[运行时所有权 ADR](docs/adr/0001-runtime-ownership.md)、[Pi-first 运行时 ADR](docs/adr/0003-pi-first-runtime.md)、[现代 Agent/Windows 基线 ADR](docs/adr/0004-modern-agent-and-windows-baseline.md)、[本地纵向闭环 ADR](docs/adr/0005-local-roundtable-vertical-slice.md)、[会话与能力清单 ADR](docs/adr/0006-session-workspaces-and-capability-manifests.md) 和 [上下文、记忆、插件与文档边界 ADR](docs/adr/0010-runtime-context-memory-plugins-and-artifacts.md)。客户端信息架构见 [会话中心设计](docs/product/session-centered-client.md)。
+更完整的边界见 [架构说明](docs/architecture.md)、[运行时所有权 ADR](docs/adr/0001-runtime-ownership.md)、[Pi-first 运行时 ADR](docs/adr/0003-pi-first-runtime.md)、[现代 Agent/Windows 基线 ADR](docs/adr/0004-modern-agent-and-windows-baseline.md)、[本地纵向闭环 ADR](docs/adr/0005-local-roundtable-vertical-slice.md)、[会话与能力清单 ADR](docs/adr/0006-session-workspaces-and-capability-manifests.md) 和 [上下文、记忆、插件与文档边界 ADR](docs/adr/0010-runtime-context-memory-plugins-and-artifacts.md)。客户端信息架构见 [会话中心设计](docs/product/session-centered-client.md)，`v0.4` 到 `v0.8` 的逐项实现与发版证据见 [implementation backlog](docs/product/v0.4-v0.8-implementation-todo.md)。
 
 ## 快速开始
 

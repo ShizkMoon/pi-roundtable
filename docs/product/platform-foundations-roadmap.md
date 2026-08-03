@@ -5,6 +5,10 @@
 - 状态口径：`implemented` 表示代码与自动化存在，`connected` 表示用户路径可达，
   `verified` 表示相应验收已在当前候选版本完成，`pending` 不得写成已交付
 
+`v0.4` 到 `v0.8` 的逐项代码、测试、真实场景与发版门禁由
+[v0.4-v0.8 implementation backlog](v0.4-v0.8-implementation-todo.md) 跟踪。
+本文件继续说明产品边界与执行顺序；backlog 是后续版本的可勾选交付清单。
+
 ## 1. 目标与不可破坏的边界
 
 Pi Roundtable 的基础能力不是把更多第三方实现直接塞进桌面进程，而是建立可演进的
