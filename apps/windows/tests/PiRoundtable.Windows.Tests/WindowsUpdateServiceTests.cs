@@ -624,12 +624,13 @@ public sealed class WindowsUpdateServiceTests
             },
             ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/")));
 
-        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-04T00:00:00Z"));
+        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-05T00:00:00Z"));
 
-        Assert.AreEqual(new Version(0, 3, 0), verified.Version);
+        Assert.AreEqual(new Version(0, 4, 0), verified.Version);
         Assert.AreEqual("stable-2026-08", verified.Document.Signature.KeyId);
-        Assert.AreEqual(148653395, verified.Document.Asset.Size);
-        Assert.AreEqual("F39BDB09AB7590F5BD5F314B51170BE0255843C16A8E4C212867C7DA9C99B109", verified.Document.Asset.Sha256);
+        Assert.AreEqual(148848943, verified.Document.Asset.Size);
+        Assert.AreEqual("D9399C65596BAF368AB790122992A2C0C104771764CCA7CBB02B49C4A711CC4F", verified.Document.Asset.Sha256);
+        Assert.IsFalse(verified.Document.Asset.AuthenticodeRequired);
     }
 
     private static async Task AssertManifestFailsAsync(UpdateFixture fixture, string json, Type expectedType)
