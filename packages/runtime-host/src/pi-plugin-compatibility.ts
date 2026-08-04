@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { ResolvedMcpServerRuntimeConfiguration } from "./mcp-client-manager.js";
 
 export const PI_PLUGIN_COMPATIBILITY_VERSION = 1;
@@ -78,7 +80,7 @@ function resolveUniqueMcpServers(
     }
     const existing = resolved.get(server.serverId);
     if (existing === undefined) {
-      resolved.set(server.serverId, server);
+      resolved.set(server.serverId, structuredClone(server));
       continue;
     }
     if (mcpConfigurationFingerprint(existing) !== mcpConfigurationFingerprint(server)) {
@@ -96,11 +98,7 @@ function resolveUniqueMcpServers(
 function mcpConfigurationFingerprint(
   server: ResolvedMcpServerRuntimeConfiguration,
 ): string {
-  const orderedRecord = (value: Record<string, string> | undefined) =>
-    value === undefined
-      ? undefined
-      : Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
-  return JSON.stringify({
+  return createHash("sha256").update(JSON.stringify({
     serverId: server.serverId,
     displayName: server.displayName,
     transport: server.transport,
@@ -108,12 +106,32 @@ function mcpConfigurationFingerprint(
     arguments: server.arguments,
     workingDirectory: server.workingDirectory,
     endpoint: server.endpoint,
-    environment: orderedRecord(server.environment),
-    headers: orderedRecord(server.headers),
+    environment: credentialRecordFingerprint(server.environment),
+    headers: credentialRecordFingerprint(server.headers),
     toolAllowlist: [...new Set(server.toolAllowlist)].sort(),
     approvalMode: server.approvalMode,
     executionMode: server.executionMode,
-  });
+  })).digest("hex");
+}
+
+/** Hash secret values incrementally so no combined plaintext JSON copy exists. */
+function credentialRecordFingerprint(
+  value: Record<string, string> | undefined,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const hash = createHash("sha256");
+  for (const [name, secret] of Object.entries(value).sort(([left], [right]) =>
+    left.localeCompare(right))) {
+    updateLengthPrefixed(hash, name);
+    updateLengthPrefixed(hash, secret);
+  }
+  return hash.digest("hex");
+}
+
+function updateLengthPrefixed(hash: ReturnType<typeof createHash>, value: string): void {
+  hash.update(String(Buffer.byteLength(value, "utf8"))).update(":").update(value);
 }
 
 function uniqueBy<T>(values: readonly T[], key: (value: T) => string): T[] {

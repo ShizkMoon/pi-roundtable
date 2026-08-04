@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   PROTOCOL_VERSION,
+  validateMeetingEvent,
   type JsonObject,
   type MeetingCommand,
   type MeetingEvent,
@@ -43,6 +46,18 @@ import type {
   DiscussionObserver,
 } from "../discussion-observer.js";
 import { StdioRuntimeHost } from "../stdio-runtime-host.js";
+import {
+  DefaultRoleContextAssembler,
+  type ResolvedRoleRuntimeConfiguration,
+  type RoleContextAssembler,
+} from "../role-context-assembler.js";
+import { DefaultDiscussionOrchestrator } from "../discussion-orchestrator.js";
+import {
+  SynchronousNormalizedEventWriter,
+  type NormalizedEventWriter,
+  type NormalizedEventWriterOptions,
+} from "../normalized-event-writer.js";
+import { RuntimeCredentialVault } from "../runtime-credential-vault.js";
 
 class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly commands: RuntimeCommand[] = [];
@@ -131,6 +146,27 @@ class ControlledSubagentRunner implements SubagentRunner {
   }
 }
 
+class AbortAwareSubagentRunner implements SubagentRunner {
+  readonly requests: SubagentRunRequest[] = [];
+  readonly signals: AbortSignal[] = [];
+
+  run(
+    request: SubagentRunRequest,
+    _onProgress: (progress: { updateCount: number }) => void,
+    signal: AbortSignal,
+  ): Promise<string> {
+    this.requests.push(request);
+    this.signals.push(signal);
+    return new Promise<string>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new Error("controlled child cancellation")),
+        { once: true },
+      );
+    });
+  }
+}
+
 class ControlledPublicMessagePlanner implements PublicMessagePlanner {
   readonly requests: PublicMessagePlanningRequest[] = [];
 
@@ -170,6 +206,20 @@ class ControlledDiscussionObserver implements DiscussionObserver {
   }
 }
 
+class DeferredDiscussionObserver implements DiscussionObserver {
+  readonly requests: DiscussionObservationRequest[] = [];
+  readonly pending: Array<{
+    resolve: (decision: DiscussionObservationDecision) => void;
+  }> = [];
+
+  observe(request: DiscussionObservationRequest): Promise<DiscussionObservationDecision> {
+    this.requests.push(structuredClone(request));
+    return new Promise<DiscussionObservationDecision>((resolve) => {
+      this.pending.push({ resolve });
+    });
+  }
+}
+
 function createObservedWorkspaceAndSession(): {
   workspace: WorkspaceProfile;
   session: RoundtableSession;
@@ -206,6 +256,75 @@ function command(
     payload: {},
     ...overrides,
   };
+}
+
+async function startObservedFreeDiscussion(observer: DiscussionObserver): Promise<{
+  host: LocalRoundtableHost;
+  adapters: Map<string, FakeRuntimeAdapter>;
+  events: MeetingEvent[];
+  speaker: FakeRuntimeAdapter;
+  correlationId: string;
+}> {
+  const { workspace, session } = createObservedWorkspaceAndSession();
+  const planner = new ControlledPublicMessagePlanner({
+    sharedRequirements: [],
+    roleTasks: { "participant.secretary": [] },
+    groupTasks: [],
+    speakerOrder: ["participant.secretary"],
+  });
+  const adapters = new Map<string, FakeRuntimeAdapter>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    publicMessagePlanner: planner,
+    discussionObserver: observer,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.set(roleId, adapter);
+      return adapter;
+    },
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(workspace, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  await host.execute(command("role.add", "add-observed-secretary", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("role.add", "add-observed-risk", {
+    actorId: "participant.risk",
+  }));
+  await host.execute(command("meeting.open", "open-observer-fence"));
+  await host.execute(command("discussion.configure", "configure-observer-fence", {
+    actorId: "user.direct_host",
+    payload: {
+      agendaItems: ["Runtime ownership"],
+      limits: { maxObserverProbesPerSegment: 4 },
+    },
+  }));
+  await host.execute(command("discussion.mode.set", "free-observer-fence", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "test" },
+  }));
+  await host.execute(command("speech.broadcast", "broadcast-observer-fence", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "请讨论模型执行边界。",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const speaker = adapters.get("participant.secretary");
+  assert.ok(speaker !== undefined);
+  const turn = speaker.commands.at(-1);
+  assert.equal(turn?.kind, "turn.prompt");
+  const correlationId = turn?.commandId;
+  assert.ok(correlationId !== undefined);
+  speaker.emit("turn.started", {}, correlationId);
+  return { host, adapters, events, speaker, correlationId };
 }
 
 const TEST_WORKSPACE: WorkspaceProfile = {
@@ -500,6 +619,7 @@ test("broadcasts shared and per-role assignments sequentially with a role-exclus
   const directSent = events.find((event) => event.kind === "message.direct_sent");
   assert.equal(directSent?.visibility, "private");
   assert.deepEqual(directSent?.audience, ["user.direct_host", "role.b"]);
+  assert.deepEqual(directSent?.payload, { message: "Keep this risk private" });
   adapters.get("role.b")?.emit("turn.started", {}, "direct-b");
   adapters.get("role.b")?.emit("turn.delta", { delta: "Private answer" }, "direct-b");
   adapters.get("role.b")?.emit("turn.completed", {}, "direct-b");
@@ -820,6 +940,138 @@ test("runs one final observer probe when a completed speech adds no new text", a
   await host.stop();
 });
 
+test("drops a queued observer decision after the candidate role is recreated", async () => {
+  const observer = new DeferredDiscussionObserver();
+  const { host, adapters, events, speaker, correlationId } =
+    await startObservedFreeDiscussion(observer);
+  speaker.emit("turn.delta", {
+    delta: `同步服务器直接执行所有模型调用。${"这是一段仍在继续的公开发言。".repeat(20)}`,
+  }, correlationId);
+  await waitFor(() => observer.requests.length === 1, "deferred observer should start");
+
+  const candidate = adapters.get("participant.risk");
+  assert.ok(candidate !== undefined);
+  const entered = createDeferredSignal();
+  const release = createDeferredSignal();
+  candidate.onExecute = async (runtimeCommand) => {
+    if (runtimeCommand.commandId === "hold-observer-apply") {
+      entered.resolve();
+      await release.promise;
+    }
+    return { commandId: runtimeCommand.commandId, accepted: true };
+  };
+  const blocking = host.execute(command("tool.approval.resolve", "hold-observer-apply", {
+    actorId: "user.direct_host",
+    targetId: "participant.risk",
+    payload: { approvalId: "approval.observer-fence", approved: true },
+  }));
+  await entered.promise;
+  const baselineFloorRequests = events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length;
+  const removing = host.execute(command("role.remove", "remove-observer-candidate", {
+    actorId: "participant.risk",
+  }));
+  const adding = host.execute(command("role.add", "readd-observer-candidate", {
+    actorId: "participant.risk",
+  }));
+  observer.pending[0]!.resolve({
+    action: "interrupt",
+    kind: "critical",
+    reason: "stale candidate decision",
+    prompt: "This decision belongs to the retired role session.",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  release.resolve();
+  assert.equal((await blocking).status, "accepted");
+  assert.equal((await removing).status, "accepted");
+  assert.equal((await adding).status, "accepted");
+  await host.execute(command("discussion.mode.set", "drain-observer-apply", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length,
+  baselineFloorRequests);
+  await host.stop();
+});
+
+test("drops a queued observer launch after the observed speaker is recreated", async () => {
+  const observer = new ControlledDiscussionObserver({ action: "none" });
+  const { host, adapters, speaker, correlationId } = await startObservedFreeDiscussion(observer);
+  const candidate = adapters.get("participant.risk");
+  assert.ok(candidate !== undefined);
+  const entered = createDeferredSignal();
+  const release = createDeferredSignal();
+  candidate.onExecute = async (runtimeCommand) => {
+    if (runtimeCommand.commandId === "hold-observer-launch") {
+      entered.resolve();
+      await release.promise;
+    }
+    return { commandId: runtimeCommand.commandId, accepted: true };
+  };
+  const blocking = host.execute(command("tool.approval.resolve", "hold-observer-launch", {
+    actorId: "user.direct_host",
+    targetId: "participant.risk",
+    payload: { approvalId: "approval.observer-launch", approved: true },
+  }));
+  await entered.promise;
+  const removing = host.execute(command("role.remove", "remove-observed-speaker", {
+    actorId: "participant.secretary",
+  }));
+  const adding = host.execute(command("role.add", "readd-observed-speaker", {
+    actorId: "participant.secretary",
+  }));
+  speaker.emit("turn.delta", {
+    delta: "这段旧会话发言足够长，原本会触发角色观察。".repeat(20),
+  }, correlationId);
+  release.resolve();
+  assert.equal((await blocking).status, "accepted");
+  assert.equal((await removing).status, "accepted");
+  assert.equal((await adding).status, "accepted");
+  await host.execute(command("discussion.mode.set", "drain-observer-launch", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(observer.requests.length, 0);
+  await host.stop();
+});
+
+test("drops an in-flight observer decision after the observed speaker is recreated", async () => {
+  const observer = new DeferredDiscussionObserver();
+  const { host, events, speaker, correlationId } = await startObservedFreeDiscussion(observer);
+  speaker.emit("turn.delta", {
+    delta: `同步服务器直接执行所有模型调用。${"这是一段仍在继续的公开发言。".repeat(20)}`,
+  }, correlationId);
+  await waitFor(() => observer.requests.length === 1, "observer decision should be in flight");
+  const baselineFloorRequests = events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length;
+
+  assert.equal((await host.execute(command("role.remove", "remove-observed-speaker-after-launch", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "readd-observed-speaker-after-launch", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  observer.pending[0]!.resolve({
+    action: "interrupt",
+    kind: "critical",
+    reason: "stale observed speaker decision",
+    prompt: "This decision belongs to speech from the retired speaker session.",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await host.execute(command("discussion.mode.set", "drain-observed-speaker-decision", {
+    actorId: "user.direct_host",
+    payload: { mode: "free_discussion", reason: "drain" },
+  }));
+
+  assert.equal(events.filter((event) =>
+    event.kind === "floor.requested" && event.actorId === "participant.risk").length,
+  baselineFloorRequests);
+  await host.stop();
+});
+
 test("automatically converges a no-progress discussion and completes after one facilitator turn", async () => {
   const { host, adapters } = createHost();
   const events: MeetingEvent[] = [];
@@ -952,13 +1204,105 @@ test("resolves a frozen participant manifest into private Pi runtime options", a
     assert.equal(resolved?.modelId, "test-model");
     assert.equal(resolved?.modelName, "Test model");
     assert.deepEqual(resolved?.modelCapabilities, ["text"]);
-    assert.equal(resolved?.apiKey, "runtime-secret");
+    assert.equal(resolved?.credentialLease.resolveApiKey("test"), "runtime-secret");
     assert.equal(resolved?.systemPrompt, "Keep the meeting on track.");
     assert.equal(resolved?.skillPaths.length, 1);
     assert.equal(resolved?.skillPaths[0]?.endsWith("skills\\test\\SKILL.md") || resolved?.skillPaths[0]?.endsWith("skills/test/SKILL.md"), true);
   } finally {
     await host.stop();
+    assert.equal(resolved?.credentialLease.closed, true);
     rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("routes frozen participant assembly through the injected role context seam", async () => {
+  const delegate = new DefaultRoleContextAssembler();
+  const requests: Parameters<RoleContextAssembler["assemble"]>[0][] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    roleContextAssembler: {
+      assemble: (request) => {
+        requests.push(request);
+        return delegate.assemble(request);
+      },
+    },
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  try {
+    const receipt = await host.execute(command("role.add", "add-through-assembler", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "accepted", receipt.message ?? receipt.errorCode ?? undefined);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.participant.participantId, "participant.secretary");
+    assert.equal(requests[0]?.runtimeGeneration, 1);
+    assert.equal(requests[0]?.workspace.workspaceId, "workspace.test");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("routes scheduler policy and normalized event authority through injected seams", async () => {
+  class TrackingDiscussionOrchestrator extends DefaultDiscussionOrchestrator {
+    configureCount = 0;
+
+    override configure(
+      ...args: Parameters<DefaultDiscussionOrchestrator["configure"]>
+    ): ReturnType<DefaultDiscussionOrchestrator["configure"]> {
+      ++this.configureCount;
+      return super.configure(...args);
+    }
+  }
+
+  const orchestrator = new TrackingDiscussionOrchestrator();
+  let writer: NormalizedEventWriter | undefined;
+  let writerOptions: NormalizedEventWriterOptions | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    discussionOrchestrator: orchestrator,
+    normalizedEventWriterFactory: (options) => {
+      writerOptions = options;
+      writer = new SynchronousNormalizedEventWriter(options);
+      return writer;
+    },
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  }, 5);
+  host.start();
+  try {
+    assert.equal((await host.execute(command("role.add", "add-seam-role", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("discussion.configure", "configure-through-seam", {
+      actorId: "user.direct_host",
+      payload: { agendaItems: ["Runtime seams"] },
+    }))).status, "accepted");
+
+    assert.equal(orchestrator.configureCount, 1);
+    assert.equal(writerOptions?.meetingId, "meeting-local-test");
+    assert.equal(writerOptions?.runtimeGeneration, 1);
+    assert.equal(writer?.sequence, host.sequence);
+    assert.deepEqual(events.map((event) => event.sequence), [6, 7, 8, 9]);
+    assert.deepEqual(events.map((event) => event.kind), [
+      "runtime.lease_acquired",
+      "role.registered",
+      "discussion.configured",
+      "agenda.item_changed",
+    ]);
+    assert.deepEqual(events.flatMap((event) => validateMeetingEvent(event)), []);
+  } finally {
+    await host.stop();
   }
 });
 
@@ -1086,9 +1430,10 @@ test("resolves an approved Git MCP grant and its credential references", async (
       actorId: "participant.secretary",
     }));
     assert.equal(receipt.status, "accepted");
-    assert.equal(resolved?.mcpServers[0]?.serverId, "mcp.test");
-    assert.deepEqual(resolved?.mcpServers[0]?.toolAllowlist, ["echo"]);
-    assert.equal(resolved?.mcpServers[0]?.environment?.TEST_TOKEN, "mcp-secret");
+    const mcpServers = resolved?.credentialLease.materializeMcpServers() ?? [];
+    assert.equal(mcpServers[0]?.serverId, "mcp.test");
+    assert.deepEqual(mcpServers[0]?.toolAllowlist, ["echo"]);
+    assert.equal(mcpServers[0]?.environment?.TEST_TOKEN, "mcp-secret");
   } finally {
     await host.stop();
     rmSync(runtimeDirectory, { recursive: true, force: true });
@@ -1239,6 +1584,67 @@ test("publishes the interruption reason and hands the floor to an interrupting r
   assert.equal(interruption?.actorId, "role.b");
   assert.equal(interruption?.targetId, "role.a");
   assert.equal(interruption?.payload.message, "B takes the floor");
+  await host.stop();
+});
+
+test("drops a queued interruption handoff after the interrupting role is recreated", async () => {
+  const adapters = new Map<string, FakeRuntimeAdapter[]>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      const versions = adapters.get(roleId) ?? [];
+      versions.push(adapter);
+      adapters.set(roleId, versions);
+      return adapter;
+    },
+  });
+  let removing: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  let adding: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "speech.cancelled" && removing === undefined) {
+      removing = host.execute(command("role.remove", "remove-handoff-role", {
+        actorId: "role.b",
+      }));
+      adding = host.execute(command("role.add", "readd-handoff-role", {
+        actorId: "role.b",
+        payload: { displayName: "B, new session" },
+      }));
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-handoff-target", {
+    actorId: "role.a",
+  }));
+  await host.execute(command("role.add", "add-handoff-interruptor", {
+    actorId: "role.b",
+  }));
+  await host.execute(command("meeting.open", "open-handoff-fence"));
+  await host.execute(command("speech.prompt", "prompt-handoff-target", {
+    actorId: "role.a",
+    payload: { message: "A speaks" },
+  }));
+  const target = adapters.get("role.a")?.[0];
+  assert.ok(target !== undefined);
+  target.emit("turn.started", {}, "prompt-handoff-target");
+
+  assert.equal((await host.execute(command("speech.interrupt", "stale-handoff", {
+    actorId: "role.b",
+    targetId: "role.a",
+    payload: { message: "B takes the floor" },
+  }))).status, "accepted");
+  target.emit("turn.cancelled", {}, "prompt-handoff-target");
+  await waitFor(() => removing !== undefined && adding !== undefined, "handoff role should be replaced");
+  assert.equal((await removing!).status, "accepted");
+  assert.equal((await adding!).status, "accepted");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const replacement = adapters.get("role.b")?.[1];
+  assert.ok(replacement !== undefined);
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" && runtimeCommand.commandId === "stale-handoff"), false);
   await host.stop();
 });
 
@@ -1562,6 +1968,631 @@ test("stdio host frames ready, errors, events, and shutdown", async () => {
   assert.equal(frames[2]?.errorCode, "invalid_json");
 });
 
+test("zeroizes host and role credential owners before a stalled adapter stop settles", async () => {
+  const stopGate = createDeferredSignal();
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  adapter.onStop = () => stopGate.promise;
+  let vault: RuntimeCredentialVault | undefined;
+  let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.credentials",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (_roleId, resolved) => {
+      configuration = resolved;
+      return adapter;
+    },
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "host-owned-secret",
+  });
+  host.start();
+  await host.restoreConfiguredRoles();
+  assert.ok(vault !== undefined);
+  assert.ok(configuration !== undefined);
+
+  const stopping = host.stop();
+  await waitFor(() => adapter.stopCount === 1, "adapter stop should begin");
+  assert.equal(vault.closed, true);
+  assert.equal(vault.zeroizedSecretCount, vault.ownedSecretCount);
+  assert.equal(configuration.credentialLease.closed, true);
+  assert.equal(
+    configuration.credentialLease.zeroizedSecretCount,
+    configuration.credentialLease.ownedSecretCount,
+  );
+
+  stopGate.resolve();
+  await stopping;
+});
+
+test("blocks initialization-seam start reentry without corrupting runtime ownership", async () => {
+  let host!: LocalRoundtableHost;
+  let vault: RuntimeCredentialVault | undefined;
+  let reentryError: unknown;
+  host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.init-reentry",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      try {
+        host.start();
+      } catch (error) {
+        reentryError = error;
+      }
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+
+  host.initializeRuntimeConfiguration(TEST_WORKSPACE, TEST_SESSION, {
+    "memory://provider.test": "reentry-secret",
+  });
+  assert.match(String(reentryError), /initialization is in progress/);
+  host.start();
+  await host.stop();
+  assert.ok(vault !== undefined);
+  assert.equal(vault.closed, true);
+});
+
+test("clears the initialization guard when a custom event writer sequence getter throws", () => {
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.throwing-sequence",
+    runtimeGeneration: 1,
+    normalizedEventWriterFactory: () => ({
+      get sequence(): number {
+        throw new Error("controlled sequence getter failure");
+      },
+      reset: () => undefined,
+      subscribe: () => () => undefined,
+      write: () => undefined,
+    }),
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+
+  const initialize = () => host.initializeRuntimeConfiguration(
+    TEST_WORKSPACE,
+    TEST_SESSION,
+    { "memory://provider.test": "sequence-secret" },
+  );
+  assert.throws(initialize, /controlled sequence getter failure/);
+  assert.throws(initialize, /controlled sequence getter failure/);
+});
+
+test("an initialization rollback preserves its cause when credential-vault close also throws", () => {
+  class ThrowingRollbackVault extends RuntimeCredentialVault {
+    override close(): void {
+      super.close();
+      throw new Error("controlled rollback vault close failure");
+    }
+  }
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.rollback-vault",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => new ThrowingRollbackVault(credentials),
+    normalizedEventWriterFactory: () => ({
+      sequence: 0,
+      reset: () => {
+        throw new Error("controlled event reset failure");
+      },
+      subscribe: () => () => undefined,
+      write: () => undefined,
+    }),
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const initialize = () => host.initializeRuntimeConfiguration(
+    TEST_WORKSPACE,
+    TEST_SESSION,
+    { "memory://provider.test": "rollback-vault-secret" },
+  );
+
+  assert.throws(initialize, /controlled event reset failure/);
+  assert.throws(initialize, /controlled event reset failure/);
+});
+
+test("a throwing credential-vault seam cannot bypass adapter and ownership cleanup", async () => {
+  class ThrowingCloseVault extends RuntimeCredentialVault {
+    override close(): void {
+      super.close();
+      throw new Error("controlled credential vault close failure");
+    }
+  }
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.throwing-vault",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => new ThrowingCloseVault(credentials),
+    adapterFactory: () => adapter,
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "throwing-vault-secret",
+  });
+  host.start();
+  await host.restoreConfiguredRoles();
+
+  const firstStop = host.stop();
+  const repeatedStop = host.stop();
+  assert.equal(firstStop, repeatedStop);
+  await assert.rejects(firstStop, /controlled credential vault close failure/);
+  assert.equal(adapter.stopCount, 1);
+  await assert.rejects(repeatedStop, /controlled credential vault close failure/);
+});
+
+test("a direct configured-role restore failure terminally clears host and role credentials", async () => {
+  let vault: RuntimeCredentialVault | undefined;
+  let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.restore-failure",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (roleId, resolved) => {
+      configuration = resolved;
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapter.onStart = async () => {
+        throw new Error("controlled configured-role failure");
+      };
+      return adapter;
+    },
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "restore-failure-secret",
+  });
+  host.start();
+
+  await assert.rejects(host.restoreConfiguredRoles(), /controlled configured-role failure/);
+  assert.ok(vault !== undefined);
+  assert.ok(configuration !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(configuration.credentialLease.closed, true);
+  await host.stop();
+});
+
+test("meeting.close clears credential owners even before stdio shutdown", async () => {
+  let vault: RuntimeCredentialVault | undefined;
+  let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.meeting-close-credentials",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (roleId, resolved) => {
+      configuration = resolved;
+      return new FakeRuntimeAdapter(roleId);
+    },
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "meeting-close-secret",
+  });
+  host.start();
+  await host.restoreConfiguredRoles();
+
+  const receipt = await host.execute(command("meeting.close", "close-credentials", {
+    actorId: "user.direct_host",
+  }));
+  assert.equal(receipt.status, "accepted");
+  assert.ok(vault !== undefined);
+  assert.ok(configuration !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(configuration.credentialLease.closed, true);
+  await host.stop();
+});
+
+test("meeting.close commits its terminal event when process shutdown races role cleanup", async () => {
+  const stopGate = createDeferredSignal();
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  adapter.onStop = () => stopGate.promise;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.close-race",
+    runtimeGeneration: 1,
+    adapterFactory: () => adapter,
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "close-race-secret",
+  });
+  host.start();
+  await host.restoreConfiguredRoles();
+
+  const closing = host.execute(command("meeting.close", "close-racing-stop"));
+  await waitFor(() => adapter.stopCount === 1, "meeting close should begin role cleanup");
+  const stopping = host.stop("close");
+  stopGate.resolve();
+
+  const receipt = await closing;
+  await stopping;
+  assert.equal(receipt.status, "rejected");
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.deepEqual(events.slice(-2).map((event) => event.kind), [
+    "meeting.closed",
+    "runtime.lease_released",
+  ]);
+});
+
+test("meeting.close writes its terminal event when vault cleanup reentrantly requests stop", async () => {
+  let stopping: Promise<void> | undefined;
+  let host!: LocalRoundtableHost;
+  class ReentrantStopVault extends RuntimeCredentialVault {
+    override close(): void {
+      super.close();
+      stopping = host.stop("close");
+    }
+  }
+  host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.vault-close-race",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => new ReentrantStopVault(credentials),
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(TEST_WORKSPACE, TEST_SESSION, {
+    "memory://provider.test": "vault-close-race-secret",
+  });
+  host.start();
+  assert.equal((await host.execute(command("meeting.open", "open-vault-close-race"))).status, "accepted");
+
+  const receipt = await host.execute(command("meeting.close", "close-vault-close-race"));
+  await stopping;
+  assert.equal(receipt.errorCode, "runtime_stopped");
+  assert.deepEqual(events.slice(-2).map((event) => event.kind), [
+    "meeting.closed",
+    "runtime.lease_released",
+  ]);
+});
+
+test("stdio initialization failure is terminal and clears credentials before returning", async () => {
+  let vault: RuntimeCredentialVault | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.failed-initialization",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapter.onStart = async () => {
+        throw new Error("controlled adapter start failure with secret-value");
+      };
+      return adapter;
+    },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let text = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    text += chunk;
+  });
+  input.end(
+    `${JSON.stringify({
+      type: "initialize",
+      requestId: "init-fails",
+      workspace: RESUME_WORKSPACE,
+      session: RESUME_SESSION,
+      credentials: { "memory://provider.test": "process-exit-secret" },
+      initialSequence: 0,
+    })}\n${JSON.stringify({
+      type: "initialize",
+      requestId: "must-not-retry",
+      workspace: RESUME_WORKSPACE,
+      session: RESUME_SESSION,
+      credentials: { "memory://provider.test": "second-secret" },
+      initialSequence: 0,
+    })}\n`,
+  );
+
+  await new StdioRuntimeHost(host).run(input, output);
+  const frames = text.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    errorCode?: string;
+  });
+  assert.deepEqual(frames.map((frame) => frame.type), ["error", "stopped"]);
+  assert.equal(frames[0]?.errorCode, "initialization_failed");
+  assert.equal(text.includes("process-exit-secret"), false);
+  assert.equal(text.includes("second-secret"), false);
+  assert.ok(vault !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(vault.zeroizedSecretCount, vault.ownedSecretCount);
+});
+
+test("stdio shutdown preempts a stalled configured-role startup and clears leases", async () => {
+  const adapter = new FakeRuntimeAdapter("participant.secretary");
+  adapter.onStart = () => new Promise<void>(() => undefined);
+  let vault: RuntimeCredentialVault | undefined;
+  let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.preemptive-shutdown",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (_roleId, resolved) => {
+      configuration = resolved;
+      return adapter;
+    },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let text = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    text += chunk;
+  });
+  const running = new StdioRuntimeHost(host).run(input, output);
+  input.write(`${JSON.stringify({
+    type: "initialize",
+    requestId: "init-stalled",
+    workspace: RESUME_WORKSPACE,
+    session: RESUME_SESSION,
+    credentials: { "memory://provider.test": "stalled-secret" },
+    initialSequence: 0,
+  })}\n`);
+  await waitFor(() => adapter.startCount === 1, "configured role startup should stall");
+  input.end(`${JSON.stringify({
+    type: "shutdown",
+    requestId: "stop-stalled",
+    mode: "suspend",
+  })}\n`);
+
+  await withTimeout(running, "shutdown must preempt stalled startup");
+  const frames = text.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    requestId?: string | null;
+  });
+  assert.equal(frames.at(-1)?.type, "stopped");
+  assert.equal(frames.at(-1)?.requestId, "stop-stalled");
+  assert.ok(vault !== undefined);
+  assert.ok(configuration !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(configuration.credentialLease.closed, true);
+  assert.equal(text.includes("stalled-secret"), false);
+});
+
+test("stdio propagates a preemptive stop failure after writing its terminal frame", async () => {
+  class ThrowingPreemptiveVault extends RuntimeCredentialVault {
+    override close(): void {
+      super.close();
+      throw new Error("controlled preemptive stop failure");
+    }
+  }
+  const planner = new StalledPublicMessagePlanner();
+  let vault: ThrowingPreemptiveVault | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.preemptive-stop-failure",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new ThrowingPreemptiveVault(credentials);
+      return vault;
+    },
+    publicMessagePlanner: planner,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let text = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    text += chunk;
+  });
+  const running = new StdioRuntimeHost(host).run(input, output);
+  input.write(`${JSON.stringify({
+    type: "initialize",
+    requestId: "init-preemptive-failure",
+    workspace: RESUME_WORKSPACE,
+    session: RESUME_SESSION,
+    credentials: { "memory://provider.test": "preemptive-failure-secret" },
+    initialSequence: 0,
+  })}\n`);
+  await waitFor(() => text.includes('"type":"ready"'), "stdio host should become ready");
+  input.write(`${JSON.stringify({
+    type: "command",
+    command: command("speech.broadcast", "broadcast-preemptive-failure", {
+      actorId: "user.direct_host",
+      payload: {
+        message: "Stall planning before shutdown",
+        mentions: ["participant.secretary"],
+      },
+    }),
+  })}\n`);
+  await planner.started.promise;
+  input.write(`${JSON.stringify({
+    type: "shutdown",
+    requestId: "stop-preemptive-failure",
+    mode: "suspend",
+  })}\n`);
+
+  await assert.rejects(
+    withTimeout(running, "preemptive stop failure should settle"),
+    /controlled preemptive stop failure/,
+  );
+  const frames = text.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    requestId?: string | null;
+  });
+  assert.equal(frames.at(-1)?.type, "stopped");
+  assert.equal(frames.at(-1)?.requestId, "stop-preemptive-failure");
+  assert.ok(vault !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(text.includes("preemptive-failure-secret"), false);
+});
+
+test("stdio EOF suspends a live host and zeroizes owners without closing the meeting", async () => {
+  let vault: RuntimeCredentialVault | undefined;
+  let configuration: ResolvedRoleRuntimeConfiguration | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.eof",
+    runtimeGeneration: 1,
+    credentialVaultFactory: (credentials) => {
+      vault = new RuntimeCredentialVault(credentials);
+      return vault;
+    },
+    adapterFactory: (roleId, resolved) => {
+      configuration = resolved;
+      return new FakeRuntimeAdapter(roleId);
+    },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let text = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    text += chunk;
+  });
+  input.end(`${JSON.stringify({
+    type: "initialize",
+    requestId: "init-eof",
+    workspace: RESUME_WORKSPACE,
+    session: RESUME_SESSION,
+    credentials: { "memory://provider.test": "eof-secret" },
+    initialSequence: 4,
+  })}\n`);
+
+  await withTimeout(new StdioRuntimeHost(host).run(input, output), "EOF cleanup should settle");
+  const frames = text.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    event?: { kind: string };
+  });
+  assert.equal(frames.some((frame) => frame.type === "ready"), true);
+  assert.equal(frames.at(-1)?.type, "stopped");
+  assert.equal(
+    frames.some((frame) => frame.event?.kind === "meeting.closed"),
+    false,
+  );
+  assert.ok(vault !== undefined);
+  assert.ok(configuration !== undefined);
+  assert.equal(vault.closed, true);
+  assert.equal(configuration.credentialLease.closed, true);
+  assert.equal(text.includes("eof-secret"), false);
+});
+
+test("host-main exits cleanly on stdin EOF without echoing initialization credentials", async () => {
+  const hostMain = fileURLToPath(new URL("../host-main.js", import.meta.url));
+  const child = spawn(process.execPath, [hostMain], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PI_ROUNDTABLE_MEETING_ID: "meeting-local-test",
+      PI_ROUNDTABLE_RUNTIME_ID: "runtime.child-eof",
+      PI_ROUNDTABLE_RUNTIME_GENERATION: "1",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.end(`${JSON.stringify({
+    type: "initialize",
+    requestId: "init-child-eof",
+    workspace: TEST_WORKSPACE,
+    session: TEST_SESSION,
+    credentials: { "memory://provider.test": "child-process-secret" },
+    initialSequence: 0,
+  })}\n`);
+  const exitCode = await withTimeout(
+    new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    }),
+    "host-main should exit after stdin EOF",
+    5_000,
+  );
+
+  assert.equal(exitCode, 0, stderr);
+  const frames = stdout.trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+  assert.equal(frames[0]?.type, "ready");
+  assert.equal(frames.at(-1)?.type, "stopped");
+  assert.equal(stdout.includes("child-process-secret"), false);
+  assert.equal(stderr.includes("child-process-secret"), false);
+});
+
+test("host-main exits after explicit shutdown even while its stdin pipe remains open", async () => {
+  const hostMain = fileURLToPath(new URL("../host-main.js", import.meta.url));
+  const child = spawn(process.execPath, [hostMain], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      PI_ROUNDTABLE_MEETING_ID: "meeting-local-test",
+      PI_ROUNDTABLE_RUNTIME_ID: "runtime.child-shutdown",
+      PI_ROUNDTABLE_RUNTIME_GENERATION: "1",
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.write(`${JSON.stringify({
+    type: "initialize",
+    requestId: "init-child-shutdown",
+    workspace: TEST_WORKSPACE,
+    session: TEST_SESSION,
+    credentials: { "memory://provider.test": "child-shutdown-secret" },
+    initialSequence: 0,
+  })}\n${JSON.stringify({
+    type: "shutdown",
+    requestId: "stop-child-shutdown",
+    mode: "suspend",
+  })}\n`);
+
+  const exitCode = await withTimeout(
+    new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    }),
+    "host-main should exit after explicit shutdown",
+    5_000,
+  );
+
+  assert.equal(exitCode, 0, stderr);
+  const frames = stdout.trim().split("\n").map((line) => JSON.parse(line) as {
+    type: string;
+    requestId?: string | null;
+  });
+  assert.equal(frames[0]?.type, "ready");
+  assert.equal(frames.at(-1)?.type, "stopped");
+  assert.equal(frames.at(-1)?.requestId, "stop-child-shutdown");
+  assert.equal(stdout.includes("child-shutdown-secret"), false);
+  assert.equal(stderr.includes("child-shutdown-secret"), false);
+});
+
 test("routes a private tool approval decision to the owning role", async () => {
   const { host, adapters } = createHost();
   const events: Array<{
@@ -1646,6 +2677,7 @@ test("runs at most two isolated SubAgents and returns results only to the parent
       }))).status, "accepted");
     }
     await waitFor(() => runner.requests.length === 2, "both SubAgents should start");
+    assert.equal(runner.requests.every((request) => request.runtimeGeneration === 1), true);
     const limited = await host.execute(command("subagent.spawn", "spawn-3-limited", {
       actorId: "participant.secretary",
       payload: { task: "must wait for a free slot" },
@@ -2298,6 +3330,236 @@ test("drops retained adapter callbacks as soon as stop is requested", async () =
     "runtime.lease_acquired",
     "runtime.lease_released",
   ]);
+});
+
+test("drops retained callbacks after removing and recreating the same role", async () => {
+  const adapters: FakeRuntimeAdapter[] = [];
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 5,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.push(adapter);
+      return adapter;
+    },
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-first-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+    payload: { displayName: "First role" },
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-reused-role", {
+    runtimeGeneration: 5,
+  }))).status, "accepted");
+  adapters[0]!.retainListenersAfterUnsubscribe = true;
+  assert.equal((await host.execute(command("role.remove", "remove-first-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "add-second-role", {
+    actorId: "role.reused",
+    runtimeGeneration: 5,
+    payload: { displayName: "Second role" },
+  }))).status, "accepted");
+
+  adapters[0]!.emit("tool.approval_requested", { approvalId: "stale" }, "stale-command");
+  assert.equal(events.some((event) =>
+    event.kind === "tool.approval_requested" && event.payload.approvalId === "stale"), false);
+  adapters[1]!.emit("tool.approval_requested", { approvalId: "fresh" }, "fresh-command");
+  assert.equal(events.some((event) =>
+    event.kind === "tool.approval_requested" && event.payload.approvalId === "fresh"), true);
+  await host.stop();
+});
+
+test("drops a queued public turn after its target role is recreated", async () => {
+  const adapters = new Map<string, FakeRuntimeAdapter[]>();
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      const versions = adapters.get(roleId) ?? [];
+      versions.push(adapter);
+      adapters.set(roleId, versions);
+      return adapter;
+    },
+  });
+  let removing: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  let adding: Promise<import("@pi-roundtable/protocol").CommandReceipt> | undefined;
+  host.subscribe((event) => {
+    if (event.kind === "speech.completed" && event.actorId === "role.first") {
+      removing = host.execute(command("role.remove", "remove-queued-target", {
+        actorId: "role.second",
+      }));
+      adding = host.execute(command("role.add", "readd-queued-target", {
+        actorId: "role.second",
+        payload: { displayName: "Second role, new session" },
+      }));
+    }
+  });
+  host.start();
+  await host.execute(command("role.add", "add-first-queued-role", {
+    actorId: "role.first",
+    payload: { displayName: "First role" },
+  }));
+  await host.execute(command("role.add", "add-second-queued-role", {
+    actorId: "role.second",
+    payload: { displayName: "Second role" },
+  }));
+  await host.execute(command("meeting.open", "open-queued-role-test"));
+  await host.execute(command("speech.broadcast", "queued-role-broadcast", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "Both roles should answer in order.",
+      mentions: ["role.first", "role.second"],
+    },
+  }));
+  const first = adapters.get("role.first")?.[0];
+  const firstTurn = first?.commands.at(-1);
+  assert.equal(firstTurn?.kind, "turn.prompt");
+  const correlationId = firstTurn?.commandId;
+  assert.ok(correlationId !== undefined);
+  first?.emit("turn.started", {}, correlationId);
+  first?.emit("turn.completed", {}, correlationId);
+  await waitFor(() => removing !== undefined && adding !== undefined, "role replacement should queue");
+  assert.equal((await removing!).status, "accepted");
+  assert.equal((await adding!).status, "accepted");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const replacement = adapters.get("role.second")?.[1];
+  assert.ok(replacement !== undefined);
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" &&
+    runtimeCommand.commandId === "queued-role-broadcast:2"), false);
+  await host.stop();
+});
+
+test("aborts SubAgents when their parent role is removed", async () => {
+  const runner = new AbortAwareSubagentRunner();
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 6,
+    subagentRunner: runner,
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  assert.equal((await host.execute(command("role.add", "add-removable-parent", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("meeting.open", "open-removable-parent", {
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("subagent.spawn", "spawn-removable-child", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+    payload: { task: "wait until the parent is removed" },
+  }))).status, "accepted");
+  await waitFor(() => runner.requests.length === 1, "the child should start");
+  assert.equal(runner.requests[0]?.runtimeGeneration, 6);
+
+  assert.equal((await host.execute(command("role.remove", "remove-subagent-parent", {
+    actorId: "participant.secretary",
+    runtimeGeneration: 6,
+  }))).status, "accepted");
+  assert.equal(runner.signals[0]?.aborted, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(events.some((event) =>
+    event.kind === "subagent.completed" || event.kind === "subagent.failed"), false);
+  await host.stop();
+});
+
+test("drops a completed SubAgent continuation after its parent role is recreated", async () => {
+  const runner = new ControlledSubagentRunner();
+  const adapters: FakeRuntimeAdapter[] = [];
+  const events: MeetingEvent[] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    subagentRunner: runner,
+    adapterFactory: (roleId) => {
+      const adapter = new FakeRuntimeAdapter(roleId);
+      adapters.push(adapter);
+      return adapter;
+    },
+  });
+  const session = structuredClone(RESUME_SESSION);
+  session.phase = "draft";
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, session, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.subscribe((event) => events.push(event));
+  host.start();
+  await host.execute(command("role.add", "add-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }));
+  await host.execute(command("meeting.open", "open-stale-subagent-parent"));
+  await host.execute(command("speech.broadcast", "occupy-stale-subagent-parent", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "Hold the public turn while the delegated task finishes.",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const oldParent = adapters[0];
+  const activeTurn = oldParent?.commands.at(-1);
+  assert.equal(activeTurn?.kind, "turn.prompt");
+  const activeCorrelationId = activeTurn?.commandId;
+  assert.ok(activeCorrelationId !== undefined);
+  oldParent?.emit("turn.started", {}, activeCorrelationId);
+  await host.execute(command("subagent.spawn", "spawn-stale-continuation", {
+    actorId: "participant.secretary",
+    payload: { task: "produce a result for only this role session" },
+  }));
+  await waitFor(() => runner.pending.length === 1, "SubAgent should be running");
+  runner.pending[0]!.resolve("old-session-only-result");
+  await waitFor(() => events.some((event) =>
+    event.kind === "subagent.completed" && event.actorId === "participant.secretary"),
+  "SubAgent completion should be queued behind the active parent turn");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal((await host.execute(command("role.remove", "remove-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  assert.equal((await host.execute(command("role.add", "readd-stale-subagent-parent", {
+    actorId: "participant.secretary",
+  }))).status, "accepted");
+  const replacement = adapters[1];
+  assert.ok(replacement !== undefined);
+  await host.execute(command("speech.broadcast", "drive-new-parent-turn", {
+    actorId: "user.direct_host",
+    payload: {
+      message: "This is a new role session.",
+      mentions: ["participant.secretary"],
+    },
+  }));
+  const replacementTurn = replacement.commands.at(-1);
+  assert.equal(replacementTurn?.kind, "turn.prompt");
+  const replacementCorrelationId = replacementTurn?.commandId;
+  assert.ok(replacementCorrelationId !== undefined);
+  replacement.emit("turn.started", {}, replacementCorrelationId);
+  replacement.emit("turn.completed", {}, replacementCorrelationId);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(replacement.commands.some((runtimeCommand) =>
+    runtimeCommand.kind === "turn.prompt" &&
+    (runtimeCommand.commandId.startsWith("subagent-result:") ||
+      runtimeCommand.message.includes("old-session-only-result"))), false);
+  await host.stop();
 });
 
 test("drops an already-queued internal continuation once stop is requested", async () => {

@@ -40,17 +40,21 @@ public sealed partial class MainWindow : Window
     private bool _privateFollowsLatest = true;
     private int _publicForcePassesRemaining;
     private int _privateForcePassesRemaining;
-    private readonly WindowsUpdateService _updateService = new();
+    private readonly WindowsApplicationCompositionRoot _compositionRoot;
+    private readonly WindowsUpdateService _updateService;
     private VerifiedUpdateManifest? _availableUpdate;
     private CancellationTokenSource? _updateOperationCancellation;
+    private Task? _updateOperationTask;
     private readonly DispatcherQueueTimer _toolApprovalDeadlineTimer;
 
     public MainViewModel ViewModel { get; }
 
-    public MainWindow()
+    internal MainWindow(WindowsApplicationCompositionRoot compositionRoot)
     {
+        _compositionRoot = compositionRoot ?? throw new ArgumentNullException(nameof(compositionRoot));
         InitializeComponent();
-        ViewModel = new MainViewModel(DispatcherQueue);
+        _updateService = _compositionRoot.UpdateService;
+        ViewModel = _compositionRoot.CreateMainViewModel(DispatcherQueue);
         RootDataContext = ViewModel;
         ViewModel.PendingToolApprovals.CollectionChanged += PendingToolApprovals_CollectionChanged;
         _toolApprovalDeadlineTimer = DispatcherQueue.CreateTimer();
@@ -1235,16 +1239,19 @@ public sealed partial class MainWindow : Window
 
     private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
     {
-        if (_updateOperationCancellation is not null)
+        if (_shutdownStarted || _updateOperationCancellation is not null)
         {
             return;
         }
-        _updateOperationCancellation = new CancellationTokenSource();
+        var cancellation = new CancellationTokenSource();
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _updateOperationCancellation = cancellation;
+        _updateOperationTask = completion.Task;
         SetUpdateControlsBusy(true);
         UpdateStatusText.Text = "正在下载并验证签名更新清单…";
         try
         {
-            var result = await _updateService.CheckAsync(_updateOperationCancellation.Token);
+            var result = await _updateService.CheckAsync(cancellation.Token);
             if (result.Availability == UpdateAvailability.Available)
             {
                 _availableUpdate = result.Manifest;
@@ -1273,15 +1280,32 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _updateOperationCancellation.Dispose();
-            _updateOperationCancellation = null;
-            SetUpdateControlsBusy(false);
+            try
+            {
+                cancellation.Dispose();
+                if (ReferenceEquals(_updateOperationCancellation, cancellation))
+                {
+                    _updateOperationCancellation = null;
+                }
+                if (!_shutdownStarted)
+                {
+                    SetUpdateControlsBusy(false);
+                }
+            }
+            finally
+            {
+                completion.TrySetResult();
+                if (ReferenceEquals(_updateOperationTask, completion.Task))
+                {
+                    _updateOperationTask = null;
+                }
+            }
         }
     }
 
     private async void InstallUpdate_Click(object sender, RoutedEventArgs e)
     {
-        if (_availableUpdate is null || _updateOperationCancellation is not null)
+        if (_shutdownStarted || _availableUpdate is null || _updateOperationCancellation is not null)
         {
             return;
         }
@@ -1295,13 +1319,21 @@ public sealed partial class MainWindow : Window
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
         };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+        var dialogResult = await dialog.ShowAsync();
+        if (_shutdownStarted)
+        {
+            return;
+        }
+        if (dialogResult != ContentDialogResult.Primary)
         {
             InstallUpdateButton.Focus(FocusState.Programmatic);
             return;
         }
 
-        _updateOperationCancellation = new CancellationTokenSource();
+        var cancellation = new CancellationTokenSource();
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _updateOperationCancellation = cancellation;
+        _updateOperationTask = completion.Task;
         SetUpdateControlsBusy(true);
         UpdateProgressBar.Value = 0;
         UpdateProgressBar.Visibility = Visibility.Visible;
@@ -1316,7 +1348,7 @@ public sealed partial class MainWindow : Window
             var staged = await _updateService.DownloadAndStageAsync(
                 manifest,
                 progress,
-                _updateOperationCancellation.Token);
+                cancellation.Token);
             using var helper = _updateService.LaunchInstallerHelper(staged);
             UpdateStatusText.Text = "更新包已验证；正在安全结束客户端并移交 Windows Installer…";
             Close();
@@ -1332,12 +1364,26 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _updateOperationCancellation?.Dispose();
-            _updateOperationCancellation = null;
-            if (!_shutdownStarted)
+            try
             {
-                SetUpdateControlsBusy(false);
-                UpdateProgressBar.Visibility = Visibility.Collapsed;
+                cancellation.Dispose();
+                if (ReferenceEquals(_updateOperationCancellation, cancellation))
+                {
+                    _updateOperationCancellation = null;
+                }
+                if (!_shutdownStarted)
+                {
+                    SetUpdateControlsBusy(false);
+                    UpdateProgressBar.Visibility = Visibility.Collapsed;
+                }
+            }
+            finally
+            {
+                completion.TrySetResult();
+                if (ReferenceEquals(_updateOperationTask, completion.Task))
+                {
+                    _updateOperationTask = null;
+                }
             }
         }
     }
@@ -1489,14 +1535,23 @@ public sealed partial class MainWindow : Window
         _toolApprovalDeadlineTimer.Stop();
         ViewModel.PendingToolApprovals.CollectionChanged -= PendingToolApprovals_CollectionChanged;
         _updateOperationCancellation?.Cancel();
+        var updateOperation = _updateOperationTask;
         try
         {
-            await ViewModel.DisposeAsync();
+            var disposeViewModel = ViewModel.DisposeAsync().AsTask();
+            if (updateOperation is null)
+            {
+                await disposeViewModel;
+            }
+            else
+            {
+                await Task.WhenAll(disposeViewModel, updateOperation);
+            }
         }
         finally
         {
             ViewModel.TerminateRuntimeForAppExit();
-            _updateService.Dispose();
+            _compositionRoot.Dispose();
             _shutdownComplete = true;
             Close();
         }

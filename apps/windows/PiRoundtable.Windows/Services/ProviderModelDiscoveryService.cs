@@ -5,7 +5,7 @@ using PiRoundtable.Windows.Models;
 
 namespace PiRoundtable.Windows.Services;
 
-internal sealed class ProviderModelDiscoveryService
+internal sealed class ProviderModelDiscoveryService : IDisposable
 {
     private const int MaxResponseBytes = 4 * 1024 * 1024;
     private const int MaxPages = 10;
@@ -257,4 +257,6 @@ internal sealed class ProviderModelDiscoveryService
             ? value
             : null;
     }
+
+    public void Dispose() => _httpClient.Dispose();
 }
