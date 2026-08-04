@@ -77,6 +77,27 @@ export {
   type PiPluginCompatibilityMode,
   type ResolvedPiPluginSet,
 } from "./pi-plugin-compatibility.js";
+export {
+  WorkspaceProviderCapabilityRegistry,
+  type ProviderCapabilityRegistry,
+  type ProviderCapabilityResolutionRequest,
+  type ResolvedProviderModelRoute,
+} from "./provider-capability-registry.js";
+export {
+  WorkspaceCapabilityResolver,
+  type CapabilityResolver,
+  type CredentialReferenceResolver,
+  type ResolvedRoleCapabilities,
+  type RoleCapabilityResolutionRequest,
+  type WorkspaceCapabilityResolverOptions,
+} from "./capability-resolver.js";
+export {
+  DefaultRoleContextAssembler,
+  type DefaultRoleContextAssemblerOptions,
+  type ResolvedRoleRuntimeConfiguration,
+  type RoleContextAssembler,
+  type RoleContextAssemblyRequest,
+} from "./role-context-assembler.js";
 export type {
   RuntimeAdapter,
   RuntimeCapabilities,
