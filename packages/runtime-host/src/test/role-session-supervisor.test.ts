@@ -4,6 +4,7 @@ import test from "node:test";
 import type { RoleScope } from "@pi-roundtable/protocol";
 
 import { RoleSessionSupervisor } from "../role-session-supervisor.js";
+import { RoleCredentialLease } from "../role-credential-lease.js";
 import type {
   RuntimeAdapter,
   RuntimeCommand,
@@ -292,6 +293,74 @@ test("rejects failed startup without retaining role resources", async () => {
   assert.equal(adapter.stopCount, 1);
 });
 
+test("zeroizes a real credential lease when role startup fails", async () => {
+  const adapter = new FakeAdapter("role.failed-secret");
+  adapter.startPromise = Promise.reject(new Error("controlled startup failure"));
+  const lease = new RoleCredentialLease({
+    roleId: "role.failed-secret",
+    runtimeGeneration: 21,
+    providerId: "provider.test",
+    apiKey: "failed-start-secret",
+    mcpServers: [],
+  });
+  const supervisor = new RoleSessionSupervisor<{ credentialLease: RoleCredentialLease }>({
+    runtimeGeneration: 21,
+    rootStopSignal: new AbortController().signal,
+    adapterFactory: () => adapter,
+    onEvent: () => undefined,
+    releaseConfiguration: (configuration) => configuration.credentialLease.close(),
+  });
+
+  await assert.rejects(
+    supervisor.startRole({
+      roleId: "role.failed-secret",
+      displayName: "Failed secret role",
+      scope: "long_term",
+      configuration: { credentialLease: lease },
+    }),
+    /controlled startup failure/,
+  );
+  assert.equal(lease.closed, true);
+  assert.equal(lease.zeroizedSecretCount, lease.ownedSecretCount);
+});
+
+test("zeroizes a real credential lease when root cancellation wins startup", async () => {
+  const root = new AbortController();
+  const adapter = new FakeAdapter("role.cancelled-secret");
+  adapter.startPromise = new Promise<RuntimeSessionInfo>(() => undefined);
+  const lease = new RoleCredentialLease({
+    roleId: "role.cancelled-secret",
+    runtimeGeneration: 22,
+    providerId: "provider.test",
+    apiKey: "cancelled-start-secret",
+    mcpServers: [],
+  });
+  const supervisor = new RoleSessionSupervisor<{ credentialLease: RoleCredentialLease }>({
+    runtimeGeneration: 22,
+    rootStopSignal: root.signal,
+    adapterFactory: () => adapter,
+    onEvent: () => undefined,
+    releaseConfiguration: (configuration) => configuration.credentialLease.close(),
+  });
+  const starting = supervisor.startRole({
+    roleId: "role.cancelled-secret",
+    displayName: "Cancelled secret role",
+    scope: "long_term",
+    configuration: { credentialLease: lease },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  root.abort();
+  assert.deepEqual(await starting, { status: "stop_requested" });
+  for (let attempt = 0; attempt < 10 && !lease.closed; ++attempt) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.equal(lease.closed, true);
+  assert.equal(lease.zeroizedSecretCount, lease.ownedSecretCount);
+  assert.equal(adapter.stopCount, 1);
+  await supervisor.stopAll();
+});
+
 test("releases rejected definitions and keeps credential configuration off session views", async () => {
   const root = new AbortController();
   const released: TestConfiguration[] = [];
@@ -493,6 +562,44 @@ test("contains stopAll reentry from adapter factory and subscription setup", asy
     assert.equal(releases, 1);
     assert.deepEqual(await supervisor.stopAll(), []);
   }
+});
+
+test("a factory-reentrant stopAll promise waits for the early adapter retirement", async () => {
+  const root = new AbortController();
+  const adapter = new FakeAdapter("role.factory-stop-barrier");
+  const stopGate = deferred<void>();
+  adapter.onStop = () => stopGate.promise;
+  let releases = 0;
+  let reentrantStop!: Promise<unknown>;
+  let supervisor!: RoleSessionSupervisor<TestConfiguration>;
+  supervisor = new RoleSessionSupervisor<TestConfiguration>({
+    runtimeGeneration: 21,
+    rootStopSignal: root.signal,
+    adapterFactory: () => {
+      reentrantStop = supervisor.stopAll();
+      return adapter;
+    },
+    onEvent: () => undefined,
+    releaseConfiguration: () => {
+      ++releases;
+    },
+  });
+
+  const starting = supervisor.startRole(definition("role.factory-stop-barrier"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  let stopAllSettled = false;
+  void reentrantStop.then(() => {
+    stopAllSettled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(adapter.stopCount, 1);
+  assert.equal(releases, 1);
+  assert.equal(stopAllSettled, false);
+
+  stopGate.resolve();
+  assert.deepEqual(await starting, { status: "stop_requested" });
+  await reentrantStop;
+  assert.equal(stopAllSettled, true);
 });
 
 test("publishes adapter stop single-flight before reentrant cleanup", async () => {

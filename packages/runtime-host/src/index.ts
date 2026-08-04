@@ -97,6 +97,12 @@ export {
   type WorkspaceCapabilityResolverOptions,
 } from "./capability-resolver.js";
 export {
+  RuntimeCredentialVault,
+  type RuntimeCredentialVaultFactory,
+} from "./runtime-credential-vault.js";
+export { ZeroizableUtf8Secret } from "./zeroizable-utf8-secret.js";
+export { RoleCredentialLease, type RoleCredentialLeaseOptions } from "./role-credential-lease.js";
+export {
   DefaultRoleContextAssembler,
   type DefaultRoleContextAssemblerOptions,
   type ResolvedRoleRuntimeConfiguration,

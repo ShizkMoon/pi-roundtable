@@ -4,6 +4,7 @@ import test from "node:test";
 import type { AgentSessionEvent, PromptOptions } from "@earendil-works/pi-coding-agent";
 
 import {
+  MemoryCredentialStore,
   normalizeProviderEndpoint,
   PiRuntimeAdapter,
   type PiSessionCreateOptions,
@@ -18,6 +19,7 @@ class FakePiSession implements PiSessionHandle {
   readonly followUps: string[] = [];
   abortCount = 0;
   disposed = false;
+  disposeError: Error | undefined;
   streaming = false;
   promptResult: Promise<void> | undefined;
   #listener: ((event: AgentSessionEvent) => void) | undefined;
@@ -59,14 +61,55 @@ class FakePiSession implements PiSessionHandle {
     ++this.abortCount;
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
+    if (this.disposeError !== undefined) {
+      throw this.disposeError;
+    }
   }
 
   emit(event: AgentSessionEvent): void {
     this.#listener?.(event);
   }
 }
+
+test("in-memory credential updates preserve the current value when the updater returns undefined", async () => {
+  const store = new MemoryCredentialStore("provider.test", "original-key");
+
+  const result = await store.modify("provider.test", async () => undefined);
+
+  assert.deepEqual(result, { type: "api_key", key: "original-key" });
+  assert.deepEqual(await store.read("provider.test"), {
+    type: "api_key",
+    key: "original-key",
+  });
+  await store.delete("provider.test");
+  assert.equal(await store.read("provider.test"), undefined);
+});
+
+test("in-memory credential writes are serialized per provider including deletion", async () => {
+  const store = new MemoryCredentialStore("provider.test", "original-key");
+  const firstEntered = deferred<void>();
+  const releaseFirst = deferred<void>();
+  let secondObservedKey: string | undefined;
+  const first = store.modify("provider.test", async () => {
+    firstEntered.resolve();
+    await releaseFirst.promise;
+    return { type: "api_key", key: "first-key" };
+  });
+  await firstEntered.promise;
+  const second = store.modify("provider.test", async (current) => {
+    secondObservedKey = current?.type === "api_key" ? current.key : undefined;
+    return { type: "api_key", key: "second-key" };
+  });
+  const deletion = store.delete("provider.test");
+
+  releaseFirst.resolve();
+  await Promise.all([first, second, deletion]);
+
+  assert.equal(secondObservedKey, "first-key");
+  assert.equal(await store.read("provider.test"), undefined);
+});
 
 function deferred<T>(): {
   promise: Promise<T>;
@@ -312,6 +355,12 @@ test("validates provider endpoints before they reach the Pi model runtime", () =
 });
 
 test("creates an offline Pi session for a discovered DeepSeek-compatible model", async () => {
+  const originalFetch = globalThis.fetch;
+  let networkCalls = 0;
+  globalThis.fetch = async () => {
+    ++networkCalls;
+    throw new Error("offline test intercepted an unexpected network request");
+  };
   const adapter = new PiRuntimeAdapter({
     runtimeId: "runtime-deepseek-offline",
     sessionId: "session-deepseek-offline",
@@ -329,10 +378,42 @@ test("creates an offline Pi session for a discovered DeepSeek-compatible model",
     credentialProvider: { resolveApiKey: async () => "offline-test-key" },
   });
 
-  const info = await adapter.start();
-  assert.equal(info.engine, "pi");
-  assert.equal(info.sessionId, "session-deepseek-offline");
-  await adapter.stop();
+  try {
+    const info = await adapter.start();
+    assert.equal(info.engine, "pi");
+    assert.equal(info.sessionId, "session-deepseek-offline");
+    await adapter.stop();
+    assert.equal(networkCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("returns to stopped state when startup cleanup itself rejects", async () => {
+  let createCount = 0;
+  const factory: PiSessionFactory = {
+    async create(options) {
+      ++createCount;
+      const session = new FakePiSession("mismatched-session", [...options.tools]);
+      session.disposeError = new Error("controlled dispose failure");
+      return session;
+    },
+  };
+  const events: RuntimeEvent[] = [];
+  const adapter = new PiRuntimeAdapter({
+    sessionId: "expected-session",
+    roleId: "role.cleanup-failure",
+    providerId: "provider.test",
+    modelId: "model.test",
+    credentialProvider: { resolveApiKey: async () => "cleanup-secret" },
+    sessionFactory: factory,
+  });
+  adapter.subscribe((event) => events.push(event));
+
+  await assert.rejects(adapter.start(), /mismatched-session/);
+  await assert.rejects(adapter.start(), /mismatched-session/);
+  assert.equal(createCount, 2);
+  assert.equal(events.filter((event) => event.kind === "runtime.failed").length, 2);
 });
 
 test("exposes one asynchronous SubAgent tool without leaking the delegated task", async () => {
@@ -561,6 +642,112 @@ test("disposes a session when stop wins the startup race", async () => {
   await stopping;
   assert.equal(factory.session?.disposed, true);
   assert.deepEqual(events.map((event) => event.kind), ["runtime.stopped"]);
+});
+
+test("publishes the startup promise before a credential seam can stop reentrantly", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  let stopping: Promise<void> | undefined;
+  let adapter!: PiRuntimeAdapter;
+  adapter = new PiRuntimeAdapter({
+    sessionId: "session-reentrant-credential-stop",
+    roleId: "role.reentrant-credential-stop",
+    providerId: "openai",
+    modelId: "gpt-test",
+    credentialProvider: {
+      resolveApiKey: async () => {
+        stopping = adapter.stop();
+        return "test-key";
+      },
+    },
+    sessionFactory: factory,
+  });
+  adapter.subscribe((event) => events.push(event));
+
+  await assert.rejects(adapter.start(), /stopped before startup completed/);
+  await stopping;
+  assert.deepEqual(events.map((event) => event.kind), ["runtime.stopped"]);
+  assert.equal(factory.session?.disposed, true);
+});
+
+test("drops deprecated static MCP credential references when stopped before startup", async () => {
+  const factory = new FakePiSessionFactory();
+  const adapter = new PiRuntimeAdapter({
+    sessionId: "session-legacy-mcp-clear",
+    roleId: "role.legacy-mcp-clear",
+    providerId: "openai",
+    modelId: "gpt-test",
+    credentialProvider: { resolveApiKey: async () => "test-key" },
+    mcpServers: [{
+      serverId: "mcp.legacy",
+      displayName: "Legacy MCP",
+      transport: "streamable_http",
+      endpoint: "https://mcp.example.com/api",
+      headers: { Authorization: "Bearer legacy-secret" },
+      toolAllowlist: [],
+      approvalMode: "never",
+      executionMode: "direct",
+    }],
+    sessionFactory: factory,
+  });
+
+  await adapter.stop();
+  await adapter.start();
+  assert.deepEqual(factory.lastOptions?.mcpServers, []);
+  await adapter.stop();
+});
+
+test("does not revive deprecated static MCP credentials after a failed startup retry", async () => {
+  const factory = new FakePiSessionFactory();
+  let credentialAttempts = 0;
+  const adapter = new PiRuntimeAdapter({
+    sessionId: "session-legacy-mcp-failed-start",
+    roleId: "role.legacy-mcp-failed-start",
+    providerId: "openai",
+    modelId: "gpt-test",
+    credentialProvider: {
+      resolveApiKey: async () => {
+        ++credentialAttempts;
+        if (credentialAttempts === 1) {
+          throw new Error("controlled credential seam failure");
+        }
+        return "test-key";
+      },
+    },
+    mcpServers: [{
+      serverId: "mcp.legacy",
+      displayName: "Legacy MCP",
+      transport: "streamable_http",
+      endpoint: "https://mcp.example.com/api",
+      headers: { Authorization: "Bearer legacy-secret" },
+      toolAllowlist: [],
+      approvalMode: "never",
+      executionMode: "direct",
+    }],
+    sessionFactory: factory,
+  });
+
+  await assert.rejects(adapter.start(), /controlled credential seam failure/);
+  await adapter.start();
+  assert.deepEqual(factory.lastOptions?.mcpServers, []);
+  await adapter.stop();
+});
+
+test("a reentrant stop from runtime.ready makes startup fail without double disposal", async () => {
+  const factory = new FakePiSessionFactory();
+  const events: RuntimeEvent[] = [];
+  const adapter = createAdapter(factory, events);
+  let stopping: Promise<void> | undefined;
+  adapter.subscribe((event) => {
+    if (event.kind === "runtime.ready") {
+      stopping = adapter.stop();
+    }
+  });
+
+  await assert.rejects(adapter.start(), /stopped while publishing runtime readiness/);
+  await stopping;
+  assert.equal(factory.session?.disposed, true);
+  assert.deepEqual(events.map((event) => event.kind), ["runtime.ready", "runtime.stopped"]);
 });
 
 test("rejects concurrent prompts and suppresses late failures after stop", async () => {

@@ -81,6 +81,46 @@ export class StdioRuntimeHost {
     let initialized = false;
     let shutdownRequestId: string | null = null;
     let shutdownMode: LocalHostStopMode = "suspend";
+    let terminateAfterResponse = false;
+    let hostOperationPending = false;
+    let preemptiveStop: Promise<void> | undefined;
+    const requestPreemptiveStop = (
+      mode: LocalHostStopMode,
+      requestId: string | null,
+    ): void => {
+      setImmediate(() => {
+        // Give normally settling operations one turn to preserve FIFO behavior.
+        // A genuinely stalled adapter/planner is then fenced even though the
+        // sequential command loop has not yet consumed the shutdown/EOF.
+        if (!hostOperationPending || preemptiveStop !== undefined) {
+          return;
+        }
+        shutdownMode = mode;
+        shutdownRequestId = requestId;
+        preemptiveStop = this.host.stop(mode);
+        void preemptiveStop.catch(() => undefined);
+      });
+    };
+    const observeLineForShutdown = (line: string): void => {
+      if (!hostOperationPending || line.length === 0) {
+        return;
+      }
+      try {
+        const frame = parseLocalHostInput(line);
+        if (frame.type === "shutdown") {
+          requestPreemptiveStop(frame.mode, frame.requestId);
+        }
+      } catch {
+        // The ordered loop remains authoritative for parse errors.
+      }
+    };
+    const observeInputClose = (): void => {
+      if (hostOperationPending) {
+        requestPreemptiveStop("suspend", null);
+      }
+    };
+    lines.on("line", observeLineForShutdown);
+    lines.once("close", observeInputClose);
     try {
       for await (const line of lines) {
         if (line.length === 0) {
@@ -130,7 +170,12 @@ export class StdioRuntimeHost {
                 );
                 this.host.start();
                 if (frame.session.phase === "live") {
-                  await this.host.restoreConfiguredRoles();
+                  hostOperationPending = true;
+                  try {
+                    await this.host.restoreConfiguredRoles();
+                  } finally {
+                    hostOperationPending = false;
+                  }
                 }
                 initialized = true;
                 await writer.write({
@@ -148,6 +193,11 @@ export class StdioRuntimeHost {
                 outboundReady = true;
               } catch {
                 pendingInitializationFrames.length = 0;
+                // Initialization can already have created role adapters and
+                // credential leases. Treat failure as terminal so the final
+                // stop path closes them instead of retaining secrets while
+                // waiting for another frame on the same process.
+                terminateAfterResponse = true;
                 response = {
                   type: "error",
                   requestId: frame.requestId,
@@ -168,7 +218,12 @@ export class StdioRuntimeHost {
             shutdownMode = frame.mode;
             break;
           } else {
-            response = { type: "receipt", receipt: await this.host.execute(frame.command) };
+            hostOperationPending = true;
+            try {
+              response = { type: "receipt", receipt: await this.host.execute(frame.command) };
+            } finally {
+              hostOperationPending = false;
+            }
           }
         } catch (error) {
           response =
@@ -190,12 +245,30 @@ export class StdioRuntimeHost {
         if (response !== undefined) {
           await writer.write(response);
         }
+        if (terminateAfterResponse) {
+          break;
+        }
       }
     } finally {
-      await this.host.stop(shutdownMode);
-      unsubscribeEvents();
-      unsubscribeDiagnostics();
+      lines.off("line", observeLineForShutdown);
+      lines.off("close", observeInputClose);
+      // A protocol shutdown is authoritative even when the parent keeps its
+      // stdin pipe open. Release readline's input listeners so the Runtime Host
+      // process can finish instead of waiting indefinitely for EOF.
+      lines.close();
+      let stopFailure: unknown;
+      try {
+        await (preemptiveStop ?? this.host.stop(shutdownMode));
+      } catch (error) {
+        stopFailure = error;
+      } finally {
+        unsubscribeEvents();
+        unsubscribeDiagnostics();
+      }
       await writer.write({ type: "stopped", requestId: shutdownRequestId });
+      if (stopFailure !== undefined) {
+        throw stopFailure;
+      }
     }
   }
 }

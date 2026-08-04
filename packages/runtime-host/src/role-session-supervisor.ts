@@ -100,6 +100,7 @@ export class RoleSessionSupervisor<TConfiguration> {
   readonly #children = new Map<string, RoleChildRecord>();
   readonly #adapterStopPromises = new WeakMap<RuntimeAdapter, Promise<void>>();
   readonly #retirements = new Set<Promise<RoleSessionStopResult>>();
+  readonly #startupSettlements = new Set<Promise<void>>();
   readonly #onRootAbort = (): void => {
     this.#stopping = true;
     this.#abortAllScopes();
@@ -212,84 +213,108 @@ export class RoleSessionSupervisor<TConfiguration> {
       }
       throw new Error("Role session already exists or has an invalid identity");
     }
-    const roleId = definition.roleId;
-    const sessionToken = `${this.#runtimeGeneration}.${++this.#nextSessionToken}`;
-    const identity: RoleSessionIdentity = Object.freeze({
-      roleId: definition.roleId,
-      runtimeGeneration: this.#runtimeGeneration,
-      sessionToken,
+    let settleStartup!: () => void;
+    const startupSettlement = new Promise<void>((resolve) => {
+      settleStartup = resolve;
     });
-    let adapter: RuntimeAdapter;
+    this.#startupSettlements.add(startupSettlement);
     try {
-      adapter = this.#adapterFactory(identity, definition.configuration);
-    } catch (error) {
-      if (definition.configuration !== undefined) {
-        this.#tryReleaseConfiguration(definition.configuration);
+      const roleId = definition.roleId;
+      const sessionToken = `${this.#runtimeGeneration}.${++this.#nextSessionToken}`;
+      const identity: RoleSessionIdentity = Object.freeze({
+        roleId: definition.roleId,
+        runtimeGeneration: this.#runtimeGeneration,
+        sessionToken,
+      });
+      let adapter: RuntimeAdapter;
+      try {
+        adapter = this.#adapterFactory(identity, definition.configuration);
+      } catch (error) {
+        if (definition.configuration !== undefined) {
+          this.#tryReleaseConfiguration(definition.configuration);
+        }
+        throw error;
       }
-      throw error;
-    }
-    if (this.#stopping || this.#rootStopSignal.aborted) {
-      if (definition.configuration !== undefined) {
-        this.#tryReleaseConfiguration(definition.configuration);
-      }
-      await this.#stopAdapterWithGrace(adapter, Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS));
-      return { status: "stop_requested" };
-    }
-    const record: RoleSessionRecord<TConfiguration> = {
-      roleId,
-      displayName: definition.displayName,
-      scope: definition.scope,
-      ...(definition.configuration === undefined ? {} : { configuration: definition.configuration }),
-      runtimeGeneration: this.#runtimeGeneration,
-      sessionToken,
-      adapter,
-      controller: new AbortController(),
-      unsubscribe: () => undefined,
-      startupEvents: [],
-      configurationReleased: false,
-      retired: false,
-    };
-    try {
-      record.unsubscribe = adapter.subscribe((event) => this.#forwardEvent(record, event));
-    } catch (error) {
-      if (record.configuration !== undefined) {
-        record.configurationReleased = true;
-        this.#tryReleaseConfiguration(record.configuration);
-      }
-      await this.#stopAdapterWithGrace(adapter, Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS));
-      throw error;
-    }
-    if (this.#stopping || this.#rootStopSignal.aborted) {
-      record.retired = true;
-      record.controller.abort();
-      this.#tryUnsubscribe(record.unsubscribe);
-      this.#releaseRecordConfiguration(record);
-      await this.#stopAdapterWithGrace(adapter, Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS));
-      return { status: "stop_requested" };
-    }
-    // Register before start so root stop and stopAll own a stalled startup.
-    this.#sessions.set(record.roleId, record);
-    try {
-      const outcome = await raceWithAbort(Promise.resolve().then(() => adapter.start()), record.controller.signal);
-      if (
-        outcome.kind === "aborted" ||
-        this.#stopping ||
-        this.#rootStopSignal.aborted ||
-        !this.#isCurrent(record)
-      ) {
-        void this.#retire(record);
+      if (this.#stopping || this.#rootStopSignal.aborted) {
+        if (definition.configuration !== undefined) {
+          this.#tryReleaseConfiguration(definition.configuration);
+        }
+        await this.#stopAdapterWithGrace(
+          adapter,
+          Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS),
+        );
         return { status: "stop_requested" };
       }
-      record.info = outcome.value;
-      this.#flushStartupEvents(record);
-      if (this.#stopping || this.#rootStopSignal.aborted || !this.#isCurrent(record)) {
+      const record: RoleSessionRecord<TConfiguration> = {
+        roleId,
+        displayName: definition.displayName,
+        scope: definition.scope,
+        ...(definition.configuration === undefined
+          ? {}
+          : { configuration: definition.configuration }),
+        runtimeGeneration: this.#runtimeGeneration,
+        sessionToken,
+        adapter,
+        controller: new AbortController(),
+        unsubscribe: () => undefined,
+        startupEvents: [],
+        configurationReleased: false,
+        retired: false,
+      };
+      try {
+        record.unsubscribe = adapter.subscribe((event) => this.#forwardEvent(record, event));
+      } catch (error) {
+        if (record.configuration !== undefined) {
+          record.configurationReleased = true;
+          this.#tryReleaseConfiguration(record.configuration);
+        }
+        await this.#stopAdapterWithGrace(
+          adapter,
+          Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS),
+        );
+        throw error;
+      }
+      if (this.#stopping || this.#rootStopSignal.aborted) {
+        record.retired = true;
+        record.controller.abort();
+        this.#tryUnsubscribe(record.unsubscribe);
+        this.#releaseRecordConfiguration(record);
+        await this.#stopAdapterWithGrace(
+          adapter,
+          Math.min(this.#stopGraceMs, STARTUP_STOP_GRACE_MS),
+        );
+        return { status: "stop_requested" };
+      }
+      // Register before start so root stop and stopAll own a stalled startup.
+      this.#sessions.set(record.roleId, record);
+      try {
+        const outcome = await raceWithAbort(
+          Promise.resolve().then(() => adapter.start()),
+          record.controller.signal,
+        );
+        if (
+          outcome.kind === "aborted" ||
+          this.#stopping ||
+          this.#rootStopSignal.aborted ||
+          !this.#isCurrent(record)
+        ) {
+          void this.#retire(record);
+          return { status: "stop_requested" };
+        }
+        record.info = outcome.value;
+        this.#flushStartupEvents(record);
+        if (this.#stopping || this.#rootStopSignal.aborted || !this.#isCurrent(record)) {
+          await this.#retire(record);
+          return { status: "stop_requested" };
+        }
+        return { status: "started", session: this.#view(record) };
+      } catch (error) {
         await this.#retire(record);
-        return { status: "stop_requested" };
+        throw error;
       }
-      return { status: "started", session: this.#view(record) };
-    } catch (error) {
-      await this.#retire(record);
-      throw error;
+    } finally {
+      settleStartup();
+      this.#startupSettlements.delete(startupSettlement);
     }
   }
 
@@ -333,7 +358,9 @@ export class RoleSessionSupervisor<TConfiguration> {
     this.#abortAllScopes();
     const records = [...this.#sessions.values()];
     const current = records.map((record) => this.#retire(record));
-    const operation = Promise.all([...new Set([...this.#retirements, ...current])]);
+    const retirements = Promise.all([...new Set([...this.#retirements, ...current])]);
+    const startupSettlements = Promise.all([...this.#startupSettlements]);
+    const operation = Promise.all([retirements, startupSettlements]).then(([results]) => results);
     this.#stopAllPromise = operation.finally(() => this.#detachRootAbortListener());
     return this.#stopAllPromise;
   }
@@ -603,6 +630,18 @@ export class RoleSessionSupervisor<TConfiguration> {
     } catch (error) {
       rejectStop(error);
     }
+    void stopPromise.then(
+      () => {
+        if (this.#adapterStopPromises.get(adapter) === stopPromise) {
+          this.#adapterStopPromises.delete(adapter);
+        }
+      },
+      () => {
+        if (this.#adapterStopPromises.get(adapter) === stopPromise) {
+          this.#adapterStopPromises.delete(adapter);
+        }
+      },
+    );
     return stopPromise;
   }
 
