@@ -81,8 +81,13 @@ function validateEndpoint(
 ): void {
   if (value === undefined) return;
   try {
+    if (value.length > 2048 || /[\s\u0000-\u001f\u007f]/u.test(value) || value.includes("?") || value.includes("#")) {
+      throw new Error("unsafe raw endpoint");
+    }
     const endpoint = new URL(value);
-    const isLoopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(endpoint.hostname);
+    const hostname = endpoint.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const isLoopback = hostname === "localhost" || hostname === "::1" ||
+      /^127(?:\.\d{1,3}){3}$/.test(hostname);
     if (
       endpoint.username !== "" ||
       endpoint.password !== "" ||
@@ -94,7 +99,7 @@ function validateEndpoint(
     issues.push({
       path,
       code: "invalid_endpoint",
-      message: "Endpoints must use HTTPS, or HTTP on loopback, and cannot contain URI userinfo.",
+      message: "Endpoints must use HTTPS, or HTTP on loopback, and cannot contain URI userinfo, query, or fragment.",
     });
   }
 }

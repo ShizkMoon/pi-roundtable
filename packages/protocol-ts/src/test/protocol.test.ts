@@ -10,6 +10,7 @@ import {
   FLOOR_REQUEST_KINDS,
   isMeetingCommandKind,
   isMeetingEventKind,
+  isValidMeetingEventKind,
   isRoleScope,
   MEETING_COMMAND_KINDS,
   MEETING_EVENT_KINDS,
@@ -140,6 +141,49 @@ test("role lifecycle event kinds are part of protocol v1", () => {
     assert.equal(MEETING_EVENT_KINDS.some((candidate) => candidate === kind), true);
   }
   assert.equal(isMeetingEventKind("vendor.role.spawned"), false);
+  assert.equal(isValidMeetingEventKind("vendor.role_spawned"), true);
+  assert.equal(isValidMeetingEventKind("vendor"), false);
+});
+
+test("wire validation accepts additive namespaced event kinds without treating them as known reducer transitions", () => {
+  const event = {
+    protocolVersion: 1,
+    meetingId: "meeting.future",
+    eventId: "event.future",
+    sequence: 1,
+    runtimeGeneration: 1,
+    kind: "vendor.future_event",
+    occurredAt: "2026-08-04T00:00:00.000Z",
+    visibility: "public",
+    payload: {},
+  };
+  assert.deepEqual(validateMeetingEvent(event), []);
+  assert.equal(isMeetingEventKind(event.kind), false);
+  assert.ok(validateMeetingEvent({ ...event, kind: "vendor" }).some((issue) => issue.path === "kind"));
+  assert.ok(validateMeetingEvent({ ...event, kind: "Vendor.future" }).some((issue) => issue.path === "kind"));
+  assert.ok(validateMeetingEvent({ ...event, occurredAt: "2026-08-04" }).some((issue) => issue.path === "occurredAt"));
+  assert.ok(validateMeetingEvent({ ...event, occurredAt: "0" }).some((issue) => issue.path === "occurredAt"));
+});
+
+test("workspace endpoints reject query and fragment while accepting the full IPv4 loopback range", () => {
+  const workspace = createWorkspace();
+  workspace.providers[0]!.endpoint = "http://127.0.2.4/v1";
+  assert.deepEqual(validateWorkspaceProfile(workspace), []);
+  workspace.providers[0]!.endpoint = "https://api.example.com/v1?token=not-allowed";
+  assert.ok(validateWorkspaceProfile(workspace).some((issue) => issue.code === "invalid_endpoint"));
+  workspace.providers[0]!.endpoint = "https://api.example.com/v1#fragment";
+  assert.ok(validateWorkspaceProfile(workspace).some((issue) => issue.code === "invalid_endpoint"));
+  for (const endpoint of [
+    "https://api.example.com/v1?",
+    "https://api.example.com/v1#",
+    "https://api.example.com/v1 x",
+    `https://api.example.com/${"x".repeat(2049)}`,
+  ]) {
+    workspace.providers[0]!.endpoint = endpoint;
+    assert.ok(validateWorkspaceProfile(workspace).some((issue) => issue.code === "invalid_endpoint"));
+  }
+  workspace.providers[0]!.endpoint = "http://[::ffff:127.0.0.1]/v1";
+  assert.ok(validateWorkspaceProfile(workspace).some((issue) => issue.code === "invalid_endpoint"));
 });
 
 test("role lifecycle commands and scopes are recognized", () => {

@@ -14,6 +14,43 @@ function ConvertTo-XmlAttribute {
     return [System.Security.SecurityElement]::Escape($Value)
 }
 
+function Get-MsiProperty {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    $view = $null
+    try {
+        $database = $installer.GetType().InvokeMember(
+            'OpenDatabase',
+            'InvokeMethod',
+            $null,
+            $installer,
+            @([System.IO.Path]::GetFullPath($Path), 0))
+        $view = $database.GetType().InvokeMember(
+            'OpenView',
+            'InvokeMethod',
+            $null,
+            $database,
+            @("SELECT `Value` FROM `Property` WHERE `Property`='$Name'"))
+        [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+        if ($null -eq $record) { throw "MSI property is missing: $Name" }
+        return [string]$record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, 1)
+    } finally {
+        if ($null -ne $view) {
+            try { [void]$view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) } catch {}
+        }
+        foreach ($comObject in @($view, $database, $installer)) {
+            if ($null -ne $comObject -and [System.Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
+                [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+            }
+        }
+    }
+}
+
 function Test-PathIsStrictChild {
     param(
         [Parameter(Mandatory = $true)][string]$Path,

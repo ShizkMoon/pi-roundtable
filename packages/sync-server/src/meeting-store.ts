@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 
 import {
   PROTOCOL_VERSION,
+  isValidMeetingEventIdentifier,
+  isValidMeetingEventKind,
+  validateMeetingEvent,
   type JsonObject,
   type MeetingEvent,
-  type MeetingEventKind,
 } from "@pi-roundtable/protocol";
 
 export type StoreErrorCode =
@@ -50,7 +52,7 @@ export interface AppendMeetingEventInput {
   meetingId: string;
   ownerRuntimeId: string;
   runtimeGeneration: number;
-  kind: MeetingEventKind;
+  kind: string;
   actorId?: string | null;
   targetId?: string | null;
   causationId?: string | null;
@@ -180,6 +182,11 @@ export class InMemoryMeetingStore implements MeetingStore {
   }
 
   append(input: AppendMeetingEventInput): MeetingEvent {
+    this.#validateId(input.meetingId, "meetingId");
+    this.#validateId(input.ownerRuntimeId, "ownerRuntimeId");
+    if (!isValidMeetingEventKind(input.kind) || input.kind.startsWith("runtime.lease_")) {
+      throw new MeetingStoreError("invalid_argument", "event kind must be valid and runtime lease events are store-owned");
+    }
     const record = this.#records.get(input.meetingId);
     if (record === undefined) {
       throw new MeetingStoreError("lease_not_found", "meeting has no runtime generation");
@@ -277,6 +284,13 @@ export class InMemoryMeetingStore implements MeetingStore {
       ...(input.causationId !== undefined ? { causationId: input.causationId } : {}),
       ...(input.audience !== undefined ? { audience: input.audience } : {}),
     };
+    const validationIssues = validateMeetingEvent(event);
+    if (validationIssues.length > 0) {
+      throw new MeetingStoreError(
+        "invalid_argument",
+        `event violates protocol v1 at ${validationIssues[0]!.path || "envelope"}`,
+      );
+    }
 
     record.lastSequence = event.sequence;
     record.events.push(event);
@@ -287,8 +301,8 @@ export class InMemoryMeetingStore implements MeetingStore {
   }
 
   #validateId(value: string, name: string): void {
-    if (value.length === 0 || value.length > 128) {
-      throw new MeetingStoreError("invalid_argument", `${name} must contain 1-128 characters`);
+    if (!isValidMeetingEventIdentifier(value)) {
+      throw new MeetingStoreError("invalid_argument", `${name} must be a protocol identifier`);
     }
   }
 }

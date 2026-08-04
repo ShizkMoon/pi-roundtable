@@ -82,6 +82,8 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 
     public event EventHandler<string>? DiagnosticReceived;
 
+    public event EventHandler<string>? EventStreamFaulted;
+
     public async Task StartAsync(RuntimeHostStartOptions options, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -392,9 +394,9 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             }
             if (line.Length > 1_048_576)
             {
-                TraceProtocolFrame($"drop reason=oversize bytes={line.Length}");
-                ReportDiagnostic("Runtime Host 返回了超出限制的数据帧。");
-                continue;
+                TraceProtocolFrame($"fault reason=oversize bytes={line.Length}");
+                ReportEventStreamFault("Runtime Host 返回了超出限制的数据帧；会议已安全暂停。");
+                return;
             }
             try
             {
@@ -404,13 +406,15 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             catch (JsonException error)
             {
                 TraceProtocolFrame(
-                    $"drop reason=json length={line.Length} byte={error.BytePositionInLine?.ToString() ?? "unknown"} window={RedactJsonWindow(line, error.BytePositionInLine)}");
-                ReportDiagnostic("Runtime Host 输出了无法解析的数据。");
+                    $"fault reason=json length={line.Length} byte={error.BytePositionInLine?.ToString() ?? "unknown"} window={RedactJsonWindow(line, error.BytePositionInLine)}");
+                ReportEventStreamFault("Runtime Host 输出了无法解析的数据；会议已安全暂停。");
+                return;
             }
             catch (Exception error) when (error is KeyNotFoundException or InvalidOperationException or FormatException)
             {
-                TraceProtocolFrame($"drop reason=shape error={error.GetType().Name}");
-                ReportDiagnostic("Runtime Host 输出的数据不符合本地协议。");
+                TraceProtocolFrame($"fault reason=shape error={error.GetType().Name}");
+                ReportEventStreamFault("Runtime Host 输出的数据不符合本地协议；会议已安全暂停。");
+                return;
             }
         }
     }
@@ -435,8 +439,7 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
     {
         if (!frame.TryGetProperty("type", out var typeElement))
         {
-            TraceProtocolFrame("drop reason=missing_type");
-            return;
+            throw new InvalidOperationException("Runtime Host frame type is missing.");
         }
         var frameType = typeElement.GetString() ?? "unknown";
         if (frameType == "event" && frame.TryGetProperty("event", out var tracedEvent))
@@ -494,6 +497,8 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             case "stopped":
                 _stopped.TrySetResult();
                 break;
+            default:
+                throw new InvalidOperationException($"Runtime Host frame type is unsupported: {frameType}.");
         }
     }
 
@@ -563,29 +568,12 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
 
     private void HandleEvent(JsonElement eventElement)
     {
-        var meetingEvent = new RuntimeMeetingEvent(
-            eventElement.GetProperty("meetingId").GetString() ?? string.Empty,
-            eventElement.GetProperty("eventId").GetString() ?? string.Empty,
-            eventElement.GetProperty("sequence").GetUInt64(),
-            eventElement.GetProperty("runtimeGeneration").GetUInt64(),
-            eventElement.GetProperty("kind").GetString() ?? string.Empty,
-            eventElement.GetProperty("occurredAt").GetDateTimeOffset(),
-            eventElement.TryGetProperty("actorId", out var actorId) ? actorId.GetString() : null,
-            eventElement.TryGetProperty("targetId", out var targetId) ? targetId.GetString() : null,
-            eventElement.TryGetProperty("causationId", out var causationId) ? causationId.GetString() : null,
-            eventElement.TryGetProperty("visibility", out var visibility)
-                ? visibility.GetString() ?? "public"
-                : "public",
-            eventElement.TryGetProperty("audience", out var audience)
-                ? audience.EnumerateArray().Select(item => item.GetString() ?? string.Empty).Where(item => item.Length > 0).ToArray()
-                : [],
-            eventElement.GetProperty("payload").Clone());
+        var meetingEvent = RuntimeMeetingEventParser.Parse(eventElement);
         if (
             meetingEvent.MeetingId != _meetingId ||
             meetingEvent.RuntimeGeneration != _runtimeGeneration)
         {
-            ReportDiagnostic("Runtime Host 事件不属于当前会议代次，已拒绝。");
-            return;
+            throw new InvalidOperationException("Runtime Host event does not belong to the active meeting generation.");
         }
         try
         {
@@ -709,6 +697,20 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
         catch
         {
             // Diagnostics cannot destabilize the process supervisor.
+        }
+    }
+
+    private void ReportEventStreamFault(string message)
+    {
+        Terminate();
+        ReportDiagnostic(message);
+        try
+        {
+            EventStreamFaulted?.Invoke(this, message);
+        }
+        catch
+        {
+            // Process termination remains the final safety boundary.
         }
     }
 

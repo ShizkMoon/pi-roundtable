@@ -1,7 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 
-import { PROTOCOL_VERSION, isMeetingEventKind, type JsonObject, type MeetingEvent } from "@pi-roundtable/protocol";
+import {
+  PROTOCOL_VERSION,
+  isValidMeetingEventIdentifier,
+  isValidMeetingEventKind,
+  type JsonObject,
+  type MeetingEvent,
+} from "@pi-roundtable/protocol";
 
 import { AuthenticationError, DeviceTokenAuthenticator, type AuthenticatedPrincipal } from "./device-auth.js";
 import { InMemoryMeetingStore, MeetingStoreError, type MeetingStore } from "./meeting-store.js";
@@ -50,7 +56,7 @@ async function readJsonObject(request: IncomingMessage): Promise<Record<string, 
 
 function decodeSegment(value: string): string {
   const decoded = decodeURIComponent(value);
-  if (decoded.length === 0 || decoded.length > 128 || decoded.includes("/")) {
+  if (!isValidMeetingEventIdentifier(decoded)) {
     throw new Error("invalid path identifier");
   }
   return decoded;
@@ -58,8 +64,8 @@ function decodeSegment(value: string): string {
 
 function requiredString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
-  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
-    throw new Error(`${key} must be a non-empty string`);
+  if (!isValidMeetingEventIdentifier(value)) {
+    throw new Error(`${key} must be a protocol identifier`);
   }
   return value;
 }
@@ -69,8 +75,8 @@ function optionalNullableString(body: Record<string, unknown>, key: string): str
   if (value === null) {
     return null;
   }
-  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
-    throw new Error(`${key} must be null or a non-empty string`);
+  if (!isValidMeetingEventIdentifier(value)) {
+    throw new Error(`${key} must be null or a protocol identifier`);
   }
   return value;
 }
@@ -87,7 +93,7 @@ function jsonObject(value: unknown): JsonObject {
 
 function audienceList(value: unknown): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > 256 ||
-      value.some((entry) => typeof entry !== "string" || entry.length === 0 || entry.length > 128) ||
+      value.some((entry) => !isValidMeetingEventIdentifier(entry)) ||
       new Set(value).size !== value.length) {
     throw new Error("private audience must be a unique non-empty ID list");
   }
@@ -166,8 +172,8 @@ export function createSyncServer(
         if (method === "POST") {
           const body = await readJsonObject(request);
           const kind = body.kind;
-          if (!isMeetingEventKind(kind) || kind.startsWith("runtime.lease_")) {
-            throw new Error("kind must be a non-lease meeting event kind");
+          if (!isValidMeetingEventKind(kind) || kind.startsWith("runtime.lease_")) {
+            throw new Error("kind must be a valid non-lease namespaced meeting event kind");
           }
           const generation = body.runtimeGeneration;
           if (!Number.isSafeInteger(generation) || (generation as number) < 1) {
@@ -178,6 +184,9 @@ export function createSyncServer(
           const visibility = body.visibility;
           if (visibility !== "public" && visibility !== "private") {
             throw new Error("visibility must be public or private");
+          }
+          if (visibility === "public" && Object.hasOwn(body, "audience")) {
+            throw new Error("public events must not carry a private audience");
           }
           const event = await store.append({
             meetingId,

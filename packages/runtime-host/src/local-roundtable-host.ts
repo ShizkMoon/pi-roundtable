@@ -2521,7 +2521,7 @@ export class LocalRoundtableHost {
           event.correlationId ?? null,
           event.payload,
           "private",
-          ["user.direct_host"],
+          ["user.direct_host", roleId],
         );
         break;
       case "tool.completed":

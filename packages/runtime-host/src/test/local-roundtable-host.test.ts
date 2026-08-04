@@ -2597,6 +2597,7 @@ test("routes a private tool approval decision to the owning role", async () => {
   const { host, adapters } = createHost();
   const events: Array<{
     kind: string;
+    actorId?: string | null;
     visibility: string;
     audience?: string[];
     targetId?: string | null;
@@ -2617,8 +2618,9 @@ test("routes a private tool approval decision to the owning role", async () => {
   });
   const approvalEvent = events.at(-1);
   assert.equal(approvalEvent?.kind, "tool.approval_requested");
+  assert.equal(approvalEvent?.actorId, "role.approval");
   assert.equal(approvalEvent?.visibility, "private");
-  assert.deepEqual(approvalEvent?.audience, ["user.direct_host"]);
+  assert.deepEqual(approvalEvent?.audience, ["user.direct_host", "role.approval"]);
   assert.equal(approvalEvent?.targetId, "user.direct_host");
 
   const receipt = await host.execute(command("tool.approval.resolve", "approve-tool", {
@@ -2634,6 +2636,16 @@ test("routes a private tool approval decision to the owning role", async () => {
     approvalId: "approval-1",
     approved: true,
   });
+  adapter.emit("tool.approval_resolved", {
+    approvalId: "approval-1",
+    approved: true,
+  });
+  const resolvedEvent = events.at(-1);
+  assert.equal(resolvedEvent?.kind, "tool.approval_resolved");
+  assert.equal(resolvedEvent?.actorId, "role.approval");
+  assert.equal(resolvedEvent?.visibility, "private");
+  assert.deepEqual(resolvedEvent?.audience, ["user.direct_host", "role.approval"]);
+  assert.equal(resolvedEvent?.targetId, "user.direct_host");
   await host.stop();
 });
 

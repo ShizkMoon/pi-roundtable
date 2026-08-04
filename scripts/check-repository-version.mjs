@@ -23,6 +23,7 @@ const rootLock = await readJson("package-lock.json");
 const protocolPackage = await readJson("packages/protocol-ts/package.json");
 const runtimePackage = await readJson("packages/runtime-host/package.json");
 const syncPackage = await readJson("packages/sync-server/package.json");
+const packagedRuntimePackage = await readJson("packaging/windows-runtime/package.json");
 const packagedProtocol = await readJson("packaging/windows-runtime/protocol/package.json");
 const packagedRuntimeLock = await readJson("packaging/windows-runtime/package-lock.json");
 
@@ -39,6 +40,9 @@ expect("package-lock.json#/packages/packages~1runtime-host/version", rootLock.pa
 expect("package-lock.json#/packages/packages~1runtime-host/dependencies/@pi-roundtable~1protocol", rootLock.packages?.["packages/runtime-host"]?.dependencies?.["@pi-roundtable/protocol"], version);
 expect("package-lock.json#/packages/packages~1sync-server/version", rootLock.packages?.["packages/sync-server"]?.version, version);
 expect("package-lock.json#/packages/packages~1sync-server/dependencies/@pi-roundtable~1protocol", rootLock.packages?.["packages/sync-server"]?.dependencies?.["@pi-roundtable/protocol"], version);
+expect("packaging/windows-runtime/package.json#/version", packagedRuntimePackage.version, version);
+expect("packaging/windows-runtime/package-lock.json#/version", packagedRuntimeLock.version, version);
+expect("packaging/windows-runtime/package-lock.json#/packages//version", packagedRuntimeLock.packages?.[""]?.version, version);
 expect("packaging/windows-runtime/protocol/package.json#/version", packagedProtocol.version, version);
 expect("packaging/windows-runtime/package-lock.json#/packages/protocol/version", packagedRuntimeLock.packages?.protocol?.version, version);
 
@@ -86,6 +90,12 @@ const promotion = await readText(".github/workflows/promote-windows-release.yml"
 const releaseTagBlock = promotion.match(/release_tag:\s*\n(?<block>(?:\s{8}.+\n)+)/)?.groups?.block ?? "";
 if (/\bdefault:/.test(releaseTagBlock)) {
   failures.push("promote-windows-release.yml release_tag must not default to a stale product version.");
+}
+expectContains("promote-windows-release.yml", promotion, '$checkedOutCommit -ne $run.head_sha');
+expectContains("promote-windows-release.yml", promotion, 'verify-windows-release-candidate.mjs');
+expectContains("promote-windows-release.yml", promotion, 'CANDIDATE_METADATA');
+if (promotion.includes("--clobber") || promotion.includes("$manifest.asset.fileName")) {
+  failures.push("promote-windows-release.yml must not overwrite assets or use stable-manifest asset metadata as candidate identity.");
 }
 
 const stableManifest = await readJson("packaging/windows-x64/update-manifest.json");

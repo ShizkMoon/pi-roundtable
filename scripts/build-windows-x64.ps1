@@ -336,6 +336,28 @@ try {
     Copy-Item -LiteralPath $nodeExecutable -Destination (Join-Path $runtimeStage 'node.exe') -Force
     Copy-Item -LiteralPath $nodeLicense -Destination (Join-Path $runtimeStage 'LICENSE.node.txt') -Force
 
+    $sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'Unable to bind Windows release materials to the current Git commit.'
+    }
+    $releaseInventory = Join-Path $installerOutput "PiRoundtable-$Version-win-x64.dependencies.json"
+    $releaseSbom = Join-Path $installerOutput "PiRoundtable-$Version-win-x64.sbom.cdx.json"
+    $releaseNotices = Join-Path $installerOutput "PiRoundtable-$Version-win-x64.third-party-notices.txt"
+    Invoke-Checked 'node' @(
+        'scripts/generate-windows-release-inventory.mjs',
+        '--version', $Version,
+        '--source-commit', $sourceCommit,
+        '--runtime-root', $runtimeHostStage,
+        '--nuget-assets', (Join-Path $repoRoot 'apps\windows\PiRoundtable.Windows\obj\project.assets.json'),
+        '--nuget-lock', (Join-Path $repoRoot 'apps\windows\PiRoundtable.Windows\packages.lock.json'),
+        '--global-json', (Join-Path $repoRoot 'global.json'),
+        '--wix-project', (Join-Path $repoRoot 'packaging\windows-x64\PiRoundtable.Installer.wixproj'),
+        '--output-directory', $installerOutput,
+        '--packaged-notices-output', (Join-Path $appStage 'THIRD-PARTY-NOTICES.txt'),
+        '--packaged-license-output', (Join-Path $appStage 'LICENSE.pi-roundtable.txt'),
+        '--repository-license', (Join-Path $repoRoot 'LICENSE')
+    ) $repoRoot
+
     $packagedNode = Join-Path $runtimeStage 'node.exe'
     $packagedHost = Join-Path $runtimeHostStage 'host-main.js'
     Invoke-Checked $packagedNode @('--check', $packagedHost) $appStage
@@ -429,9 +451,44 @@ try {
             -TimestampUrl $TimestampUrl `
             -RequireTrustedSignature:$RequireTrustedSignature | Out-Host
     }
+    $msiProductVersion = Get-MsiProperty -Path $msi.FullName -Name 'ProductVersion'
+    $msiProductName = Get-MsiProperty -Path $msi.FullName -Name 'ProductName'
+    $msiUpgradeCode = (Get-MsiProperty -Path $msi.FullName -Name 'UpgradeCode').ToUpperInvariant()
+    $expectedUpgradeCode = $UpgradeCode.ToString('B').ToUpperInvariant()
+    if ($msiProductVersion -ne $Version -or $msiProductName -ne $ProductName -or $msiUpgradeCode -ne $expectedUpgradeCode) {
+        throw 'The generated MSI identity does not match the requested ProductVersion, ProductName, and UpgradeCode.'
+    }
     $hash = Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256
+    $productionUpgradeCode = [Guid]'8F84BF2C-3DBB-4F28-8B97-78D8B384365A'
+    $isProductionIdentity = $ProductName -eq 'Pi Roundtable' -and
+        $UpgradeCode -eq $productionUpgradeCode -and
+        $OutputNamePrefix -eq 'PiRoundtable'
+    $releaseMetadata = $null
+    if ($isProductionIdentity) {
+        $releaseMetadata = Join-Path $installerOutput "PiRoundtable-$Version-win-x64.release.json"
+        $authenticodeRequired = (![string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)).ToString().ToLowerInvariant()
+        Invoke-Checked 'node' @(
+            'scripts/generate-windows-release-metadata.mjs',
+            '--version', $Version,
+            '--source-commit', $sourceCommit,
+            '--msi', $msi.FullName,
+            '--output', $releaseMetadata,
+            '--authenticode-required', $authenticodeRequired,
+            '--product-name', $msiProductName,
+            '--upgrade-code', $msiUpgradeCode,
+            '--sbom', $releaseSbom,
+            '--dependency-inventory', $releaseInventory,
+            '--notices', $releaseNotices
+        ) $repoRoot
+    } else {
+        Write-Host 'Release metadata skipped for isolated non-production MSI identity.'
+    }
     Write-Host "MSI: $($msi.FullName)"
     Write-Host "SHA256: $($hash.Hash)"
+    if ($null -ne $releaseMetadata) { Write-Host "Release metadata: $releaseMetadata" }
+    Write-Host "Dependency inventory: $releaseInventory"
+    Write-Host "SBOM: $releaseSbom"
+    Write-Host "Third-party notices: $releaseNotices"
 } catch {
     if ($null -ne $temporaryWixNuGetConfig) {
         Remove-Item -LiteralPath $temporaryWixNuGetConfig -Force -ErrorAction SilentlyContinue

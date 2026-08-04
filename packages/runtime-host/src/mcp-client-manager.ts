@@ -104,7 +104,7 @@ export class McpClientManager {
           approvalMode,
         } = server;
         const client = new Client(
-          { name: "pi-roundtable-runtime-host", version: "0.3.0" },
+          { name: "pi-roundtable-runtime-host", version: "0.4.0" },
           { capabilities: {} },
         );
         const transport = makeCloseSingleFlight(this.#transportFactory(server));

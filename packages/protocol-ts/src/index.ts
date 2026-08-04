@@ -81,9 +81,17 @@ export const MEETING_EVENT_KINDS = [
 ] as const satisfies readonly MeetingEventKind[];
 
 const MEETING_EVENT_KIND_SET: ReadonlySet<string> = new Set(MEETING_EVENT_KINDS);
+const MEETING_EVENT_KIND_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
 
 export function isMeetingEventKind(value: unknown): value is MeetingEventKind {
   return typeof value === "string" && MEETING_EVENT_KIND_SET.has(value);
+}
+
+/** Validates the additive namespaced event-kind syntax used on the v1 wire. */
+export function isValidMeetingEventKind(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length <= 128 &&
+    MEETING_EVENT_KIND_PATTERN.test(value);
 }
 
 export interface MeetingEvent {
@@ -92,7 +100,7 @@ export interface MeetingEvent {
   eventId: string;
   sequence: number;
   runtimeGeneration: number;
-  kind: MeetingEventKind;
+  kind: string;
   occurredAt: string;
   actorId?: string | null;
   targetId?: string | null;
@@ -235,6 +243,11 @@ const COMMAND_REQUIRED_PROPERTIES = [
   "payload",
 ] as const;
 const ENVELOPE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const RFC3339_DATE_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function isValidMeetingEventIdentifier(value: unknown): value is string {
+  return typeof value === "string" && ENVELOPE_ID_PATTERN.test(value);
+}
 
 /** Validates untrusted JSON at the public protocol boundary. */
 export function validateMeetingEvent(value: unknown): MeetingEnvelopeValidationIssue[] {
@@ -247,8 +260,8 @@ export function validateMeetingEvent(value: unknown): MeetingEnvelopeValidationI
   validateIdentifier(event.eventId, "eventId", issues);
   validatePositiveInteger(event.sequence, "sequence", 1, issues);
   validatePositiveInteger(event.runtimeGeneration, "runtimeGeneration", 1, issues);
-  if (!isMeetingEventKind(event.kind)) {
-    addIssue(issues, "kind", "invalid_value", "Meeting event kind is not part of protocol v1.");
+  if (!isValidMeetingEventKind(event.kind)) {
+    addIssue(issues, "kind", "invalid_value", "Meeting event kind must be a valid namespaced v1 identifier.");
   }
   validateTimestamp(event.occurredAt, "occurredAt", issues);
   validateOptionalIdentifier(event.actorId, "actorId", issues);
@@ -324,7 +337,7 @@ function validateIdentifier(
   path: string,
   issues: MeetingEnvelopeValidationIssue[],
 ): void {
-  if (typeof value !== "string" || !ENVELOPE_ID_PATTERN.test(value)) {
+  if (!isValidMeetingEventIdentifier(value)) {
     addIssue(issues, path, "invalid_format", `${path} must be a protocol identifier.`);
   }
 }
@@ -380,7 +393,7 @@ function validateTimestamp(
   path: string,
   issues: MeetingEnvelopeValidationIssue[],
 ): void {
-  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+  if (typeof value !== "string" || !RFC3339_DATE_TIME_PATTERN.test(value) || !Number.isFinite(Date.parse(value))) {
     addIssue(issues, path, "invalid_format", `${path} must be an ISO date-time string.`);
   }
 }

@@ -26,6 +26,8 @@ internal interface IRuntimeHostProcess : IAsyncDisposable
 
     event EventHandler<string>? DiagnosticReceived;
 
+    event EventHandler<string>? EventStreamFaulted;
+
     Task StartAsync(RuntimeHostStartOptions options, CancellationToken cancellationToken);
 
     Task<RuntimeCommandReceipt> SendCommandAsync(
@@ -53,6 +55,8 @@ internal sealed class RuntimeHostFactory : IRuntimeHostFactory
 
 internal interface IMeetingCoreSession : IDisposable
 {
+    bool SupportsEventKind(string kind);
+
     void Apply(RuntimeMeetingEvent meetingEvent);
 }
 
