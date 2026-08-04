@@ -4,6 +4,7 @@ namespace PiRoundtable.Windows;
 
 public partial class App : Application
 {
+    private readonly WindowsApplicationCompositionRoot _compositionRoot = new();
     private Window? _window;
 
     public App()
@@ -13,7 +14,7 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        _window = new MainWindow();
+        _window ??= _compositionRoot.CreateMainWindow();
         _window.Activate();
     }
 }
