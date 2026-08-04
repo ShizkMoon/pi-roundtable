@@ -18,12 +18,12 @@ Outputs:
 
 The client updater uses a signed canonical manifest with an ECDSA P-256 public key pinned in the application. It then holds a cross-process directory lease and one no-follow package handle through bounded download, post-flush size/SHA-256 re-verification, and atomic promotion; strictly named crash-orphan leaves are cleaned only while that lease is held. If a manifest declares `authenticodeRequired: true`, Windows Authenticode trust must also succeed against that same locked file object; otherwise installation fails closed. `scripts/New-WindowsUpdateManifest.ps1` signs a release manifest using a private key outside the repository. Never commit that private key.
 
-Without an external production certificate the MSI remains an unsigned local-alpha artifact, so release manifests must keep `authenticodeRequired: false`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from the process-scoped `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD` (persisted user/machine values are rejected), imported non-exportable for the build, and removed in `finally`:
+Without an external production certificate the MSI remains an unsigned local-alpha artifact and cannot become a new stable release. The legacy v0.3.0 manifest remains independently signed with `authenticodeRequired: false`; v0.4.0 and newer stable manifests must advance that version and set `authenticodeRequired: true`. Formal builds accept either an installed certificate thumbprint or a PFX outside the repository; the PFX password is read only from the process-scoped `PI_ROUNDTABLE_SIGNING_PFX_PASSWORD` (persisted user/machine values are rejected), imported non-exportable for the build, and removed in `finally`:
 
 ```powershell
 $env:PI_ROUNDTABLE_SIGNING_PFX_PASSWORD = '<secret from CI secret store>'
 pwsh -File .\scripts\build-signed-windows-x64.ps1 `
-  -Version 0.3.0 `
+  -Version 0.4.0 `
   -PfxPath C:\secure\pi-roundtable-release.pfx `
   -TimestampUrl https://timestamp.example.com
 ```
@@ -36,7 +36,7 @@ pwsh -File .\scripts\test-windows-signing-pipeline.ps1
 
 That smoke test creates a one-day, non-exportable self-signed certificate in `CurrentUser\My`, signs copies of an application binary and MSI without modifying the originals, verifies signer identity, and removes the certificate in `finally`. Its report explicitly records that it is not trusted production signing.
 
-Candidate promotion does not reuse the signed stable manifest as candidate metadata. The exact successful current-main CI run emits a separate version/commit/file/size/SHA-256/AuthentiCode-policy record; the promotion workflow requires the draft tag to match that version, verifies the candidate before upload, refuses to clobber a differing asset, and downloads the draft asset again for independent verification. The committed signed stable manifest remains the older upgrade baseline. When candidate metadata sets `authenticodeRequired` to `true`, promotion also requires the repository variable `WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT` to contain the expected 40-hex production leaf-certificate thumbprint. A merely trusted, timestamped signature from a different signer fails closed. PFX imports snapshot `CurrentUser\My`, clear the password environment variable before spawning the child build, and remove every certificate newly added to that store before exit.
+Candidate promotion does not reuse the signed stable manifest as candidate metadata. The reserved Actions verification workflow refuses any candidate whose metadata does not require production Authenticode; the current ordinary CI has no production certificate and its unsigned artifacts are merge evidence only, not an eligible input to that reserved workflow. The implemented v0.4 production path is local release-owner publication: after the complete ReleaseCandidate gate reports `releaseEligible: true`, `scripts/publish-windows-release.ps1` verifies the RC and signed-build reports, creates or resumes an exact-commit draft, uploads the five public assets without clobbering, re-downloads and re-verifies every byte and the trusted timestamped MSI, and publishes only when `-Publish` is explicit. The committed signed stable manifest remains the older upgrade baseline until the public release URL is live. PFX imports snapshot `CurrentUser\My`, clear the password environment variable before spawning the child build, and remove every certificate newly added to that store before exit.
 
 The isolated lifecycle harness never registers the production UpgradeCode. By default it builds a compact MSI from the real WinUI application shell so CI can deterministically exercise the Windows Installer state machine; release machines should also run `-UseFullPayload` against all bundled runtime files:
 
@@ -48,6 +48,23 @@ pwsh -File .\scripts\test-windows-msi-lifecycle.ps1 -UseFullPayload
 Both modes cover baseline install, responsive app launch when enabled, file deletion and `/fomus` repair, major upgrade, blocked downgrade with candidate preservation, a second repair, uninstall, product/registry/shortcut/folder cleanup, and production-registration invariance. Administrative extraction remains a non-registering complementary gate. When testing extraction or the full lifecycle payload, use a short target path or a temporary drive mapping because some production Node dependencies have deep paths even though their normal `C:\Program Files\Pi Roundtable` paths remain below the Windows Installer limit.
 
 The current Windows workstation has verified both modes, including the complete 22,594-file payload: baseline and candidate launches were responsive; the major upgrade completed; downgrade returned 1603 without mutating the candidate; both deliberate file deletions were repaired; uninstall left no QA ProductCode, directory, registry key, or Start Menu folder; and the production 0.2.2 registration was unchanged. These are local, time-bounded release-gate results rather than a permanent guarantee for later payloads.
+
+Production stable-to-candidate evidence uses a separate fail-closed harness on a disposable clean Windows VM. It never removes a pre-existing production installation: preflight aborts if the production UpgradeCode, product name, process, install directory, registry key, Start Menu directory, or default user-data directory already exists. Cleanup is limited to the exact stable and candidate ProductCodes installed by the current run. The stable MSI must match the committed signed manifest, while the candidate MSI must match a verified, clean-commit, trusted and RFC 3161 timestamped signed-build report:
+
+```powershell
+pwsh -File .\scripts\test-windows-production-msi-lifecycle.ps1 `
+  -StableMsiPath C:\release-input\PiRoundtable-0.3.0-win-x64.msi `
+  -CandidateMsiPath C:\release-input\PiRoundtable-0.4.0-win-x64.msi `
+  -SignedBuildReportPath C:\release-input\signed-build-report.json `
+  -ExpectedSignerThumbprint '<repository production signer thumbprint>' `
+  -VmImage 'windows-11-release-validation' `
+  -SnapshotId 'clean-before-pi-roundtable' `
+  -DisposableCleanVm
+```
+
+The report is written below `out\e2e\production-msi-lifecycle-*` and is accepted by the Release Candidate gate only when all install, launch, upgrade, repair, downgrade-block, uninstall, and residue checks pass without a reboot request.
+
+After the public release is verified, generate the next stable manifest only from the exact public MSI. The generator verifies its internal production identity, configured signer, trusted timestamp, and monotonic version before using the repository-external ECDSA key.
 
 Compact operations have a 12-minute per-`msiexec` limit; `-UseFullPayload` raises it to 45 minutes because a major upgrade must transact more than 22,000 components. `-MsiTimeoutMinutes` may override the limit on a slower release machine. If the limit is exceeded, the harness waits a bounded consistency grace period (and, if necessary, terminates and waits for the exact client process) before it attempts product enumeration or cleanup; it never disposes a live `msiexec` handle and reports a false-clean state.
 

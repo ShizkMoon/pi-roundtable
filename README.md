@@ -101,13 +101,13 @@ dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 
 开发客户端会向上查找 `packages/runtime-host/dist/host-main.js`，并在 x64 构建时复制 `out/build/dev/core/pi_roundtable_core.dll`。源码 checkout/测试也可分别用 `PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT` 与 `PI_ROUNDTABLE_NODE_PATH` 指定路径；自包含发布版始终优先使用应用目录内的 Node 与 Runtime Host，不接受环境变量覆盖。非敏感工作区配置保存到 `%LOCALAPPDATA%\PiRoundtable\workspace.v1.json`，会话定义保存到 `%LOCALAPPDATA%\PiRoundtable\sessions\`；规范化事件与角色记忆修订写入版本化的 `%LOCALAPPDATA%\PiRoundtable\data\roundtable.db`，正文由当前 Windows 用户 DPAPI 加密并在打开时校验精确 schema。未来模块、工件元数据和本地诊断使用独立 `platform.db`，当前只完成所有权/迁移规范，尚未创建生产数据库；边界见 [`ADR 0013`](docs/adr/0013-local-database-ownership-and-forward-migrations.md)。API Key 按 `credentialRef` 保存到 Windows Credential Manager，启动时只把本场角色所需凭据通过一次性 stdin 初始化帧交给本地子进程，不进入环境、事件或 JSON 配置。
 
-生成未签名但可由签名清单安全分发的自包含 x64 MSI：
+生成仅用于本地 QA/合并验证的未签名自包含 x64 MSI：
 
 ```powershell
 pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.4.0
 ```
 
-脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.4.0-win-x64.msi`、提交绑定的候选元数据、依赖清单、CycloneDX SBOM、第三方 NOTICE 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，候选元数据必须保持 `authenticodeRequired: false`。
+脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.4.0-win-x64.msi`、提交绑定的候选元数据、依赖清单、CycloneDX SBOM、第三方 NOTICE 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256；从 0.4.0 起还强制 Authenticode。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，候选元数据必须保持 `authenticodeRequired: false`，不能进入发布草稿或正式 Release。
 
 无依赖的 `PiRoundtable.Distribution` 还实现了可供后续更新、模块目录、离线布局和工件导入复用的 v1 签名目录纯验证层：严格拒绝重复、未知或缺失字段，绑定密钥/算法、有效期、epoch/sequence 防回滚和同源资产策略，并只返回封闭的无凭据诊断。与纯验证器分离的 Windows 工件事务会锁定全部目标目录组件，以同一 no-follow 文件句柄完成复制、落盘后二次哈希、可选 Authenticode 和原子提升，并通过跨进程目录租约恢复崩溃残留；状态旁车失败时保留已验证包供下次离线修复。它当前没有连接目录刷新或模块安装；模块解析、依赖、授权、下载、健康检查和完整安装回滚事务仍是后续工作。架构边界见 [`ADR 0011`](docs/adr/0011-signed-catalog-trust-boundary.md) 与 [`ADR 0012`](docs/adr/0012-handle-owned-windows-artifact-staging.md)。
 
@@ -139,7 +139,7 @@ pwsh -File .\scripts\run-windows-deepseek-roundtable.ps1 `
   -AppDirectory .\out\package\windows-x64\app
 ```
 
-脚本优先通过临时 Windows Credential Manager 记录向客户端提供凭据，受限桌面会话则使用仅限当前用户、单次读取且有尺寸上限的随机命名管道：第一轮在议程模式验证单点名与表格、任务项、LaTeX 源码块、PowerShell 代码块；第二轮保持议程模式验证双点名只由产品体验官与风险审查员回答；第三轮进入自由讨论，验证暂停/继续自动主持，以及未点名角色通过有界观察自主申请发言或抢答。证据只在被忽略的 `out\e2e\` 保存角色、状态、字符数、输出 SHA-256 和事件归属；截图优先使用窗口原生 `PrintWindow`，再回退到屏幕捕获，二者都不可用时才把视觉状态标为 pending 并保存非等价的 UIA 结构快照。脚本扫描包含完整 data-root 的证据树是否残留 Key，并在退出后删除临时凭据。实现现状、参考项目迁移边界和后续 P0/P1 见 [Agent 客户端实践与差距审计](docs/research/2026-08-02-agent-client-practices-and-gap-analysis.md)。
+脚本优先通过临时 Windows Credential Manager 记录向客户端提供凭据，受限桌面会话则使用仅限当前用户、单次读取且有尺寸上限的随机命名管道：第一轮在议程模式验证单点名与表格、任务项、LaTeX 源码块、PowerShell 代码块；第二轮保持议程模式验证双点名只由产品体验官与风险审查员回答；第三轮进入自由讨论，验证暂停/继续自动主持，以及未点名角色通过有界观察自主申请发言或抢答。证据只在被忽略的 `out\e2e\` 保存角色、状态、字符数、输出 SHA-256 和事件归属，并绑定产品版本、完整 Git 提交与被测 EXE SHA-256；截图优先使用窗口原生 `PrintWindow`，再回退到屏幕捕获，二者都不可用时才把视觉状态标为 pending 并保存非等价的 UIA 结构快照。脚本扫描包含完整 data-root 的证据树是否残留 Key，并在退出后删除临时凭据。实现现状、参考项目迁移边界和后续 P0/P1 见 [Agent 客户端实践与差距审计](docs/research/2026-08-02-agent-client-practices-and-gap-analysis.md)。
 
 ## 版本基线
 

@@ -1,8 +1,8 @@
 # Release Candidate evidence contract
 
 This document defines the implemented final-gate validation contract for a
-Windows x64 Release Candidate. Production clean-VM evidence capture remains a
-separate pending automation item. The gate prevents a successful command, an old report, an
+Windows x64 Release Candidate. Production clean-VM evidence capture is implemented as a
+separate fail-closed harness. The gate prevents a successful command, an old report, an
 ephemeral signing test, or an isolated QA installer from being presented as
 production release evidence.
 
@@ -32,6 +32,7 @@ The gate keeps the following evidence classes separate:
 | `production-signed-windows-build` | full tests and ICE ran, five release artifacts are trusted and timestamped | installed upgrade behavior or visual correctness |
 | `production-clean-vm-stable-to-candidate` | real production UpgradeCode transition on a disposable clean VM | other DPI sessions or other artifact bytes |
 | `real-windows-dpi-visual-matrix` | light, dark, high-contrast and responsive widths at real 96/144/192 DPI | installer or update behavior |
+| `real-provider-windows-roundtable` | real DeepSeek/Pi three-role scenarios bound to one candidate executable | installer, DPI matrix, or another provider |
 
 ## Build and collect evidence
 
@@ -57,8 +58,11 @@ Download the stable MSI named by the committed, signed
 `packaging/windows-x64/update-manifest.json`. The final gate recalculates its
 file name, size, and SHA-256 and rejects any mismatch.
 
-The production lifecycle report must come from a disposable clean Windows VM
-and must have this minimum JSON shape:
+The production lifecycle report must come from a disposable clean Windows VM.
+Generate it with `scripts/test-windows-production-msi-lifecycle.ps1`; the script
+requires an explicit disposable-VM attestation, verifies that it is running in a
+detected VM, rejects pre-existing Pi Roundtable state, and limits cleanup to the
+exact ProductCodes installed by that run. The report has this minimum JSON shape:
 
 ```json
 {
@@ -103,20 +107,20 @@ and must have this minimum JSON shape:
 }
 ```
 
-The report producer must additionally retain VM image/snapshot identity,
-Windows build, MSI logs, exit codes, and reboot state for audit. The current
-final gate validates the fields above and accepts reports no more than 24 hours
-old. Automated production-UpgradeCode report capture is pending under
-`V04-REL-007`; until then, this is an explicit release-owner/clean-VM evidence
-step, not a local workstation substitute.
+The producer retains VM image/snapshot identity, Windows build, MSI logs, exit
+codes, and reboot state for audit. The final gate validates the fields above and
+accepts reports no more than 24 hours old. This remains an explicit
+release-owner/clean-VM execution step, not a local workstation substitute.
 
 ## Run the final gate
 
 ```powershell
 npm run quality:release-candidate -- `
   -SignedBuildReportPath .\out\package\windows-x64\signed-build-report.json `
+  -ExpectedSignerThumbprint '<repository production signer thumbprint>' `
   -StableMsiPath C:\release-evidence\PiRoundtable-<stable>-win-x64.msi `
   -ProductionLifecycleReportPath C:\release-evidence\production-lifecycle.json `
+  -RealProviderEvidencePath C:\release-evidence\deepseek\evidence.json `
   -VisualReportPath96 C:\release-evidence\visual-96\theme-visual-qa-report.json `
   -VisualReportPath144 C:\release-evidence\visual-144\theme-visual-qa-report.json `
   -VisualReportPath192 C:\release-evidence\visual-192\theme-visual-qa-report.json
@@ -125,8 +129,25 @@ npm run quality:release-candidate -- `
 The gate re-verifies all signed artifact bytes and Authenticode timestamps,
 runs a fresh full-payload lifecycle under the isolated QA UpgradeCode, verifies
 the stable baseline bytes, validates the separate production clean-VM report,
-and merges the real-DPI matrix. All reports must agree with current `VERSION`,
-the clean Git commit, and the signed candidate artifact hashes.
+validates a real-provider three-role report, and merges the real-DPI matrix. All
+reports must agree with current `VERSION`, the clean Git commit, and the signed
+candidate artifact hashes.
+
+Publication is a separate explicit action. The publisher requires the same
+fresh RC and signed-build report, revalidates every evidence descriptor and
+artifact, compares the signer with the GitHub repository variable
+`WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT`, creates or resumes the exact-commit
+draft, re-downloads the exact five-asset set, and publishes only with
+`-Publish`:
+
+```powershell
+pwsh -File .\scripts\publish-windows-release.ps1 `
+  -ReleaseCandidateReportPath .\out\e2e\quality-gates\runs\<run>\quality-gate-report.json `
+  -SignedBuildReportPath .\out\package\windows-x64\signed-build-report.json `
+  -ReleaseDirectory .\out\installer `
+  -ReleaseNotesPath .\docs\release\v0.4.0.md `
+  -Publish
+```
 
 The pull-request CI Windows job is intentionally not equivalent: it may reuse
 earlier full validation to suppress an expensive duplicate ICE pass and may

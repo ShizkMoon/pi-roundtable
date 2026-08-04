@@ -38,7 +38,9 @@ internal sealed record WindowsUpdateServiceOptions(
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     [UpdateTrustAnchor.KeyId] = UpdateTrustAnchor.PublicKeyPem,
-                }),
+                },
+                ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
+                MinimumAuthenticodeVersion: new Version(0, 4, 0)),
             Path.Combine(LocalDataRoot.Resolve(), "updates"),
             currentVersion);
     }
@@ -87,8 +89,11 @@ internal sealed class WindowsUpdateService : IDisposable
 
     public async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken = default)
     {
-        ValidateInitialUri(_options.ManifestUri);
-        using var response = await SendWithRedirectsAsync(_options.ManifestUri, cancellationToken);
+        ValidateInitialUri(_options.ManifestUri, UpdateRequestKind.Manifest);
+        using var response = await SendWithRedirectsAsync(
+            _options.ManifestUri,
+            UpdateRequestKind.Manifest,
+            cancellationToken);
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is long contentLength &&
             contentLength > UpdateManifestVerifier.MaximumManifestBytes)
@@ -120,6 +125,10 @@ internal sealed class WindowsUpdateService : IDisposable
         IProgress<double>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        if (manifest.Version <= _options.CurrentVersion)
+        {
+            throw new InvalidDataException("更新包版本必须高于当前已安装版本。");
+        }
         var versionDirectory = Path.Combine(_options.StagingRoot, manifest.Version.ToString(3));
         EnsureSafeStagingPath(versionDirectory);
 
@@ -142,8 +151,11 @@ internal sealed class WindowsUpdateService : IDisposable
             return new StagedUpdatePackage(manifest, finalPath);
         }
 
-        ValidateInitialUri(manifest.AssetUri);
-        using var response = await SendWithRedirectsAsync(manifest.AssetUri, cancellationToken);
+        ValidateInitialUri(manifest.AssetUri, UpdateRequestKind.Asset);
+        using var response = await SendWithRedirectsAsync(
+            manifest.AssetUri,
+            UpdateRequestKind.Asset,
+            cancellationToken);
         response.EnsureSuccessStatusCode();
         if (response.Content.Headers.ContentLength is long contentLength &&
             contentLength != manifest.Document.Asset.Size)
@@ -237,7 +249,10 @@ internal sealed class WindowsUpdateService : IDisposable
         }
     }
 
-    private async Task<HttpResponseMessage> SendWithRedirectsAsync(Uri initialUri, CancellationToken cancellationToken)
+    private async Task<HttpResponseMessage> SendWithRedirectsAsync(
+        Uri initialUri,
+        UpdateRequestKind requestKind,
+        CancellationToken cancellationToken)
     {
         var uri = initialUri;
         for (var redirect = 0; redirect <= _options.MaximumRedirects; redirect++)
@@ -248,10 +263,7 @@ internal sealed class WindowsUpdateService : IDisposable
             if (!IsRedirect(response.StatusCode))
             {
                 var finalUri = response.RequestMessage?.RequestUri ?? uri;
-                if (!UpdateManifestVerifier.IsAllowedNetworkUri(
-                        finalUri,
-                        _options.ManifestPolicy.AllowLoopbackHttp,
-                        allowQuery: true))
+                if (!IsAllowedRequestUri(finalUri, initialUri, requestKind))
                 {
                     response.Dispose();
                     throw new InvalidDataException("更新请求被重定向到不安全的地址。");
@@ -265,10 +277,7 @@ internal sealed class WindowsUpdateService : IDisposable
                 throw new HttpRequestException("更新服务器返回了没有 Location 的重定向。");
             }
             uri = location.IsAbsoluteUri ? location : new Uri(uri, location);
-            if (!UpdateManifestVerifier.IsAllowedNetworkUri(
-                    uri,
-                    _options.ManifestPolicy.AllowLoopbackHttp,
-                    allowQuery: true))
+            if (!IsAllowedRequestUri(uri, initialUri, requestKind))
             {
                 throw new InvalidDataException("更新请求被重定向到不安全的地址。");
             }
@@ -276,15 +285,60 @@ internal sealed class WindowsUpdateService : IDisposable
         throw new HttpRequestException("更新请求重定向次数过多。");
     }
 
-    private void ValidateInitialUri(Uri uri)
+    private void ValidateInitialUri(Uri uri, UpdateRequestKind requestKind)
     {
-        if (!UpdateManifestVerifier.IsAllowedNetworkUri(
-                uri,
-                _options.ManifestPolicy.AllowLoopbackHttp,
-                allowQuery: false))
+        var expected = requestKind == UpdateRequestKind.Manifest ? _options.ManifestUri : uri;
+        if (!IsAllowedRequestUri(uri, expected, requestKind) || !string.IsNullOrEmpty(uri.Query))
         {
             throw new InvalidDataException("更新地址必须使用无凭据、查询或片段的 HTTPS 地址。");
         }
+    }
+
+    private bool IsAllowedRequestUri(Uri uri, Uri initialUri, UpdateRequestKind requestKind)
+    {
+        if (_options.ManifestPolicy.AllowLoopbackHttp && uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback)
+        {
+            return UpdateManifestVerifier.IsAllowedNetworkUri(
+                uri,
+                allowLoopbackHttp: true,
+                allowQuery: false);
+        }
+        if (requestKind == UpdateRequestKind.Manifest)
+        {
+            return UpdateManifestVerifier.IsAllowedNetworkUri(
+                    uri,
+                    allowLoopbackHttp: false,
+                    allowQuery: false) &&
+                string.Equals(uri.AbsoluteUri, initialUri.AbsoluteUri, StringComparison.Ordinal);
+        }
+        if (string.Equals(uri.AbsoluteUri, initialUri.AbsoluteUri, StringComparison.Ordinal))
+        {
+            return UpdateManifestVerifier.IsAllowedNetworkUri(
+                uri,
+                allowLoopbackHttp: false,
+                allowQuery: false);
+        }
+        return IsAllowedGitHubReleaseCdnUri(uri);
+    }
+
+    private static bool IsAllowedGitHubReleaseCdnUri(Uri uri)
+    {
+        if (!UpdateManifestVerifier.IsAllowedNetworkUri(
+                uri,
+                allowLoopbackHttp: false,
+                allowQuery: true) ||
+            !string.Equals(uri.Host, "release-assets.githubusercontent.com", StringComparison.OrdinalIgnoreCase) ||
+            uri.IsDefaultPort is false ||
+            string.IsNullOrEmpty(uri.Query))
+        {
+            return false;
+        }
+
+        var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length == 3 &&
+            string.Equals(segments[0], "github-production-release-asset", StringComparison.Ordinal) &&
+            ulong.TryParse(segments[1], NumberStyles.None, CultureInfo.InvariantCulture, out _) &&
+            Guid.TryParse(segments[2], out _);
     }
 
     private static async Task WriteStateAsync(
@@ -373,6 +427,12 @@ internal sealed class WindowsUpdateService : IDisposable
             HttpStatusCode.RedirectMethod or
             HttpStatusCode.TemporaryRedirect or
             HttpStatusCode.PermanentRedirect;
+    }
+
+    private enum UpdateRequestKind
+    {
+        Manifest,
+        Asset,
     }
 
     private sealed class DownloadProgress(IProgress<double> progress, long expectedSize) : IProgress<long>

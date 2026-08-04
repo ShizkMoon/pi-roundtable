@@ -1,10 +1,10 @@
-name: Promote Windows release artifact
+name: Verify production-signed Windows artifact (reserved)
 
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful current-main workflow run containing the Windows candidate
+        description: Reserved future current-main run containing a production-signed Windows candidate; ordinary CI is ineligible
         required: true
         type: string
       release_tag:
@@ -50,7 +50,9 @@ jobs:
             throw "Run $env:RUN_ID is not a successful completed run."
           }
           if ($run.event -ne 'push' -or $run.head_branch -ne 'main' -or
-              $run.name -ne 'Pi Roundtable CI' -or $run.head_sha -notmatch '^[0-9a-f]{40}$') {
+              $run.name -ne 'Pi Roundtable CI' -or
+              $run.path -ne '.github/workflows/ci.yml' -or
+              $run.head_sha -notmatch '^[0-9a-f]{40}$') {
             throw "Run $env:RUN_ID is not an eligible Pi Roundtable main-branch push run."
           }
           $checkedOutCommit = (& git rev-parse HEAD).Trim()
@@ -117,6 +119,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Candidate metadata verification failed.' }
 
           $metadata = Get-Content -Raw -LiteralPath $metadataPath | ConvertFrom-Json
+          if ($metadata.authenticodeRequired -ne $true) {
+            throw 'Only a production Authenticode-required candidate may enter a release draft.'
+          }
           . ./scripts/windows-packaging.ps1
           $msiProductVersion = Get-MsiProperty -Path $msiPath -Name 'ProductVersion'
           $msiProductName = Get-MsiProperty -Path $msiPath -Name 'ProductName'
@@ -138,11 +143,9 @@ jobs:
               throw "$Path does not have the required trusted, timestamped Authenticode signature. Status=$($signature.Status)."
             }
           }
-          if ($metadata.authenticodeRequired) {
-            $expectedSigner = ($env:WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
-            if ($expectedSigner -notmatch '^[0-9A-F]{40}$') {
-              throw 'Repository variable WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT must contain the production signing certificate SHA-1 thumbprint.'
-            }
+          $expectedSigner = ($env:WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
+          if ($expectedSigner -notmatch '^[0-9A-F]{40}$') {
+            throw 'Repository variable WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT must contain the production signing certificate SHA-1 thumbprint.'
           }
           Assert-CandidateAuthenticode -Path $msiPath
 
@@ -157,6 +160,10 @@ jobs:
             $env:CANDIDATE_SBOM,
             $env:CANDIDATE_NOTICES
           )
+          $unexpectedAssets = @($release.assets | Where-Object { $_.name -notin $candidateAssetNames })
+          if ($unexpectedAssets.Count -ne 0) {
+            throw "Draft release contains assets outside the exact candidate set: $($unexpectedAssets.name -join ', ')"
+          }
           foreach ($assetName in $candidateAssetNames) {
             $currentRelease = gh release view $env:RELEASE_TAG --json isDraft,assets | ConvertFrom-Json
             if (!$currentRelease.isDraft) { throw "Release $env:RELEASE_TAG is no longer a draft." }
@@ -192,8 +199,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Re-downloaded candidate verification failed.' }
           Assert-CandidateAuthenticode -Path $uploadedMsi
 
-          $finalRelease = gh release view $env:RELEASE_TAG --json isDraft | ConvertFrom-Json
+          $finalRelease = gh release view $env:RELEASE_TAG --json isDraft,assets | ConvertFrom-Json
           if (!$finalRelease.isDraft) { throw "Release $env:RELEASE_TAG was published during candidate verification." }
+          $finalAssets = @($finalRelease.assets)
+          if ($finalAssets.Count -ne $candidateAssetNames.Count -or
+              @($finalAssets | Where-Object { $_.name -notin $candidateAssetNames }).Count -ne 0) {
+            throw "Draft release does not contain the exact candidate asset set."
+          }
 
           $stableHashAfter = (Get-FileHash -LiteralPath 'packaging/windows-x64/update-manifest.json' -Algorithm SHA256).Hash
           if ($stableHashAfter -ne $env:STABLE_MANIFEST_SHA256) {
