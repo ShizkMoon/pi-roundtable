@@ -10,7 +10,7 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const generator = path.join(repositoryRoot, "scripts", "generate-windows-release-metadata.mjs");
 const verifier = path.join(repositoryRoot, "scripts", "verify-windows-release-candidate.mjs");
 
-test("release metadata binds exact-run MSI and materials while stable remains an older baseline", async (context) => {
+test("release metadata binds exact-run MSI and materials against an older signed baseline fixture", async (context) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "pi-roundtable-release-metadata-"));
   context.after(() => rm(directory, { recursive: true, force: true }));
   const version = "0.4.0";
@@ -21,7 +21,15 @@ test("release metadata binds exact-run MSI and materials while stable remains an
   const inventory = path.join(directory, `${prefix}.dependencies.json`);
   const sbom = path.join(directory, `${prefix}.sbom.cdx.json`);
   const notices = path.join(directory, `${prefix}.third-party-notices.txt`);
-  const stable = path.join(repositoryRoot, "packaging", "windows-x64", "update-manifest.json");
+  const stable = path.join(directory, "update-manifest.json");
+  await copyFile(
+    path.join(repositoryRoot, "scripts", "test", "fixtures", "update-manifest-v0.3.0.json"),
+    stable,
+  );
+  await copyFile(
+    path.join(repositoryRoot, "packaging", "windows-x64", "update-public-key.pem"),
+    path.join(directory, "update-public-key.pem"),
+  );
   await writeFile(msi, "candidate-msi-bytes");
   await writeFile(inventory, JSON.stringify({ schemaVersion: 1, productVersion: version, sourceCommit: commit, architecture: "x64" }));
   await writeFile(sbom, JSON.stringify({
@@ -67,10 +75,6 @@ test("release metadata binds exact-run MSI and materials while stable remains an
   const stableDocument = JSON.parse(await readFile(stable, "utf8"));
   stableDocument.asset.size += 1;
   await writeFile(tamperedStable, `${JSON.stringify(stableDocument, null, 2)}\n`);
-  await copyFile(
-    path.join(repositoryRoot, "packaging", "windows-x64", "update-public-key.pem"),
-    path.join(directory, "update-public-key.pem"),
-  );
   assert.throws(() => run(verifier, verificationArguments(tamperedStable)), /signature is invalid/);
 
   function verificationArguments(stableManifest = stable) {

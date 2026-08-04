@@ -168,9 +168,10 @@ try {
     }
     $outputDirectory = Split-Path -Parent $resolvedOutput
     New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
+    $manifestJson = (($manifest | ConvertTo-Json -Depth 5) -replace "`r`n", "`n") + "`n"
     [System.IO.File]::WriteAllText(
         $resolvedOutput,
-        ($manifest | ConvertTo-Json -Depth 5) + "`n",
+        $manifestJson,
         [System.Text.UTF8Encoding]::new($false))
     Write-Host "Signed update manifest: $resolvedOutput"
     Write-Host "Version: $Version"

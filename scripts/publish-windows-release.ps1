@@ -358,7 +358,8 @@ if ((& git -C $repoRoot cat-file -t "refs/tags/$tag").Trim() -ne 'tag' -or
     (& git -C $repoRoot rev-parse "$tag^{commit}").Trim() -ne $sourceCommit) {
     throw "Tag $tag must be annotated and point to $sourceCommit."
 }
-$existingRemoteTagLine = ([string](& git -C $repoRoot ls-remote origin "refs/tags/$tag^{}" )).Trim()
+$existingRemoteTagOutput = @(& git -C $repoRoot ls-remote origin "refs/tags/$tag^{}")
+$existingRemoteTagLine = ($existingRemoteTagOutput -join "`n").Trim()
 if ($LASTEXITCODE -ne 0) {
     throw "Unable to inspect remote tag $tag."
 }
