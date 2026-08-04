@@ -11,6 +11,7 @@ import {
   type PiSessionFactory,
   type PiSessionHandle,
 } from "../pi-runtime-adapter.js";
+import type { ProviderContextDiagnosticV1 } from "../provider-context-diagnostics.js";
 import type { RuntimeEvent } from "../runtime-adapter.js";
 
 class FakePiSession implements PiSessionHandle {
@@ -18,9 +19,11 @@ class FakePiSession implements PiSessionHandle {
   readonly steering: string[] = [];
   readonly followUps: string[] = [];
   abortCount = 0;
+  abortCompactionCount = 0;
   disposed = false;
   disposeError: Error | undefined;
   streaming = false;
+  compacting = false;
   promptResult: Promise<void> | undefined;
   #listener: ((event: AgentSessionEvent) => void) | undefined;
 
@@ -31,6 +34,10 @@ class FakePiSession implements PiSessionHandle {
 
   get isStreaming(): boolean {
     return this.streaming;
+  }
+
+  get isCompacting(): boolean {
+    return this.compacting;
   }
 
   getActiveToolNames(): string[] {
@@ -59,6 +66,10 @@ class FakePiSession implements PiSessionHandle {
 
   async abort(): Promise<void> {
     ++this.abortCount;
+  }
+
+  abortCompaction(): void {
+    ++this.abortCompactionCount;
   }
 
   async dispose(): Promise<void> {
@@ -895,6 +906,7 @@ test("emits cancellation without a contradictory completion", async () => {
   const session = factory.session;
   assert.ok(session !== undefined);
   session.streaming = true;
+  session.compacting = true;
 
   const cancelled = await adapter.execute({
     kind: "turn.cancel",
@@ -902,6 +914,7 @@ test("emits cancellation without a contradictory completion", async () => {
     roleId: "role.researcher",
   });
   assert.equal(cancelled.accepted, true);
+  assert.equal(session.abortCompactionCount, 1);
   session.emit({ type: "agent_start" });
   session.emit({ type: "turn_start" });
   session.emit({
@@ -923,6 +936,79 @@ test("emits cancellation without a contradictory completion", async () => {
   );
   assert.equal(events.some((event) => event.kind === "turn.completed"), false);
   session.streaming = false;
+  session.compacting = false;
+  await adapter.stop();
+});
+
+test("emits bounded private usage, cache, and compaction diagnostics", async () => {
+  const factory = new FakePiSessionFactory();
+  const diagnostics: ProviderContextDiagnosticV1[] = [];
+  const adapter = new PiRuntimeAdapter({
+    runtimeId: "runtime-context-diagnostics",
+    sessionId: "session-context-diagnostics",
+    roleId: "role.researcher",
+    providerId: "openai",
+    apiFamily: "openai_responses",
+    modelId: "gpt-test",
+    contextWindow: 100_000,
+    runtimeGeneration: 7,
+    systemPrompt: "stable role prefix",
+    credentialProvider: { resolveApiKey: async () => "test-key" },
+    sessionFactory: factory,
+    now: () => new Date("2026-08-01T00:00:00.000Z"),
+    diagnosticListener: (diagnostic) => diagnostics.push(diagnostic),
+  });
+  await adapter.start();
+  const session = factory.session;
+  assert.ok(session !== undefined);
+
+  session.emit({ type: "compaction_start", reason: "threshold" });
+  session.emit({
+    type: "compaction_end",
+    reason: "threshold",
+    result: {
+      summary: "private summary must never be retained in diagnostics",
+      firstKeptEntryId: "entry-42",
+      tokensBefore: 62_000,
+      estimatedTokensAfter: 19_000,
+      usage: {
+        input: 1_000,
+        output: 100,
+        cacheRead: 600,
+        cacheWrite: 50,
+        totalTokens: 1_100,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    },
+    aborted: false,
+    willRetry: false,
+  });
+  const assistantMessage = {
+    role: "assistant",
+    stopReason: "stop",
+    usage: {
+      input: 2_000,
+      output: 200,
+      cacheRead: 1_500,
+      cacheWrite: 100,
+      totalTokens: 2_200,
+    },
+  } as never;
+  session.emit({ type: "message_end", message: assistantMessage });
+  session.emit({ type: "turn_end", message: assistantMessage, toolResults: [] });
+
+  const compaction = diagnostics.find((item) => item.kind === "context_compaction");
+  assert.equal(compaction?.status, "completed");
+  assert.equal(compaction?.runtimeGeneration, 7);
+  assert.equal(compaction?.tokensBefore, 62_000);
+  assert.equal(compaction?.triggerRatio, 0.62);
+  assert.equal(typeof compaction?.summaryDigest, "string");
+  const usage = diagnostics.filter((item) => item.kind === "provider_usage");
+  assert.equal(usage.length, 2);
+  assert.equal(usage.at(-1)?.cacheReadTokens, 1_500);
+  const cache = diagnostics.filter((item) => item.kind === "provider_cache").at(-1);
+  assert.equal(cache?.hitRate, 1_500 / 3_600);
+  assert.ok(!JSON.stringify(diagnostics).includes("private summary"));
   await adapter.stop();
 });
 

@@ -75,6 +75,53 @@ export {
   type RuntimeContextPolicyOptions,
 } from "./runtime-context-policy.js";
 export {
+  resolveProviderCapabilityProfile,
+  type ContextWindowSource,
+  type ProviderCacheMode,
+  type ProviderCapabilityProfileV1,
+  type ProviderCapabilityResolutionInput,
+  type ProviderFamily,
+} from "./provider-capability-profile.js";
+export {
+  createProviderCacheDiagnostic,
+  resolveProviderCacheRequestPolicy,
+  type CacheRetention,
+  type PrefixInvalidationCause,
+  type ProviderCacheDiagnosticV1,
+  type ProviderCacheRequestPolicyV1,
+} from "./provider-cache-adapter.js";
+export {
+  mergeProviderUsageSamples,
+  parseProviderUsageSample,
+  type ProviderUsageParseContext,
+  type ProviderUsageSampleV1,
+  type ProviderUsageSource,
+} from "./provider-usage.js";
+export {
+  classifyPrefixInvalidation,
+  createRoleContextSnapshot,
+  validateRoleContextSnapshot,
+  type RoleContextSnapshotExpectation,
+  type RoleContextSnapshotInput,
+  type RoleContextSnapshotRejection,
+  type RoleContextSnapshotV1,
+  type RoleContextToolResultV1,
+  type RoleContextTurnV1,
+} from "./role-context-snapshot.js";
+export {
+  finishContextCompaction,
+  startContextCompaction,
+  type ContextCompactionRecordV1,
+  type ContextCompactionResultInput,
+  type ContextCompactionStatus,
+  type ContextCompactionTrackerV1,
+  type ContextCompactionTrigger,
+} from "./context-compaction.js";
+export type {
+  ProviderContextDiagnosticListener,
+  ProviderContextDiagnosticV1,
+} from "./provider-context-diagnostics.js";
+export {
   PI_PLUGIN_CAPABILITIES,
   PI_PLUGIN_COMPATIBILITY_VERSION,
   resolvePiPluginSet,

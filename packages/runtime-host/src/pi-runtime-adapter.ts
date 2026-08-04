@@ -42,6 +42,18 @@ import {
   resolveRuntimeContextPolicy,
   type RuntimeContextPolicyOptions,
 } from "./runtime-context-policy.js";
+import {
+  finishContextCompaction,
+  startContextCompaction,
+  type ContextCompactionTrackerV1,
+} from "./context-compaction.js";
+import {
+  createProviderCacheDiagnostic,
+  resolveProviderCacheRequestPolicy,
+} from "./provider-cache-adapter.js";
+import { resolveProviderCapabilityProfile } from "./provider-capability-profile.js";
+import type { ProviderContextDiagnosticListener } from "./provider-context-diagnostics.js";
+import { parseProviderUsageSample } from "./provider-usage.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
@@ -52,12 +64,14 @@ export interface RuntimeCredentialProvider {
 export interface PiSessionHandle {
   readonly sessionId: string;
   readonly isStreaming: boolean;
+  readonly isCompacting?: boolean;
   getActiveToolNames(): string[];
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string, options?: PromptOptions): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
   abort(): Promise<void>;
+  abortCompaction?(): void;
   dispose(): void | Promise<void>;
 }
 
@@ -88,6 +102,7 @@ export interface PiSessionCreateOptions {
   mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
   approvalHandler?: (request: McpToolApprovalRequest) => Promise<boolean>;
   customTools?: readonly ToolDefinition[];
+  diagnosticListener?: ProviderContextDiagnosticListener;
 }
 
 export interface PiSessionFactory {
@@ -123,6 +138,8 @@ export interface PiRuntimeAdapterOptions {
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
   toolApprovalTimeoutMs?: number;
+  runtimeGeneration?: number;
+  diagnosticListener?: ProviderContextDiagnosticListener;
 }
 
 export class PiRuntimeError extends Error {
@@ -335,13 +352,32 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         throw toStageError("mcp_connect_failed", error);
       }
       const customTools = [...mcpTools, ...(options.customTools ?? [])];
-      // The model registry is authoritative for the final window. Computing
-      // from adapter defaults before model resolution can compact too late for
-      // a smaller built-in model or unnecessarily early for a larger one.
+      const capabilityProfile = resolveProviderCapabilityProfile({
+        providerId: options.providerId,
+        modelId: options.modelId,
+        apiFamily: options.apiFamily,
+        ...(endpoint === undefined ? {} : { endpoint }),
+        ...(options.contextWindow === undefined
+          ? {}
+          : { declaredContextWindow: options.contextWindow }),
+        runtimeContextWindow: model.contextWindow,
+      });
+      // Resolve disagreement conservatively. A declared window or stale SDK
+      // registry entry must never make compaction later than the smaller bound.
       const contextPolicy = resolveRuntimeContextPolicy(
-        model.contextWindow,
+        capabilityProfile.resolvedContextWindow,
         options.contextPolicy,
       );
+      const cacheRequestPolicy = resolveProviderCacheRequestPolicy(
+        capabilityProfile,
+        contextPolicy.cacheRetention,
+        options.sessionId,
+      );
+      emitContextDiagnostic(options.diagnosticListener, createProviderCacheDiagnostic(
+        capabilityProfile,
+        Buffer.byteLength(options.systemPrompt, "utf8"),
+        "initial_session",
+      ));
       const settingsManager = createIsolatedSettingsManager(
         options.thinkingLevel ?? "off",
         contextPolicy,
@@ -390,18 +426,29 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       }
       const session = createdSession;
       const piStreamFunction = session.agent.streamFunction;
-      session.agent.streamFunction = (streamModel, context, streamOptions) =>
-        piStreamFunction(streamModel, context, {
+      session.agent.streamFunction = (streamModel, context, streamOptions) => {
+        const cacheOptions = cacheRequestPolicy.cacheRetention === "none"
+          ? {}
+          : {
+              cacheRetention: cacheRequestPolicy.cacheRetention,
+              ...(cacheRequestPolicy.sessionId === undefined
+                ? {}
+                : { sessionId: cacheRequestPolicy.sessionId }),
+            };
+        return piStreamFunction(streamModel, context, {
           ...streamOptions,
           fetch: activeProviderTransport.fetch,
-          cacheRetention: streamOptions?.cacheRetention ?? contextPolicy.cacheRetention,
-          sessionId: streamOptions?.sessionId ?? options.sessionId,
+          ...cacheOptions,
         });
+      };
       let disposePromise: Promise<void> | undefined;
       return {
         sessionId: session.sessionId,
         get isStreaming() {
           return session.isStreaming;
+        },
+        get isCompacting() {
+          return session.isCompacting;
         },
         getActiveToolNames: () => session.getActiveToolNames(),
         subscribe: (listener) => session.subscribe(listener),
@@ -409,6 +456,7 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         steer: (text) => session.steer(text),
         followUp: (text) => session.followUp(text),
         abort: () => session.abort(),
+        abortCompaction: () => session.abortCompaction(),
         dispose: () => {
           disposePromise ??= (async () => {
             try {
@@ -439,6 +487,18 @@ function toStageError(code: string, error: unknown): PiRuntimeError {
     : new PiRuntimeError(code, `Pi runtime stage failed: ${code}`);
 }
 
+function emitContextDiagnostic(
+  listener: ProviderContextDiagnosticListener | undefined,
+  diagnostic: Parameters<ProviderContextDiagnosticListener>[0],
+): void {
+  try {
+    listener?.(diagnostic);
+  } catch {
+    // Diagnostics are private observations and cannot affect the authoritative
+    // role session or normalized meeting event stream.
+  }
+}
+
 export class PiRuntimeAdapter implements RuntimeAdapter {
   readonly #options: PiRuntimeAdapterOptions;
   readonly #runtimeId: string;
@@ -459,6 +519,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnFailureTerminalEmitted = false;
   #turnStartedEmitted = false;
   #activeTurnCommandId: string | undefined;
+  #compactionTracker: ContextCompactionTrackerV1 | undefined;
+  #lastUsageSignature: string | undefined;
   readonly #pendingToolApprovals = new Map<string, PendingToolApproval>();
 
   constructor(options: PiRuntimeAdapterOptions) {
@@ -601,6 +663,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#turnCancellationEmitted = false;
       }
       try {
+        if (session.isCompacting && session.abortCompaction !== undefined) {
+          try {
+            session.abortCompaction();
+          } catch {
+            // The turn abort below remains authoritative even if Pi's optional
+            // compaction-specific hook races with natural completion.
+          }
+        }
         await session.abort();
         return remember({ commandId: command.commandId, accepted: true });
       } catch (error) {
@@ -730,6 +800,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
             ? []
             : [this.#createSubagentTool(this.#options.subagentSpawner)]),
         ],
+        ...(this.#options.diagnosticListener === undefined
+          ? {}
+          : { diagnosticListener: this.#options.diagnosticListener }),
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;
@@ -815,13 +888,15 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#session = undefined;
     this.#unsubscribeSession?.();
     this.#unsubscribeSession = undefined;
-    const shouldAbort = session.isStreaming || this.#promptDispatchPending;
+    const shouldAbort = session.isStreaming || session.isCompacting || this.#promptDispatchPending;
     this.#promptDispatchPending = false;
     this.#clearCancellationOutcome();
     this.#turnFailed = false;
     this.#turnFailureTerminalEmitted = false;
     this.#turnStartedEmitted = false;
     this.#activeTurnCommandId = undefined;
+    this.#compactionTracker = undefined;
+    this.#lastUsageSignature = undefined;
     for (const pending of this.#pendingToolApprovals.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(false);
@@ -829,6 +904,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#pendingToolApprovals.clear();
     try {
       if (shouldAbort) {
+        if (session.isCompacting && session.abortCompaction !== undefined) {
+          try {
+            session.abortCompaction();
+          } catch {
+            // dispose() is still required and is the final cleanup boundary.
+          }
+        }
         await session.abort();
       }
     } finally {
@@ -938,6 +1020,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#turnFailed = false;
         this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
+        this.#lastUsageSignature = undefined;
         if (!this.#turnStartedEmitted) {
           this.#turnStartedEmitted = true;
           this.#emit("turn.started", {}, this.#activeTurnCommandId);
@@ -963,6 +1046,66 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       case "turn_end":
         this.#observeFinalMessage(event.message);
         break;
+      case "compaction_start": {
+        const policy = this.#resolveDiagnosticContextPolicy();
+        this.#compactionTracker = startContextCompaction({
+          startedAtMs: this.#now().getTime(),
+          trigger: event.reason,
+          triggerRatio: policy.compactAtTokens / policy.contextWindow,
+          providerId: this.#options.providerId,
+          modelId: this.#options.modelId,
+          roleId: this.#options.roleId,
+          sessionId: this.#sessionId,
+          ...(this.#options.runtimeGeneration === undefined
+            ? {}
+            : { runtimeGeneration: this.#options.runtimeGeneration }),
+        });
+        break;
+      }
+      case "compaction_end": {
+        const policy = this.#resolveDiagnosticContextPolicy();
+        const tracker = this.#compactionTracker ?? startContextCompaction({
+          startedAtMs: this.#now().getTime(),
+          trigger: event.reason,
+          triggerRatio: policy.compactAtTokens / policy.contextWindow,
+          providerId: this.#options.providerId,
+          modelId: this.#options.modelId,
+          roleId: this.#options.roleId,
+          sessionId: this.#sessionId,
+          ...(this.#options.runtimeGeneration === undefined
+            ? {}
+            : { runtimeGeneration: this.#options.runtimeGeneration }),
+        });
+        const status = event.aborted
+          ? "aborted" as const
+          : event.errorMessage !== undefined
+            ? "failed" as const
+            : event.result === undefined
+              ? "fallback" as const
+              : "completed" as const;
+        emitContextDiagnostic(this.#options.diagnosticListener, finishContextCompaction(tracker, {
+          finishedAtMs: this.#now().getTime(),
+          status,
+          ...(event.result?.tokensBefore === undefined
+            ? {}
+            : { tokensBefore: event.result.tokensBefore }),
+          ...(event.result?.estimatedTokensAfter === undefined
+            ? {}
+            : { estimatedTokensAfter: event.result.estimatedTokensAfter }),
+          ...(event.result?.firstKeptEntryId === undefined
+            ? {}
+            : { firstKeptEntryId: event.result.firstKeptEntryId }),
+          ...(event.result?.summary === undefined ? {} : { summary: event.result.summary }),
+          ...(status === "failed" ? { failureCode: "pi_compaction_failed" } : {}),
+          ...(status === "fallback" ? { fallbackReason: "missing_compaction_result" } : {}),
+          willRetry: event.willRetry,
+        }));
+        if (event.result?.usage !== undefined) {
+          this.#observeProviderUsage(event.result.usage, true);
+        }
+        this.#compactionTracker = undefined;
+        break;
+      }
       case "agent_settled":
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
@@ -1039,10 +1182,12 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       role?: unknown;
       stopReason?: unknown;
       errorMessage?: unknown;
+      usage?: unknown;
     };
     if (finalMessage.role !== "assistant") {
       return;
     }
+    this.#observeProviderUsage(finalMessage.usage, false);
     if (finalMessage.stopReason === "aborted") {
       this.#markTurnCancelled();
     } else if (finalMessage.stopReason === "error") {
@@ -1051,6 +1196,63 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       );
       this.#markTurnFailed(failure.code, failure.message);
     }
+  }
+
+  #observeProviderUsage(usage: unknown, partial: boolean): void {
+    const sample = parseProviderUsageSample(usage, {
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      observedAt: this.#now().toISOString(),
+      source: "sdk_normalized",
+      partial,
+    });
+    if (sample === undefined) {
+      return;
+    }
+    const signature = JSON.stringify([
+      sample.inputTokens,
+      sample.outputTokens,
+      sample.cacheReadTokens,
+      sample.cacheWriteTokens,
+      sample.totalTokens,
+      sample.partial,
+    ]);
+    if (signature === this.#lastUsageSignature) {
+      return;
+    }
+    this.#lastUsageSignature = signature;
+    emitContextDiagnostic(this.#options.diagnosticListener, sample);
+    const profile = resolveProviderCapabilityProfile({
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      apiFamily: this.#options.apiFamily ?? "custom",
+      ...(this.#options.endpoint === undefined ? {} : { endpoint: this.#options.endpoint }),
+      ...(this.#options.contextWindow === undefined
+        ? {}
+        : { declaredContextWindow: this.#options.contextWindow }),
+    });
+    emitContextDiagnostic(this.#options.diagnosticListener, createProviderCacheDiagnostic(
+      profile,
+      Buffer.byteLength(this.#options.systemPrompt ?? "", "utf8"),
+      "initial_session",
+      sample,
+    ));
+  }
+
+  #resolveDiagnosticContextPolicy(): ReturnType<typeof resolveRuntimeContextPolicy> {
+    const profile = resolveProviderCapabilityProfile({
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      apiFamily: this.#options.apiFamily ?? "custom",
+      ...(this.#options.endpoint === undefined ? {} : { endpoint: this.#options.endpoint }),
+      ...(this.#options.contextWindow === undefined
+        ? {}
+        : { declaredContextWindow: this.#options.contextWindow }),
+    });
+    return resolveRuntimeContextPolicy(
+      profile.resolvedContextWindow,
+      this.#options.contextPolicy,
+    );
   }
 
   #markTurnCancelled(): void {
