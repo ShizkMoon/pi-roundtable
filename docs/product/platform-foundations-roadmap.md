@@ -155,8 +155,10 @@ ONNX/DirectML 文件。
 3. WiX harvest 与默认 ICE validation；
 4. 独立 QA Product/UpgradeCode 的 install、launch、repair、major upgrade、downgrade blocking、
    second repair、uninstall 和残留检查；
-5. 正式证书签名、RFC 3161 timestamp、信任链与最终 hash；
-6. 真实 96/144/192 DPI 和高对比矩阵。
+5. 最终资产 hash、SBOM、NOTICE 与发布后重下载校验。
+
+正式证书签名、干净 VM 生产 UpgradeCode 演练、真实 96/144/192 DPI 和高对比矩阵
+均为可选诊断；未执行时记录为 `pending`，不阻止个人项目发版。
 
 `-SuppressMsiValidation` 只用于已由等价产物通过 ICE 的受限重打包场景；非管理员会话、
 Windows Installer 服务不可达或仅成功生成 MSI，都不能写成 lifecycle verified。

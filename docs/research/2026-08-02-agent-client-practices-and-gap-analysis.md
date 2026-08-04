@@ -142,7 +142,7 @@ Pi Roundtable 已经越过“静态 UI 原型”阶段：Windows 客户端、C++
 
 ### P2：分发与第二平台 — pending
 
-1. 隔离 MSI 生命周期已在完整 22,594 文件生产负载 verified 安装、启动、修复、升级、降级阻止、再次修复、卸载与零残留；每个 release candidate 继续重跑，并补正式 Authenticode/SmartScreen 声誉验收。
+1. 隔离 MSI 生命周期已在完整 22,594 文件生产负载 verified 安装、启动、修复、升级、降级阻止、再次修复、卸载与零残留；每个 release candidate 继续重跑。正式 Authenticode/SmartScreen 声誉验收保留为个人项目的可选增强。
 2. ARM64 打包。
 3. Android 作为 UI-only 客户端接入认证同步、断线游标恢复和前台流。
 4. 不新增 Oh My Pi 或其他运行时兼容面；Pi 保持唯一运行时。

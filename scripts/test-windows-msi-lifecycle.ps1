@@ -341,6 +341,79 @@ function Invoke-InstalledAppSmoke {
     }
 }
 
+function Assert-InstalledFullPayload {
+    param([Parameter(Mandatory = $true)][string]$Label)
+    if (!$UseFullPayload) {
+        return
+    }
+
+    [xml]$manifest = Get-Content -LiteralPath $generatedWxs -Raw
+    $fileNodes = @($manifest.SelectNodes("//*[local-name()='File']"))
+    if ($fileNodes.Count -lt 1000) {
+        throw "The full-payload WiX manifest is unexpectedly small: $($fileNodes.Count) files."
+    }
+    $stagePrefix = [System.IO.Path]::GetFullPath($appStage).TrimEnd([System.IO.Path]::DirectorySeparatorChar) +
+        [System.IO.Path]::DirectorySeparatorChar
+    foreach ($fileNode in $fileNodes) {
+        $sourcePath = [System.IO.Path]::GetFullPath([string]$fileNode.Source)
+        if (!$sourcePath.StartsWith($stagePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The WiX payload escaped the staged application root: $sourcePath"
+        }
+        $relativePath = [System.IO.Path]::GetRelativePath($appStage, $sourcePath)
+        $installedPath = Join-Path $qaInstallDirectory $relativePath
+        if (!(Test-Path -LiteralPath $installedPath -PathType Leaf) -or
+            (Get-Item -LiteralPath $installedPath).Length -ne (Get-Item -LiteralPath $sourcePath).Length) {
+            throw "The installed full payload is missing or changed: $relativePath"
+        }
+    }
+    $script:steps.Add([ordered]@{
+        operation = 'payload-verification'
+        label = $Label
+        fileCount = $fileNodes.Count
+        allManifestFilesPresent = $true
+    })
+}
+
+function Invoke-InstalledRuntimeSmoke {
+    param([Parameter(Mandatory = $true)][string]$Label)
+    if (!$UseFullPayload) {
+        return
+    }
+
+    $node = Join-Path $qaInstallDirectory 'runtime\node.exe'
+    $runtimeHost = Join-Path $qaInstallDirectory 'runtime-host'
+    $hostMain = Join-Path $runtimeHost 'host-main.js'
+    foreach ($required in @($node, $hostMain, (Join-Path $runtimeHost 'index.js'))) {
+        if (!(Test-Path -LiteralPath $required -PathType Leaf)) {
+            throw "Installed Runtime Host prerequisite is missing: $required"
+        }
+    }
+    & $node '--check' $hostMain | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed Runtime Host syntax smoke failed for $Label."
+    }
+    Push-Location -LiteralPath $runtimeHost
+    try {
+        & $node '--input-type=module' '--eval' "await import('@pi-roundtable/protocol')" | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Installed protocol import smoke failed for $Label."
+        }
+        & $node '--input-type=module' '--eval' "await import('./index.js')" | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Installed Runtime Host import smoke failed for $Label."
+        }
+    } finally {
+        Pop-Location
+    }
+    $script:steps.Add([ordered]@{
+        operation = 'runtime-smoke'
+        label = $Label
+        syntax = $true
+        protocolImport = $true
+        runtimeHostImport = $true
+    })
+}
+
 $steps = [System.Collections.Generic.List[object]]::new()
 $cleanupSteps = [System.Collections.Generic.List[object]]::new()
 $productionBefore = @(Get-RelatedProducts $productionUpgradeCode | Sort-Object)
@@ -396,6 +469,7 @@ try {
 
     Invoke-MsiExec -Operation install -Target $baselineMsi -LogName '01-install-baseline.log' | Out-Null
     Assert-ProductInstalled $baselineProperties.productCode $BaselineVersion
+    Invoke-InstalledRuntimeSmoke -Label 'baseline'
     Invoke-InstalledAppSmoke -Label 'baseline'
 
     $baselineExecutable = Join-Path $qaInstallDirectory 'PiRoundtable.Windows.exe'
@@ -413,6 +487,8 @@ try {
         throw 'Major upgrade left the baseline ProductCode registered.'
     }
     Assert-ProductInstalled $candidateProperties.productCode $CandidateVersion
+    Assert-InstalledFullPayload -Label 'candidate-after-upgrade'
+    Invoke-InstalledRuntimeSmoke -Label 'candidate-after-upgrade'
     Invoke-InstalledAppSmoke -Label 'candidate-after-upgrade'
 
     $candidateExecutable = Join-Path $qaInstallDirectory 'PiRoundtable.Windows.exe'

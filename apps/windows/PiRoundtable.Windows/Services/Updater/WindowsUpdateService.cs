@@ -39,8 +39,7 @@ internal sealed record WindowsUpdateServiceOptions(
                 {
                     [UpdateTrustAnchor.KeyId] = UpdateTrustAnchor.PublicKeyPem,
                 },
-                ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
-                MinimumAuthenticodeVersion: new Version(0, 4, 0)),
+                ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/")),
             Path.Combine(LocalDataRoot.Resolve(), "updates"),
             currentVersion);
     }

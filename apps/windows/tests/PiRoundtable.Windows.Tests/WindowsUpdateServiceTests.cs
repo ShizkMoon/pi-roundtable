@@ -147,17 +147,17 @@ public sealed class WindowsUpdateServiceTests
     }
 
     [TestMethod]
-    public void Production_policy_rejects_unsigned_manifest_from_0_4_0_onward()
+    public void Production_policy_accepts_manifest_that_does_not_require_authenticode()
     {
         using var fixture = new UpdateFixture();
         var manifest = fixture.CreateManifest(Encoding.UTF8.GetBytes("unsigned-msi"), "0.4.0");
-        var verifier = new UpdateManifestVerifier(fixture.Policy with
-        {
-            MinimumAuthenticodeVersion = new Version(0, 4, 0),
-        });
+        manifest.Asset.Url = "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.4.0/PiRoundtable-0.4.0-win-x64.msi";
+        var verifier = new UpdateManifestVerifier(fixture.ProductionPolicy);
 
-        Assert.ThrowsExactly<InvalidDataException>(() =>
-            verifier.ParseAndVerify(fixture.SignAndSerialize(manifest), DateTimeOffset.UtcNow));
+        var verified = verifier.ParseAndVerify(fixture.SignAndSerialize(manifest), DateTimeOffset.UtcNow);
+
+        Assert.AreEqual(new Version(0, 4, 0), verified.Version);
+        Assert.IsFalse(verified.Document.Asset.AuthenticodeRequired);
     }
 
     [TestMethod]
@@ -622,8 +622,7 @@ public sealed class WindowsUpdateServiceTests
             {
                 [UpdateTrustAnchor.KeyId] = UpdateTrustAnchor.PublicKeyPem,
             },
-            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
-            MinimumAuthenticodeVersion: new Version(0, 4, 0)));
+            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/")));
 
         var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-04T00:00:00Z"));
 
@@ -831,8 +830,7 @@ public sealed class WindowsUpdateServiceTests
             "stable",
             "x64",
             new Dictionary<string, string> { ["test-key"] = _key.ExportSubjectPublicKeyInfoPem() },
-            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
-            MinimumAuthenticodeVersion: new Version(0, 4, 0));
+            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"));
 
         public UpdateManifestDocument CreateManifest(
             byte[] payload,
