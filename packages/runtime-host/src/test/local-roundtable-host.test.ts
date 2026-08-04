@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   PROTOCOL_VERSION,
+  validateMeetingEvent,
   type JsonObject,
   type MeetingCommand,
   type MeetingEvent,
@@ -47,6 +48,12 @@ import {
   DefaultRoleContextAssembler,
   type RoleContextAssembler,
 } from "../role-context-assembler.js";
+import { DefaultDiscussionOrchestrator } from "../discussion-orchestrator.js";
+import {
+  SynchronousNormalizedEventWriter,
+  type NormalizedEventWriter,
+  type NormalizedEventWriterOptions,
+} from "../normalized-event-writer.js";
 
 class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly commands: RuntimeCommand[] = [];
@@ -608,6 +615,7 @@ test("broadcasts shared and per-role assignments sequentially with a role-exclus
   const directSent = events.find((event) => event.kind === "message.direct_sent");
   assert.equal(directSent?.visibility, "private");
   assert.deepEqual(directSent?.audience, ["user.direct_host", "role.b"]);
+  assert.deepEqual(directSent?.payload, { message: "Keep this risk private" });
   adapters.get("role.b")?.emit("turn.started", {}, "direct-b");
   adapters.get("role.b")?.emit("turn.delta", { delta: "Private answer" }, "direct-b");
   adapters.get("role.b")?.emit("turn.completed", {}, "direct-b");
@@ -1230,6 +1238,65 @@ test("routes frozen participant assembly through the injected role context seam"
     assert.equal(requests[0]?.participant.participantId, "participant.secretary");
     assert.equal(requests[0]?.runtimeGeneration, 1);
     assert.equal(requests[0]?.workspace.workspaceId, "workspace.test");
+  } finally {
+    await host.stop();
+  }
+});
+
+test("routes scheduler policy and normalized event authority through injected seams", async () => {
+  class TrackingDiscussionOrchestrator extends DefaultDiscussionOrchestrator {
+    configureCount = 0;
+
+    override configure(
+      ...args: Parameters<DefaultDiscussionOrchestrator["configure"]>
+    ): ReturnType<DefaultDiscussionOrchestrator["configure"]> {
+      ++this.configureCount;
+      return super.configure(...args);
+    }
+  }
+
+  const orchestrator = new TrackingDiscussionOrchestrator();
+  let writer: NormalizedEventWriter | undefined;
+  let writerOptions: NormalizedEventWriterOptions | undefined;
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeId: "runtime.windows",
+    runtimeGeneration: 1,
+    discussionOrchestrator: orchestrator,
+    normalizedEventWriterFactory: (options) => {
+      writerOptions = options;
+      writer = new SynchronousNormalizedEventWriter(options);
+      return writer;
+    },
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  const events: MeetingEvent[] = [];
+  host.subscribe((event) => events.push(event));
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  }, 5);
+  host.start();
+  try {
+    assert.equal((await host.execute(command("role.add", "add-seam-role", {
+      actorId: "participant.secretary",
+    }))).status, "accepted");
+    assert.equal((await host.execute(command("discussion.configure", "configure-through-seam", {
+      actorId: "user.direct_host",
+      payload: { agendaItems: ["Runtime seams"] },
+    }))).status, "accepted");
+
+    assert.equal(orchestrator.configureCount, 1);
+    assert.equal(writerOptions?.meetingId, "meeting-local-test");
+    assert.equal(writerOptions?.runtimeGeneration, 1);
+    assert.equal(writer?.sequence, host.sequence);
+    assert.deepEqual(events.map((event) => event.sequence), [6, 7, 8, 9]);
+    assert.deepEqual(events.map((event) => event.kind), [
+      "runtime.lease_acquired",
+      "role.registered",
+      "discussion.configured",
+      "agenda.item_changed",
+    ]);
+    assert.deepEqual(events.flatMap((event) => validateMeetingEvent(event)), []);
   } finally {
     await host.stop();
   }

@@ -6,7 +6,6 @@ import {
   type CommandReceipt,
   type JsonObject,
   type MeetingCommand,
-  type MeetingEvent,
   type MeetingEventKind,
   type RoleScope,
   type ParticipantManifest,
@@ -43,6 +42,10 @@ import {
   type DiscussionSchedulerSnapshot,
   type DiscussionTransition,
 } from "./discussion-scheduler.js";
+import {
+  DefaultDiscussionOrchestrator,
+  type DiscussionOrchestrator,
+} from "./discussion-orchestrator.js";
 import { AsyncWorkLimiter } from "./async-work-limiter.js";
 import {
   PiDiscussionObserver,
@@ -65,8 +68,15 @@ import {
   type RoleContextAssembler,
 } from "./role-context-assembler.js";
 import { WorkspaceCapabilityResolver } from "./capability-resolver.js";
+import {
+  SynchronousNormalizedEventWriter,
+  type MeetingEventListener,
+  type NormalizedEventWriter,
+  type NormalizedEventWriterFactory,
+} from "./normalized-event-writer.js";
 
 export type { ResolvedRoleRuntimeConfiguration } from "./role-context-assembler.js";
+export type { MeetingEventListener } from "./normalized-event-writer.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -80,9 +90,12 @@ export interface LocalRoundtableHostOptions {
   adapterFactory?: (roleId: string, configuration?: ResolvedRoleRuntimeConfiguration) => RuntimeAdapter;
   subagentRunner?: SubagentRunner;
   publicMessagePlanner?: PublicMessagePlanner;
+  /** @deprecated Inject DiscussionOrchestrator for new integrations. */
   discussionScheduler?: FacilitatedDiscussionScheduler;
+  discussionOrchestrator?: DiscussionOrchestrator;
   discussionObserver?: DiscussionObserver;
   roleContextAssembler?: RoleContextAssembler;
+  normalizedEventWriterFactory?: NormalizedEventWriterFactory;
 }
 
 interface PendingHandoff {
@@ -142,7 +155,6 @@ interface ActiveTurnTimeout {
   handle: ReturnType<typeof setTimeout>;
 }
 
-export type MeetingEventListener = (event: MeetingEvent) => void;
 export type HostDiagnosticListener = (errorCode: string, message: string) => void;
 export type LocalHostStopMode = "suspend" | "close";
 
@@ -153,7 +165,7 @@ export class LocalRoundtableHost {
   readonly #roleSessions: RoleSessionSupervisor<ResolvedRoleRuntimeConfiguration>;
   readonly #now: () => Date;
   readonly #turnTimeoutMs: number;
-  readonly #eventListeners = new Set<MeetingEventListener>();
+  readonly #eventWriter: NormalizedEventWriter;
   readonly #diagnosticListeners = new Set<HostDiagnosticListener>();
   readonly #expectedTurns = new Map<string, ExpectedTurn>();
   readonly #pendingPublicTurns: PendingPublicTurn[] = [];
@@ -161,7 +173,7 @@ export class LocalRoundtableHost {
   readonly #rolePublicCursors = new Map<string, number>();
   readonly #subagentRunner: SubagentRunner;
   readonly #publicMessagePlanner: PublicMessagePlanner;
-  readonly #discussionScheduler: FacilitatedDiscussionScheduler;
+  readonly #discussionOrchestrator: DiscussionOrchestrator;
   readonly #discussionObserver: DiscussionObserver;
   readonly #roleContextAssembler: RoleContextAssembler;
   readonly #discussionObserverLimiter = new AsyncWorkLimiter(MAX_CONCURRENT_DISCUSSION_OBSERVERS);
@@ -174,7 +186,6 @@ export class LocalRoundtableHost {
   readonly #timedOutTurnCommands = new Set<string>();
   #subagentContinuationRetry: ReturnType<typeof setTimeout> | undefined;
   #phase: "created" | "live" | "closed" = "created";
-  #sequence = 0;
   #activeRoleId: string | undefined;
   #activeTurnCorrelationId: string | undefined;
   #activeTurnVisibility: "public" | "private" = "public";
@@ -191,12 +202,24 @@ export class LocalRoundtableHost {
     if (options.meetingId.length === 0) {
       throw new Error("meetingId is required");
     }
+    if (options.discussionScheduler !== undefined && options.discussionOrchestrator !== undefined) {
+      throw new Error("Provide either discussionScheduler or discussionOrchestrator, not both");
+    }
     this.#options = options;
     this.#runtimeOwner = new RuntimeGenerationOwner({
       runtimeId: options.runtimeId ?? randomUUID(),
       runtimeGeneration: options.runtimeGeneration ?? 1,
     });
     this.#now = options.now ?? (() => new Date());
+    const eventWriterOptions = {
+      meetingId: options.meetingId,
+      runtimeGeneration: this.runtimeGeneration,
+      now: this.#now,
+      shouldWrite: (allowDuringStop: boolean) =>
+        !this.#runtimeOwner.stopRequested || allowDuringStop,
+    };
+    this.#eventWriter = options.normalizedEventWriterFactory?.(eventWriterOptions) ??
+      new SynchronousNormalizedEventWriter(eventWriterOptions);
     const turnTimeoutMs = options.turnTimeoutMs ?? 120_000;
     if (!Number.isSafeInteger(turnTimeoutMs) || turnTimeoutMs < 1 || turnTimeoutMs > 900_000) {
       throw new RangeError("turnTimeoutMs must be an integer between 1 and 900000");
@@ -204,7 +227,10 @@ export class LocalRoundtableHost {
     this.#turnTimeoutMs = turnTimeoutMs;
     this.#subagentRunner = options.subagentRunner ?? new PiSubagentRunner();
     this.#publicMessagePlanner = options.publicMessagePlanner ?? new PiPublicMessagePlanner();
-    this.#discussionScheduler = options.discussionScheduler ?? new FacilitatedDiscussionScheduler();
+    this.#discussionOrchestrator = options.discussionOrchestrator ??
+      new DefaultDiscussionOrchestrator(
+        options.discussionScheduler ?? new FacilitatedDiscussionScheduler(),
+      );
     this.#discussionObserver = options.discussionObserver ?? new PiDiscussionObserver();
     this.#roleContextAssembler = options.roleContextAssembler ?? new DefaultRoleContextAssembler({
       capabilityResolver: new WorkspaceCapabilityResolver({
@@ -228,7 +254,7 @@ export class LocalRoundtableHost {
       readState: () => ({
         meetingId: this.meetingId,
         runtimeGeneration: this.runtimeGeneration,
-        sequence: this.#sequence,
+        sequence: this.sequence,
         leaseActive: this.#runtimeOwner.leaseActive,
         stopRequested: this.#runtimeOwner.stopRequested,
         stopped: this.#runtimeOwner.stopped,
@@ -276,12 +302,11 @@ export class LocalRoundtableHost {
   }
 
   get sequence(): number {
-    return this.#sequence;
+    return this.#eventWriter.sequence;
   }
 
   subscribe(listener: MeetingEventListener): () => void {
-    this.#eventListeners.add(listener);
-    return () => this.#eventListeners.delete(listener);
+    return this.#eventWriter.subscribe(listener);
   }
 
   subscribeDiagnostics(listener: HostDiagnosticListener): () => void {
@@ -306,13 +331,13 @@ export class LocalRoundtableHost {
     if (session.phase === "closed") {
       throw new Error("A closed meeting cannot start a Runtime Host");
     }
-    this.#sequence = initialSequence;
+    this.#eventWriter.reset(initialSequence);
     this.#phase = session.phase === "live" ? "live" : "created";
     this.#workspace = structuredClone(workspace);
     this.#session = structuredClone(session);
     this.#credentials = new Map(Object.entries(credentials));
     if (discussionState !== undefined) {
-      this.#discussionScheduler.restore(discussionState);
+      this.#discussionOrchestrator.restore(discussionState);
     }
     this.#runtimeOwner.markConfigurationInitialized();
   }
@@ -818,7 +843,7 @@ export class LocalRoundtableHost {
     if (this.#runtimeOwner.stopRequested) {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
-    for (const request of this.#discussionScheduler.removeRole(roleId)) {
+    for (const request of this.#discussionOrchestrator.removeRole(roleId)) {
       this.#emit("floor.rejected", this.runtimeId, roleId, command.commandId, {
         requestId: request.requestId,
         reason: archive ? "role_archived" : "role_removed",
@@ -878,7 +903,7 @@ export class LocalRoundtableHost {
     }
     let snapshot: DiscussionSchedulerSnapshot;
     try {
-      snapshot = this.#discussionScheduler.configure(
+      snapshot = this.#discussionOrchestrator.configure(
         agendaItems,
         Math.max(1, this.#roleSessions.size),
         limits,
@@ -921,7 +946,7 @@ export class LocalRoundtableHost {
     }
     let transition: DiscussionTransition | undefined;
     try {
-      transition = this.#discussionScheduler.setMode(mode, reason);
+      transition = this.#discussionOrchestrator.setMode(mode, reason);
     } catch {
       return this.#receipt(command, "rejected", "invalid_transition", "Discussion mode cannot change now");
     }
@@ -944,7 +969,7 @@ export class LocalRoundtableHost {
     if (this.#phase !== "live" || command.actorId !== "user.direct_host") {
       return this.#invalidTransition(command);
     }
-    const transition = this.#discussionScheduler.resume(
+    const transition = this.#discussionOrchestrator.resume(
       this.#readString(command.payload, "reason")?.trim() || "host_resume",
     );
     if (transition === undefined) {
@@ -963,7 +988,7 @@ export class LocalRoundtableHost {
       return this.#invalidTransition(command);
     }
     try {
-      const result = this.#discussionScheduler.advanceAgenda(
+      const result = this.#discussionOrchestrator.advanceAgenda(
         this.#readString(command.payload, "reason")?.trim() || "host_advanced",
       );
       if (result.completed !== undefined) {
@@ -1017,19 +1042,19 @@ export class LocalRoundtableHost {
         "A floor request requires a known role, kind, reason, and prompt",
       );
     }
-    const result = this.#discussionScheduler.requestFloor({
+    const result = this.#discussionOrchestrator.requestFloor({
       requestId: command.commandId,
       roleId,
       kind: kindText,
       reason,
       prompt,
-      requestedAtSequence: this.#sequence + 1,
+      requestedAtSequence: this.sequence + 1,
       ...(command.targetId === undefined || command.targetId === null || command.targetId === roleId
         ? {}
         : { respondsToRoleId: command.targetId }),
-      ...(this.#discussionScheduler.activeAgendaItemId === undefined
+      ...(this.#discussionOrchestrator.activeAgendaItemId === undefined
         ? {}
-        : { agendaItemId: this.#discussionScheduler.activeAgendaItemId }),
+        : { agendaItemId: this.#discussionOrchestrator.activeAgendaItemId }),
     });
     if (!result.accepted || result.request === undefined) {
       return this.#receipt(
@@ -1056,14 +1081,14 @@ export class LocalRoundtableHost {
       result.request.kind === "critical" &&
       this.#activeRoleId !== undefined &&
       this.#activeRoleId !== roleId &&
-      this.#discussionScheduler.acceptInterruption(roleId)
+      this.#discussionOrchestrator.acceptInterruption(roleId)
     ) {
-      this.#discussionScheduler.rejectFloor(result.request.requestId);
+      this.#discussionOrchestrator.rejectFloor(result.request.requestId);
       this.#emit("floor.granted", this.runtimeId, roleId, command.commandId, {
         requestId: result.request.requestId,
         kind: result.request.kind,
         reason: result.request.reason,
-        mode: this.#discussionScheduler.mode,
+        mode: this.#discussionOrchestrator.mode,
         agendaItemId: result.request.agendaItemId ?? null,
         interrupting: true,
       });
@@ -1098,7 +1123,10 @@ export class LocalRoundtableHost {
     if (!requestId) {
       return this.#receipt(command, "rejected", "invalid_floor_request", "requestId is required");
     }
-    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roleSessions.keys()), requestId);
+    const request = this.#discussionOrchestrator.takeNextFloor(
+      new Set(this.#roleSessions.keys()),
+      requestId,
+    );
     if (request === undefined) {
       return this.#receipt(command, "rejected", "unknown_floor_request", "Floor request is unavailable");
     }
@@ -1117,7 +1145,7 @@ export class LocalRoundtableHost {
     const requestId = this.#readString(command.payload, "requestId")?.trim();
     const request = requestId === undefined
       ? undefined
-      : this.#discussionScheduler.rejectFloor(requestId);
+      : this.#discussionOrchestrator.rejectFloor(requestId);
     if (request === undefined) {
       return this.#receipt(command, "rejected", "unknown_floor_request", "Floor request is unavailable");
     }
@@ -1157,7 +1185,7 @@ export class LocalRoundtableHost {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
     if (command.payload.complete === true) {
-      const transition = this.#discussionScheduler.setMode("completed", "convergence_recorded");
+      const transition = this.#discussionOrchestrator.setMode("completed", "convergence_recorded");
       if (transition !== undefined) {
         this.#emitDiscussionTransition(transition, command.commandId, command.actorId ?? this.runtimeId);
       }
@@ -1274,10 +1302,10 @@ export class LocalRoundtableHost {
     if (this.#runtimeOwner.stopRequested) {
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
-    if (this.#discussionScheduler.configured) {
-      const counters = this.#discussionScheduler.beginSegment();
+    if (this.#discussionOrchestrator.configured) {
+      const counters = this.#discussionOrchestrator.beginSegment();
       this.#emit("discussion.budget_updated", this.runtimeId, null, command.commandId, {
-        mode: this.#discussionScheduler.mode,
+        mode: this.#discussionOrchestrator.mode,
         reason: "host_segment_started",
         ...this.#discussionCountersPayload(counters),
       });
@@ -1379,9 +1407,9 @@ export class LocalRoundtableHost {
       this.#runtimeOwner.stopRequested ||
       this.#activeRoleId !== undefined ||
       this.#phase !== "live" ||
-      (this.#discussionScheduler.configured &&
-        (this.#discussionScheduler.mode === "paused" ||
-          this.#discussionScheduler.mode === "completed"))
+      (this.#discussionOrchestrator.configured &&
+        (this.#discussionOrchestrator.mode === "paused" ||
+          this.#discussionOrchestrator.mode === "completed"))
     ) {
       return;
     }
@@ -1398,13 +1426,13 @@ export class LocalRoundtableHost {
       ) {
         continue;
       }
-      if (this.#discussionScheduler.configured) {
+      if (this.#discussionOrchestrator.configured) {
         this.#emit("floor.granted", this.runtimeId, next.roleId, next.commandId, {
           requestId: next.floorRequestId ?? next.commandId,
           kind: next.requestKind ?? "host",
           reason: next.requestReason ?? "scheduled",
-          mode: this.#discussionScheduler.mode,
-          agendaItemId: this.#discussionScheduler.activeAgendaItemId ?? null,
+          mode: this.#discussionOrchestrator.mode,
+          agendaItemId: this.#discussionOrchestrator.activeAgendaItemId ?? null,
         });
       }
       this.#expectedTurns.set(next.roleId, { commandId: next.commandId, visibility: "public" });
@@ -1426,7 +1454,7 @@ export class LocalRoundtableHost {
         return;
       }
       this.#expectedTurns.delete(next.roleId);
-      if (this.#discussionScheduler.configured) {
+      if (this.#discussionOrchestrator.configured) {
         this.#emit("floor.rejected", this.runtimeId, next.roleId, next.commandId, {
           requestId: next.floorRequestId ?? next.commandId,
           reason: "runtime_rejected",
@@ -1434,10 +1462,10 @@ export class LocalRoundtableHost {
       }
       this.#diagnose(this.#safeRuntimeErrorCode(result.errorCode), "A mentioned role could not take the public floor");
     }
-    if (!this.#discussionScheduler.configured) {
+    if (!this.#discussionOrchestrator.configured) {
       return;
     }
-    const request = this.#discussionScheduler.takeNextFloor(new Set(this.#roleSessions.keys()));
+    const request = this.#discussionOrchestrator.takeNextFloor(new Set(this.#roleSessions.keys()));
     if (request !== undefined) {
       this.#queueFloorRequest(request, request.requestId);
       await this.#startNextPublicTurn();
@@ -1446,7 +1474,7 @@ export class LocalRoundtableHost {
     // An empty floor queue is not evidence that an agenda item is complete.
     // The direct host may request several passes before explicitly advancing;
     // independent soft/hard budgets still prevent unbounded automation.
-    if (this.#discussionScheduler.mode === "convergence") {
+    if (this.#discussionOrchestrator.mode === "convergence") {
       this.#queueConvergenceTurn(null);
       if (this.#pendingPublicTurns.length > 0) {
         await this.#startNextPublicTurn();
@@ -1635,10 +1663,10 @@ export class LocalRoundtableHost {
   }
 
   #discussionModeInstruction(): string[] {
-    if (!this.#discussionScheduler.configured) {
+    if (!this.#discussionOrchestrator.configured) {
       return [];
     }
-    switch (this.#discussionScheduler.mode) {
+    switch (this.#discussionOrchestrator.mode) {
       case "agenda":
         return [
           "This is an agenda turn. Address the active item directly and make dependencies explicit.",
@@ -1687,8 +1715,8 @@ export class LocalRoundtableHost {
   #queueConvergenceTurn(causationId: string | null): void {
     if (
       this.#runtimeOwner.stopRequested ||
-      this.#discussionScheduler.mode !== "convergence" ||
-      this.#discussionScheduler.pendingRequestCount > 0 ||
+      this.#discussionOrchestrator.mode !== "convergence" ||
+      this.#discussionOrchestrator.pendingRequestCount > 0 ||
       this.#pendingPublicTurns.length > 0 ||
       this.#activeRoleId !== undefined
     ) {
@@ -1696,23 +1724,23 @@ export class LocalRoundtableHost {
     }
     const roleId = this.#selectFacilitatorRole();
     if (roleId === undefined) {
-      const transition = this.#discussionScheduler.pause("facilitator_unavailable");
+      const transition = this.#discussionOrchestrator.pause("facilitator_unavailable");
       if (transition !== undefined) {
         this.#emitDiscussionTransition(transition, causationId, this.runtimeId);
       }
       return;
     }
-    const requestId = `convergence:${causationId ?? this.#sequence + 1}`;
-    const result = this.#discussionScheduler.requestFloor({
+    const requestId = `convergence:${causationId ?? this.sequence + 1}`;
+    const result = this.#discussionOrchestrator.requestFloor({
       requestId,
       roleId,
       kind: "facilitator",
       reason: "automatic_convergence",
       prompt: "收敛当前公开讨论：只列出已有决策、未解决异议、待补证据与下一步行动，并建议结束或返回一个明确议题。",
-      requestedAtSequence: this.#sequence + 1,
-      ...(this.#discussionScheduler.activeAgendaItemId === undefined
+      requestedAtSequence: this.sequence + 1,
+      ...(this.#discussionOrchestrator.activeAgendaItemId === undefined
         ? {}
-        : { agendaItemId: this.#discussionScheduler.activeAgendaItemId }),
+        : { agendaItemId: this.#discussionOrchestrator.activeAgendaItemId }),
     });
     if (result.accepted && result.request !== undefined) {
       this.#emit("floor.requested", roleId, null, causationId, {
@@ -1742,13 +1770,13 @@ export class LocalRoundtableHost {
     progressKinds: readonly DiscussionProgressKind[],
     causationId: string | null,
   ): void {
-    if (this.#runtimeOwner.stopRequested || !this.#discussionScheduler.configured) {
+    if (this.#runtimeOwner.stopRequested || !this.#discussionOrchestrator.configured) {
       return;
     }
-    const modeBefore = this.#discussionScheduler.mode;
-    const result = this.#discussionScheduler.recordTurn(roleId, progressKinds);
+    const modeBefore = this.#discussionOrchestrator.mode;
+    const result = this.#discussionOrchestrator.recordTurn(roleId, progressKinds);
     this.#emit("discussion.budget_updated", this.runtimeId, roleId, causationId, {
-      mode: this.#discussionScheduler.mode,
+      mode: this.#discussionOrchestrator.mode,
       progressKinds: [...progressKinds],
       ...this.#discussionCountersPayload(result.counters),
     });
@@ -1762,7 +1790,7 @@ export class LocalRoundtableHost {
       }
       return;
     }
-    if (modeBefore === "convergence" && this.#discussionScheduler.mode === "convergence") {
+    if (modeBefore === "convergence" && this.#discussionOrchestrator.mode === "convergence") {
       this.#emit("convergence.recorded", roleId, null, causationId, {
         progressKinds: [...progressKinds],
         complete: true,
@@ -1771,7 +1799,10 @@ export class LocalRoundtableHost {
       if (this.#runtimeOwner.stopRequested) {
         return;
       }
-      const transition = this.#discussionScheduler.setMode("completed", "convergence_turn_completed");
+      const transition = this.#discussionOrchestrator.setMode(
+        "completed",
+        "convergence_turn_completed",
+      );
       if (transition !== undefined) {
         this.#emitDiscussionTransition(transition, causationId, this.runtimeId);
       }
@@ -1787,7 +1818,7 @@ export class LocalRoundtableHost {
       previousMode: transition.previousMode,
       mode: transition.mode,
       reason: transition.reason,
-      ...this.#discussionCountersPayload(this.#discussionScheduler.snapshot().counters),
+      ...this.#discussionCountersPayload(this.#discussionOrchestrator.snapshot().counters),
     });
   }
 
@@ -1827,8 +1858,8 @@ export class LocalRoundtableHost {
   ): void {
     if (
       correlationId === undefined ||
-      !this.#discussionScheduler.configured ||
-      this.#discussionScheduler.mode !== "free_discussion" ||
+      !this.#discussionOrchestrator.configured ||
+      this.#discussionOrchestrator.mode !== "free_discussion" ||
       observedText.trim().length === 0
     ) {
       return;
@@ -1868,7 +1899,7 @@ export class LocalRoundtableHost {
     if (
       this.#runtimeOwner.stopRequested ||
       this.#runtimeOwner.stopped ||
-      this.#discussionScheduler.mode !== "free_discussion" ||
+      this.#discussionOrchestrator.mode !== "free_discussion" ||
       this.#roleSessions.get(speakerRoleId)?.sessionToken !== speakerSessionToken
     ) {
       return;
@@ -1890,15 +1921,15 @@ export class LocalRoundtableHost {
       if (this.#scheduledDiscussionObservationIds.has(observationId)) {
         continue;
       }
-      if (!this.#discussionScheduler.acceptObserverProbe()) {
+      if (!this.#discussionOrchestrator.acceptObserverProbe()) {
         break;
       }
       this.#rememberScheduledObservation(observationId);
       this.#emit("discussion.budget_updated", this.runtimeId, candidateRoleId, correlationId, {
-        mode: this.#discussionScheduler.mode,
+        mode: this.#discussionOrchestrator.mode,
         observerRoleId: candidateRoleId,
         observedSpeakerRoleId: speakerRoleId,
-        ...this.#discussionCountersPayload(this.#discussionScheduler.snapshot().counters),
+        ...this.#discussionCountersPayload(this.#discussionOrchestrator.snapshot().counters),
       });
       if (this.#runtimeOwner.stopRequested) {
         return;
@@ -2000,7 +2031,7 @@ export class LocalRoundtableHost {
     const decisionKey = `${observedCorrelationId}\u0000${candidateRoleId}`;
     if (
       this.#runtimeOwner.stopped ||
-      this.#discussionScheduler.mode !== "free_discussion" ||
+      this.#discussionOrchestrator.mode !== "free_discussion" ||
       this.#roleSessions.get(observedSpeakerRoleId)?.sessionToken !== observedSpeakerSessionToken ||
       decision.action === "none" ||
       decision.kind === undefined ||
@@ -2078,10 +2109,10 @@ export class LocalRoundtableHost {
       );
     }
     if (
-      this.#discussionScheduler.configured &&
+      this.#discussionOrchestrator.configured &&
       command.payload.hostAuthorized !== true &&
       command.payload.budgetReserved !== true &&
-      !this.#discussionScheduler.acceptInterruption(interruptorId)
+      !this.#discussionOrchestrator.acceptInterruption(interruptorId)
     ) {
       return this.#receipt(
         command,
@@ -2090,7 +2121,7 @@ export class LocalRoundtableHost {
         "The autonomous interruption budget is exhausted",
       );
     }
-    if (!this.#discussionScheduler.configured) {
+    if (!this.#discussionOrchestrator.configured) {
       this.#pendingPublicTurns.length = 0;
     }
     const target = this.#roleSessions.get(targetId);
@@ -2662,43 +2693,30 @@ export class LocalRoundtableHost {
     audience?: string[],
     allowDuringStop = false,
   ): void {
-    if (this.#runtimeOwner.stopRequested && !allowDuringStop) {
+    const request = {
+      kind,
+      actorId,
+      targetId,
+      causationId,
+      payload,
+      allowDuringStop,
+    };
+    if (visibility === "private") {
+      this.#eventWriter.write({
+        ...request,
+        visibility,
+        audience: audience ?? [],
+      });
       return;
     }
-    const event: MeetingEvent = {
-      protocolVersion: PROTOCOL_VERSION,
-      meetingId: this.meetingId,
-      eventId: randomUUID(),
-      sequence: ++this.#sequence,
-      runtimeGeneration: this.runtimeGeneration,
-      kind,
-      occurredAt: this.#now().toISOString(),
-      visibility,
-      payload,
-    };
-    if (actorId !== null) {
-      event.actorId = actorId;
-    }
-    if (targetId !== null) {
-      event.targetId = targetId;
-    }
-    if (causationId !== null) {
-      event.causationId = causationId;
-    }
     if (audience !== undefined) {
-      event.audience = audience;
+      throw new Error("Public normalized events cannot carry an audience");
     }
-    for (const listener of this.#eventListeners) {
-      try {
-        listener(event);
-      } catch {
-        // Presentation and transport listeners cannot corrupt authoritative state.
-      }
-    }
+    this.#eventWriter.write({ ...request, visibility });
   }
 
   #accepted(command: MeetingCommand): CommandReceipt {
-    return this.#receipt(command, "accepted", null, null, this.#sequence);
+    return this.#receipt(command, "accepted", null, null, this.sequence);
   }
 
   #invalidTransition(command: MeetingCommand): CommandReceipt {

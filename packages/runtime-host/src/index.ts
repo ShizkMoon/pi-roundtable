@@ -54,6 +54,11 @@ export {
   type TurnBudgetResult,
 } from "./discussion-scheduler.js";
 export {
+  DefaultDiscussionOrchestrator,
+  type AgendaAdvanceResult,
+  type DiscussionOrchestrator,
+} from "./discussion-orchestrator.js";
+export {
   PiDiscussionObserver,
   validateDiscussionObservation,
   type DiscussionObservationDecision,
@@ -98,6 +103,13 @@ export {
   type RoleContextAssembler,
   type RoleContextAssemblyRequest,
 } from "./role-context-assembler.js";
+export {
+  SynchronousNormalizedEventWriter,
+  type NormalizedEventWriteRequest,
+  type NormalizedEventWriter,
+  type NormalizedEventWriterFactory,
+  type NormalizedEventWriterOptions,
+} from "./normalized-event-writer.js";
 export type {
   RuntimeAdapter,
   RuntimeCapabilities,
