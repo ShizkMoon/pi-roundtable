@@ -17,6 +17,7 @@ import {
   type ProviderCapabilityRegistry,
 } from "./provider-capability-registry.js";
 import { RoleCredentialLease } from "./role-credential-lease.js";
+import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
 
 export interface ResolvedRoleRuntimeConfiguration {
   displayName: string;
@@ -111,6 +112,7 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
       policy: participant.capabilitiesSnapshot,
       resolveCredential,
     });
+    const plugins = resolvePiPluginSet(capabilities.skillPaths, capabilities.mcpServers);
 
     return {
       displayName: participant.displayName,
@@ -133,13 +135,13 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
       // Keep the raw frozen prompt here. The default Pi adapter adds the stable
       // role prefix exactly once at its own boundary.
       systemPrompt: participant.systemPromptSnapshot,
-      skillPaths: [...capabilities.skillPaths],
+      skillPaths: [...plugins.skillPaths],
       credentialLease: new RoleCredentialLease({
         roleId,
         runtimeGeneration,
         providerId: providerModel.providerId,
         apiKey,
-        mcpServers: capabilities.mcpServers,
+        mcpServers: plugins.mcpServers,
       }),
       delegation: {
         networkAccess: participant.delegationSnapshot.networkAccess,

@@ -53,7 +53,6 @@ import {
   type DiscussionObserver,
 } from "./discussion-observer.js";
 import { buildStableRoleSystemPrompt } from "./runtime-context-policy.js";
-import { resolvePiPluginSet } from "./pi-plugin-compatibility.js";
 import { RuntimeGenerationOwner } from "./runtime-generation-owner.js";
 import { MeetingCommandRouter } from "./meeting-command-router.js";
 import {
@@ -74,6 +73,10 @@ import {
   type NormalizedEventWriter,
   type NormalizedEventWriterFactory,
 } from "./normalized-event-writer.js";
+import {
+  RuntimeCredentialVault,
+  type RuntimeCredentialVaultFactory,
+} from "./runtime-credential-vault.js";
 
 export type { ResolvedRoleRuntimeConfiguration } from "./role-context-assembler.js";
 export type { MeetingEventListener } from "./normalized-event-writer.js";
@@ -96,6 +99,7 @@ export interface LocalRoundtableHostOptions {
   discussionObserver?: DiscussionObserver;
   roleContextAssembler?: RoleContextAssembler;
   normalizedEventWriterFactory?: NormalizedEventWriterFactory;
+  credentialVaultFactory?: RuntimeCredentialVaultFactory;
 }
 
 interface PendingHandoff {
@@ -196,7 +200,9 @@ export class LocalRoundtableHost {
     | undefined;
   #workspace: WorkspaceProfile | undefined;
   #session: RoundtableSession | undefined;
-  #credentials = new Map<string, string>();
+  #credentialVault: RuntimeCredentialVault | undefined;
+  #initializingConfiguration = false;
+  #stopPromise: Promise<void> | undefined;
 
   constructor(options: LocalRoundtableHostOptions) {
     if (options.meetingId.length === 0) {
@@ -322,6 +328,9 @@ export class LocalRoundtableHost {
     discussionState?: DiscussionSchedulerSnapshot,
   ): void {
     this.#runtimeOwner.assertCanInitializeConfiguration();
+    if (this.#initializingConfiguration) {
+      throw new Error("Runtime configuration initialization is already in progress");
+    }
     if (session.sessionId !== this.meetingId || session.workspaceId !== workspace.workspaceId) {
       throw new Error("Runtime session does not match the meeting or workspace");
     }
@@ -331,20 +340,72 @@ export class LocalRoundtableHost {
     if (session.phase === "closed") {
       throw new Error("A closed meeting cannot start a Runtime Host");
     }
-    this.#eventWriter.reset(initialSequence);
-    this.#phase = session.phase === "live" ? "live" : "created";
-    this.#workspace = structuredClone(workspace);
-    this.#session = structuredClone(session);
-    this.#credentials = new Map(Object.entries(credentials));
-    if (discussionState !== undefined) {
-      this.#discussionOrchestrator.restore(discussionState);
+    this.#initializingConfiguration = true;
+    let previousSequence: number | undefined;
+    let previousDiscussionState: DiscussionSchedulerSnapshot | undefined;
+    let nextVault: RuntimeCredentialVault | undefined;
+    try {
+      previousSequence = this.sequence;
+      const nextWorkspace = structuredClone(workspace);
+      const nextSession = structuredClone(session);
+      previousDiscussionState = this.#discussionOrchestrator.snapshot();
+      nextVault = this.#options.credentialVaultFactory?.(credentials) ??
+        new RuntimeCredentialVault(credentials);
+      if (nextVault.closed) {
+        throw new Error("Credential vault factory returned a closed vault");
+      }
+      if (discussionState !== undefined) {
+        this.#discussionOrchestrator.restore(discussionState);
+      }
+      this.#eventWriter.reset(initialSequence);
+      this.#phase = session.phase === "live" ? "live" : "created";
+      this.#workspace = nextWorkspace;
+      this.#session = nextSession;
+      this.#credentialVault = nextVault;
+      this.#runtimeOwner.markConfigurationInitialized();
+    } catch (error) {
+      try {
+        nextVault?.close();
+      } catch {
+        // Preserve the initialization error and complete transactional rollback
+        // even when a replaceable credential-vault seam fails during close.
+      }
+      this.#credentialVault = undefined;
+      this.#workspace = undefined;
+      this.#session = undefined;
+      this.#phase = "created";
+      if (previousDiscussionState !== undefined) {
+        try {
+          this.#discussionOrchestrator.restore(previousDiscussionState);
+        } catch {
+          // A custom orchestrator must not mask the initialization failure while
+          // its credential owner is being closed.
+        }
+      }
+      if (previousSequence !== undefined) {
+        try {
+          this.#eventWriter.reset(previousSequence);
+        } catch {
+          // Preserve the original initialization error across a custom seam.
+        }
+      }
+      throw error;
+    } finally {
+      this.#initializingConfiguration = false;
     }
-    this.#runtimeOwner.markConfigurationInitialized();
   }
 
   start(): void {
+    if (this.#initializingConfiguration) {
+      throw new Error("Runtime configuration initialization is in progress");
+    }
     this.#runtimeOwner.acquireLease(this.#options.adapterFactory !== undefined);
-    this.#emit("runtime.lease_acquired", this.runtimeId, null, null, {});
+    try {
+      this.#emit("runtime.lease_acquired", this.runtimeId, null, null, {});
+    } catch (error) {
+      this.#runtimeOwner.releaseLease();
+      throw error;
+    }
   }
 
   restoreConfiguredRoles(): Promise<void> {
@@ -353,7 +414,20 @@ export class LocalRoundtableHost {
     } catch (error) {
       return Promise.reject(error);
     }
-    return this.#commandRouter.serializeOperation(() => this.#restoreConfiguredRolesNow());
+    return this.#commandRouter.serializeOperation(async () => {
+      try {
+        await this.#restoreConfiguredRolesNow();
+      } catch (error) {
+        this.#runtimeOwner.requestStop();
+        try {
+          await this.#stopNow("suspend");
+        } catch {
+          // The original restoration error remains the actionable failure;
+          // #stopNow's finally block still clears credential/configuration state.
+        }
+        throw error;
+      }
+    });
   }
 
   async #restoreConfiguredRolesNow(): Promise<void> {
@@ -402,7 +476,12 @@ export class LocalRoundtableHost {
 
   stop(mode: LocalHostStopMode = "suspend"): Promise<void> {
     this.#runtimeOwner.requestStop();
-    return this.#commandRouter.serializeOperation(() => this.#stopNow(mode));
+    if (this.#stopPromise !== undefined) {
+      return this.#stopPromise;
+    }
+    const operation = this.#commandRouter.serializeOperation(() => this.#stopNow(mode));
+    this.#stopPromise = operation;
+    return operation;
   }
 
   async #stopNow(mode: LocalHostStopMode): Promise<void> {
@@ -419,25 +498,39 @@ export class LocalRoundtableHost {
     this.#pendingSubagentContinuations.length = 0;
     this.#clearSubagentContinuationRetry();
     this.#clearAllTurnTimeouts();
-    const roleStops = await this.#roleSessions.stopAll();
-    this.#diagnoseRoleStopFailures(roleStops);
-    this.#discussionObservations.clear();
-    this.#lastObservedLengths.clear();
-    this.#scheduledDiscussionObservationIds.clear();
-    this.#acceptedObserverFloorRequests.clear();
-    this.#publicMessages.length = 0;
-    this.#rolePublicCursors.clear();
-    if (mode === "close" && this.#phase === "live") {
-      this.#phase = "closed";
-      this.#emit("meeting.closed", this.runtimeId, null, null, {}, "public", undefined, true);
+    // Fence new resolution and wipe the meeting-owned byte buffers before
+    // awaiting adapters or child processes. Each active role owns a separate
+    // credential lease that its supervisor closes during retirement.
+    let stopFailure = this.#detachCredentialVault();
+    try {
+      const roleStops = await this.#roleSessions.stopAll();
+      this.#diagnoseRoleStopFailures(roleStops);
+      this.#discussionObservations.clear();
+      this.#lastObservedLengths.clear();
+      this.#scheduledDiscussionObservationIds.clear();
+      this.#acceptedObserverFloorRequests.clear();
+      this.#publicMessages.length = 0;
+      this.#rolePublicCursors.clear();
+      if (mode === "close" && this.#phase === "live") {
+        this.#phase = "closed";
+        this.#emit("meeting.closed", this.runtimeId, null, null, {}, "public", undefined, true);
+      }
+      if (this.#runtimeOwner.releaseLease()) {
+        this.#emit("runtime.lease_released", this.runtimeId, null, null, {}, "public", undefined, true);
+      }
+    } catch (error) {
+      stopFailure ??= error;
+    } finally {
+      // Configuration and non-secret meeting snapshots must not survive a
+      // throwing injected event/adapter seam after credential closure.
+      this.#runtimeOwner.releaseLease();
+      this.#workspace = undefined;
+      this.#session = undefined;
+      this.#runtimeOwner.clearConfiguration();
     }
-    if (this.#runtimeOwner.releaseLease()) {
-      this.#emit("runtime.lease_released", this.runtimeId, null, null, {}, "public", undefined, true);
+    if (stopFailure !== undefined) {
+      throw stopFailure;
     }
-    this.#credentials.clear();
-    this.#workspace = undefined;
-    this.#session = undefined;
-    this.#runtimeOwner.clearConfiguration();
   }
 
   #openMeeting(command: MeetingCommand): CommandReceipt {
@@ -459,12 +552,45 @@ export class LocalRoundtableHost {
     this.#pendingHandoff = undefined;
     this.#expectedTurns.clear();
     this.#pendingPublicTurns.length = 0;
-    await this.#stopAllRoles();
-    if (this.#runtimeOwner.stopRequested) {
-      return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
+    let closeFailure = this.#detachCredentialVault();
+    try {
+      // Closing the meeting is committed before asynchronous role retirement.
+      // A concurrent process shutdown must not erase this terminal event.
+      this.#emit(
+        "meeting.closed",
+        this.runtimeId,
+        null,
+        command.commandId,
+        {},
+        "public",
+        undefined,
+        true,
+      );
+    } catch (error) {
+      closeFailure ??= error;
     }
-    this.#emit("meeting.closed", this.runtimeId, null, command.commandId, {});
+    try {
+      await this.#stopAllRoles();
+    } catch (error) {
+      closeFailure ??= error;
+    }
+    if (closeFailure !== undefined) {
+      throw closeFailure;
+    }
     return this.#accepted(command);
+  }
+
+  #detachCredentialVault(): unknown {
+    const vault = this.#credentialVault;
+    this.#credentialVault = undefined;
+    try {
+      vault?.close();
+      return undefined;
+    } catch (error) {
+      // A replaceable vault seam cannot prevent role retirement and ownership
+      // cleanup. The caller surfaces this failure after completing cleanup.
+      return error;
+    }
   }
 
   #rejectUnsupportedToolInvocation(command: MeetingCommand): CommandReceipt {
@@ -736,6 +862,17 @@ export class LocalRoundtableHost {
     if (this.#roleSessions.has(roleId)) {
       return this.#receipt(command, "rejected", "duplicate_role", "Role already exists");
     }
+    const sessionBeforeResolution = this.#session;
+    const hadSessionParticipant = sessionBeforeResolution?.participants.some(
+      (participant) => participant.participantId === roleId,
+    ) ?? false;
+    const rollbackDynamicParticipant = (): void => {
+      if (!hadSessionParticipant && this.#session?.participants.some(
+        (participant) => participant.participantId === roleId,
+      )) {
+        this.#session = sessionBeforeResolution;
+      }
+    };
     let configuration: ResolvedRoleRuntimeConfiguration | undefined;
     if (
       this.#workspace !== undefined ||
@@ -766,6 +903,7 @@ export class LocalRoundtableHost {
         ...(configuration === undefined ? {} : { configuration }),
       });
     } catch (error) {
+      rollbackDynamicParticipant();
       const errorCode = this.#safeRuntimeErrorCode(
         error instanceof PiRuntimeError ? error.code : "role_runtime_failed",
       );
@@ -778,6 +916,7 @@ export class LocalRoundtableHost {
       );
     }
     if (startOutcome.status === "stop_requested" || this.#runtimeOwner.stopRequested) {
+      rollbackDynamicParticipant();
       return this.#receipt(command, "rejected", "runtime_stopped", "Runtime is stopped");
     }
     this.#rolePublicCursors.set(roleId, 0);
@@ -2436,10 +2575,6 @@ export class LocalRoundtableHost {
     if (configuration === undefined) {
       throw new Error("Resolved role runtime configuration is required");
     }
-    const plugins = resolvePiPluginSet(
-      configuration.skillPaths,
-      configuration.credentialLease.materializeMcpServers(),
-    );
     const options = {
       runtimeId: `${this.runtimeId}:g${identity.runtimeGeneration}:${roleId}`,
       sessionId: `role-session.${identity.sessionToken}`,
@@ -2466,8 +2601,7 @@ export class LocalRoundtableHost {
         roleId,
         configuration.displayName,
       ),
-      skillPaths: plugins.skillPaths,
-      mcpServers: plugins.mcpServers,
+      skillPaths: configuration.skillPaths,
       ...(configuration.delegation.maxConcurrentSubagents < 1
         ? {}
         : { subagentSpawner: (task: string) =>
@@ -2475,6 +2609,8 @@ export class LocalRoundtableHost {
       credentialProvider: {
         resolveApiKey: async (providerId: string) =>
           configuration.credentialLease.resolveApiKey(providerId),
+        materializeMcpServers: () =>
+          configuration.credentialLease.materializeMcpServers(),
       },
     };
     return new PiRuntimeAdapter(
@@ -2495,6 +2631,7 @@ export class LocalRoundtableHost {
     let participant = session.participants.find(
       (candidate) => candidate.participantId === roleId,
     );
+    let dynamicSessionCommit: RoundtableSession | undefined;
     if (participant === undefined && scope === "temporary") {
       if (this.#phase !== "live") {
         throw new Error("Dynamic temporary roles can only be invited during a live meeting");
@@ -2523,7 +2660,7 @@ export class LocalRoundtableHost {
       } else if (inviter.inviterId !== "user.direct_host") {
         throw new Error("User invitations must come from the direct meeting host");
       }
-      this.#session = structuredClone(nextSession);
+      dynamicSessionCommit = structuredClone(nextSession);
       session = nextSession;
       participant = candidate;
     }
@@ -2534,14 +2671,18 @@ export class LocalRoundtableHost {
     ) {
       throw new Error("Participant identity or scope does not match the role command");
     }
-    return this.#roleContextAssembler.assemble({
+    const configuration = this.#roleContextAssembler.assemble({
       workspace,
       participant,
       roleId,
       scope,
       runtimeGeneration: this.runtimeGeneration,
-      resolveCredential: (reference) => this.#credentials.get(reference),
+      resolveCredential: (reference) => this.#credentialVault?.resolve(reference),
     });
+    if (dynamicSessionCommit !== undefined) {
+      this.#session = dynamicSessionCommit;
+    }
+    return configuration;
   }
 
   #isActiveTurnEvent(roleId: string, event: RuntimeEvent): boolean {

@@ -1,4 +1,5 @@
 import type { ResolvedMcpServerRuntimeConfiguration } from "./mcp-client-manager.js";
+import { ZeroizableUtf8Secret } from "./zeroizable-utf8-secret.js";
 
 export interface RoleCredentialLeaseOptions {
   roleId: string;
@@ -8,18 +9,26 @@ export interface RoleCredentialLeaseOptions {
   mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
 }
 
-/**
- * Bounds resolved credential references to one role and runtime generation.
- * close() drops the lease's references and blocks later materialization. RUN-006
- * will replace the retained JavaScript strings with explicitly zeroizable
- * storage; this class intentionally makes no premature zeroization claim.
- */
+type NonSecretMcpConfiguration = Omit<
+  ResolvedMcpServerRuntimeConfiguration,
+  "environment" | "headers"
+>;
+
+interface LeasedMcpConfiguration {
+  configuration: NonSecretMcpConfiguration;
+  environment?: ReadonlyArray<readonly [string, ZeroizableUtf8Secret]>;
+  headers?: ReadonlyArray<readonly [string, ZeroizableUtf8Secret]>;
+}
+
+/** Bounds independently owned credential buffers to one role generation. */
 export class RoleCredentialLease {
   readonly roleId: string;
   readonly runtimeGeneration: number;
   readonly providerId: string;
-  #apiKey: string | undefined;
-  #mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[] | undefined;
+  readonly #apiKey: ZeroizableUtf8Secret;
+  readonly #mcpServers: readonly LeasedMcpConfiguration[];
+  readonly #ownedSecrets: ZeroizableUtf8Secret[] = [];
+  #closed = false;
 
   constructor(options: RoleCredentialLeaseOptions) {
     if (options.roleId.length === 0) {
@@ -34,24 +43,90 @@ export class RoleCredentialLease {
     this.roleId = options.roleId;
     this.runtimeGeneration = options.runtimeGeneration;
     this.providerId = options.providerId;
-    this.#apiKey = options.apiKey;
-    this.#mcpServers = structuredClone(options.mcpServers);
+    this.#apiKey = new ZeroizableUtf8Secret(options.apiKey);
+    this.#ownedSecrets.push(this.#apiKey);
+    try {
+      this.#mcpServers = options.mcpServers.map((server) => {
+        const { environment, headers, ...configuration } = server;
+        return {
+          configuration: structuredClone(configuration),
+          ...(environment === undefined
+            ? {}
+            : { environment: this.#leaseRecord(environment) }),
+          ...(headers === undefined ? {} : { headers: this.#leaseRecord(headers) }),
+        };
+      });
+    } catch (error) {
+      this.close();
+      throw error;
+    }
   }
 
   get closed(): boolean {
-    return this.#apiKey === undefined;
+    return this.#closed;
+  }
+
+  get ownedSecretCount(): number {
+    return this.#ownedSecrets.length;
+  }
+
+  get ownedByteLength(): number {
+    return this.#ownedSecrets.reduce((total, secret) => total + secret.byteLength, 0);
+  }
+
+  get zeroizedSecretCount(): number {
+    return this.#ownedSecrets.filter((secret) => secret.isZeroized).length;
+  }
+
+  get zeroizedByteLength(): number {
+    return this.#ownedSecrets.reduce(
+      (total, secret) => total + (secret.isZeroized ? secret.byteLength : 0),
+      0,
+    );
   }
 
   resolveApiKey(providerId: string): string | undefined {
-    return providerId === this.providerId ? this.#apiKey : undefined;
+    return !this.#closed && providerId === this.providerId
+      ? this.#apiKey.reveal()
+      : undefined;
   }
 
   materializeMcpServers(): ResolvedMcpServerRuntimeConfiguration[] {
-    return this.#mcpServers === undefined ? [] : [...structuredClone(this.#mcpServers)];
+    if (this.#closed) {
+      return [];
+    }
+    return this.#mcpServers.map(({ configuration, environment, headers }) => ({
+      ...structuredClone(configuration),
+      ...(environment === undefined
+        ? {}
+        : { environment: this.#revealRecord(environment) }),
+      ...(headers === undefined ? {} : { headers: this.#revealRecord(headers) }),
+    }));
   }
 
   close(): void {
-    this.#apiKey = undefined;
-    this.#mcpServers = undefined;
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    for (const secret of this.#ownedSecrets) {
+      secret.close();
+    }
+  }
+
+  #leaseRecord(
+    values: Readonly<Record<string, string>>,
+  ): ReadonlyArray<readonly [string, ZeroizableUtf8Secret]> {
+    return Object.entries(values).map(([name, value]) => {
+      const secret = new ZeroizableUtf8Secret(value);
+      this.#ownedSecrets.push(secret);
+      return [name, secret] as const;
+    });
+  }
+
+  #revealRecord(
+    values: ReadonlyArray<readonly [string, ZeroizableUtf8Secret]>,
+  ): Record<string, string> {
+    return Object.fromEntries(values.map(([name, secret]) => [name, secret.reveal()]));
   }
 }

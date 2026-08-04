@@ -51,6 +51,60 @@ test("rejects duplicate MCP identities with conflicting authority", () => {
   );
 });
 
+test("hashes credential records without leaking secrets and isolates resolved configuration", () => {
+  const first = {
+    serverId: "mcp.secure",
+    displayName: "Secure MCP",
+    transport: "stdio" as const,
+    command: "node",
+    environment: { B: "second-secret", A: "first-secret" },
+    headers: { Authorization: "Bearer header-secret" },
+    toolAllowlist: ["read"],
+    approvalMode: "never" as const,
+    executionMode: "direct" as const,
+  };
+  const equivalent = {
+    ...structuredClone(first),
+    environment: { A: "first-secret", B: "second-secret" },
+  };
+  const resolved = resolvePiPluginSet([], [first, equivalent]);
+  first.environment.A = "caller-mutation";
+  assert.equal(resolved.mcpServers[0]?.environment?.A, "first-secret");
+
+  let message = "";
+  assert.throws(
+    () => resolvePiPluginSet([], [equivalent, {
+      ...structuredClone(equivalent),
+      environment: { A: "different-secret", B: "second-secret" },
+    }]),
+    (error: unknown) => {
+      message = error instanceof Error ? error.message : String(error);
+      return /Conflicting approved MCP configurations/.test(message);
+    },
+  );
+  assert.equal(message.includes("first-secret"), false);
+  assert.equal(message.includes("different-secret"), false);
+});
+
+test("length-prefixes malformed credential records without delimiter collisions", () => {
+  const base = {
+    serverId: "mcp.nul",
+    displayName: "NUL MCP",
+    transport: "stdio" as const,
+    command: "node",
+    toolAllowlist: [],
+    approvalMode: "never" as const,
+    executionMode: "direct" as const,
+  };
+  assert.throws(
+    () => resolvePiPluginSet([], [
+      { ...base, environment: { a: "\0b\0" } },
+      { ...base, environment: { a: "", b: "" } },
+    ]),
+    /Conflicting approved MCP configurations/,
+  );
+});
+
 test("rejects empty plugin identities", () => {
   assert.throws(() => resolvePiPluginSet(["  "], []), /non-empty filesystem paths/);
 });
