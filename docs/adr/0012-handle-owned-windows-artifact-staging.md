@@ -64,5 +64,5 @@ installation authorization, or process execution into that assembly.
 - Deterministic tests cover success, cancellation/timeout while waiting, reparse
   rejection, ancestor locks, Authenticode handle identity, replacement, long
   paths, orphan cleanup, concurrent reuse, and sidecar-failure recovery.
-  Sustained fuzzing, forced process termination at every commit instruction,
-  and clean-VM release evidence remain pending release gates.
+  Sustained fuzzing and forced process termination at every commit instruction
+  remain pending hardening work; clean-VM evidence is an optional diagnostic.

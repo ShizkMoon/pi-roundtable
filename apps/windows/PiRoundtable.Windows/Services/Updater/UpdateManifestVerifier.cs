@@ -14,8 +14,7 @@ internal sealed record UpdateManifestPolicy(
     IReadOnlyDictionary<string, string> TrustedPublicKeys,
     long MaximumAssetBytes = 2L * 1024 * 1024 * 1024,
     bool AllowLoopbackHttp = false,
-    Uri? ReleaseAssetBaseUri = null,
-    Version? MinimumAuthenticodeVersion = null);
+    Uri? ReleaseAssetBaseUri = null);
 
 internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy)
 {
@@ -115,12 +114,6 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
             publishedAt > now.AddMinutes(10))
         {
             throw new InvalidDataException("更新发布时间无效或来自未来。");
-        }
-        if (policy.MinimumAuthenticodeVersion is { } minimumAuthenticodeVersion &&
-            version >= minimumAuthenticodeVersion &&
-            !document.Asset.AuthenticodeRequired)
-        {
-            throw new InvalidDataException("该版本的更新包必须要求 Windows Authenticode 验证。");
         }
         if (document.Asset.Size <= 0 || document.Asset.Size > policy.MaximumAssetBytes)
         {

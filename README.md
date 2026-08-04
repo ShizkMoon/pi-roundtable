@@ -13,7 +13,7 @@ Pi Roundtable 是一个原生 GUI 优先的多角色圆桌会议平台。当前�
 | `apps/android` | 脚手架已验证 | Kotlin + Jetpack Compose Material 3，自适应手机/平板界面；Debug APK 与单元测试已在本机通过，尚未接入同步服务 |
 | `apps/windows` | 已实现本地 alpha 闭环；新增基础层待接 UI | .NET 10 + WinUI 3；自适应会话轨道、严格单/多角色 `@`、公开/私聊、自动主持模式/议题/预算/队列状态带、审批到期与 SubAgent 活动；安全原生 Markdown、LaTeX 源码回退、长记录虚拟化/跟随/跳到最新；系统/亮色/暗色与高对比主题策略；会话 JSON/Markdown 导出与非破坏性导入预检；逐角色模型/System Prompt/Skill/MCP；Credential Manager；版本化 SQLite + 当前用户 DPAPI 的事件重放、调度快照、代次恢复及 append-only 角色记忆修订存储；Markdown/TeX/DrawIO/DOCX/PPTX/XLSX 安全输入规范化与 PDF 元数据预检基础（尚未接 composer）；自包含 x64 MSI；ECDSA 签名更新清单、固定公钥、大小/SHA-256 校验及独立更新辅助程序 |
 
-“已实现/已验证”描述当前工作站和仓库测试面，不表示已经生产部署。仓库不保存提供商凭据；真实提供商验收结果只保留在被忽略的本机 `out/`。托管桌面会话无法截图时，功能状态与视觉状态会分开记录，UIA 结构快照不能冒充像素级视觉验收。Windows 代码签名流水线已实现且以临时证书验证机制，但正式可信证书、时间戳发布验收及 100%/200% 真实 DPI 证据仍依赖发布环境。角色记忆的自动提取/召回注入与管理 UI、文档附件 UI、真正的公式排版引擎、PDF 正文提取/OCR、DrawIO/Office/PDF 编辑型输出、ARM64、客户端远端同步接入、E2EE、TLS/限流/保留任务、多副本通知、推送和生产级重连仍是后续工作。
+“已实现/已验证”描述当前工作站和仓库测试面，不表示已经生产部署。仓库不保存提供商凭据；真实提供商验收结果只保留在被忽略的本机 `out/`。托管桌面会话无法截图时，功能状态与视觉状态会分开记录，UIA 结构快照不能冒充像素级视觉验收。Windows 代码签名、干净 VM 升级演练及 96/144/192 DPI 矩阵均保留为可选诊断；个人项目发版不以这些外部环境为前置条件，未执行时必须标为 `pending`。角色记忆的自动提取/召回注入与管理 UI、文档附件 UI、真正的公式排版引擎、PDF 正文提取/OCR、DrawIO/Office/PDF 编辑型输出、ARM64、客户端远端同步接入、E2EE、TLS/限流/保留任务、多副本通知、推送和生产级重连仍是后续工作。
 
 ## 架构边界
 
@@ -69,11 +69,11 @@ npm run dev:sync
 `npm run quality:windows`。每次门禁写入独立运行目录；命令退出码只记录为 `passed`，
 只有解析并核对版本、提交、工件哈希和时间的报告才能记录为 `verified`。
 
-正式 `ReleaseCandidate` 是对已经完成的签名构建及现场证据作最终失败关闭核验：必须
-提供完整测试/ICE 均未跳过的生产签名构建报告、与已签名 stable manifest 字节一致的
-基线 MSI、同一候选工件在 clean VM 上完成真实 production stable→candidate 升级的
-报告，以及绑定同一 WinUI EXE 的真实 96/144/192 DPI 报告。普通 CI、一次性自签名
-smoke 和隔离 QA UpgradeCode 生命周期都不能替代这些证据。完整契约见
+正式 `ReleaseCandidate` 是个人维护者可在当前 Windows 工作站直接运行的自包含门禁：
+它从干净提交执行完整测试、默认 ICE 验证和最终 MSI 构建，核对版本、提交、五项发布
+资产、SBOM/NOTICE 与 SHA-256，再用隔离 QA UpgradeCode 对完整自包含负载执行安装、
+启动、修复、升级、降级阻止和卸载。生产 Authenticode、干净 VM、三档真实 DPI 与真实
+提供商报告均为可选诊断，不再阻止个人项目发版。完整契约见
 [`Release Candidate evidence contract`](docs/quality/release-candidate-evidence.md)。
 
 同步服务默认监听 `http://127.0.0.1:4317`。`npm run dev:sync` 不会自动加载 `.env`；服务在密钥映射缺失或无效时拒绝启动。健康检查无需认证；所有 `/v1` 路由都要求由 `PI_ROUNDTABLE_AUTH_KEYS_JSON` 验证的签名设备令牌。未设置 `DATABASE_URL` 时仅使用内存存储，适合有界本机开发且重启即丢失；配置 PostgreSQL 后启动时会应用幂等迁移。令牌约束和待完成的 TLS/E2EE 边界见 [`packages/sync-server/README.md`](packages/sync-server/README.md)。
@@ -107,19 +107,19 @@ dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.4.0
 ```
 
-脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.4.0-win-x64.msi`、提交绑定的候选元数据、依赖清单、CycloneDX SBOM、第三方 NOTICE 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256；从 0.4.0 起还强制 Authenticode。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，候选元数据必须保持 `authenticodeRequired: false`，不能进入发布草稿或正式 Release。
+脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.4.0-win-x64.msi`、提交绑定的候选元数据、依赖清单、CycloneDX SBOM、第三方 NOTICE 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能用于 CI/开发快捷路径，不能算 ReleaseCandidate 验证。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。个人项目允许以 `authenticodeRequired: false` 发布未签名 MSI；若未来清单显式设为 `true`，现有 Windows 信任验证仍失败关闭。
 
 无依赖的 `PiRoundtable.Distribution` 还实现了可供后续更新、模块目录、离线布局和工件导入复用的 v1 签名目录纯验证层：严格拒绝重复、未知或缺失字段，绑定密钥/算法、有效期、epoch/sequence 防回滚和同源资产策略，并只返回封闭的无凭据诊断。与纯验证器分离的 Windows 工件事务会锁定全部目标目录组件，以同一 no-follow 文件句柄完成复制、落盘后二次哈希、可选 Authenticode 和原子提升，并通过跨进程目录租约恢复崩溃残留；状态旁车失败时保留已验证包供下次离线修复。它当前没有连接目录刷新或模块安装；模块解析、依赖、授权、下载、健康检查和完整安装回滚事务仍是后续工作。架构边界见 [`ADR 0011`](docs/adr/0011-signed-catalog-trust-boundary.md) 与 [`ADR 0012`](docs/adr/0012-handle-owned-windows-artifact-staging.md)。
 
-Windows 发布门禁现提供三组自动化：
+Windows 质量与可选诊断提供以下自动化：
 
 ```powershell
-# 以一次性、非导出自签名证书验证“先签二进制、再构建、最后签 MSI”的机械链路；不构成生产信任
+# 可选：以一次性、非导出自签名证书验证签名机械链路
 pwsh -File .\scripts\test-windows-signing-pipeline.ps1
 
 # 使用隔离 UpgradeCode/ProductName 跑安装、启动、修复、升级、降级阻止、再修复和卸载；默认用真实 WinUI 壳的精简负载
 pwsh -File .\scripts\test-windows-msi-lifecycle.ps1
-# 发布机可显式使用完整生产负载
+# ReleaseCandidate 会自动使用完整生产负载
 pwsh -File .\scripts\test-windows-msi-lifecycle.ps1 -UseFullPayload
 
 # 在当前真实 DPI 会话核验亮色、暗色和系统高对比，并在 finally 中恢复系统设置
@@ -127,9 +127,9 @@ pwsh -File .\scripts\run-windows-theme-visual-qa.ps1 `
   -AppRoot .\out\package\windows-x64\app -ExpectedDpi 144
 ```
 
-`merge-windows-visual-matrix.ps1` 只接受真实 96/144/192 DPI 会话分别生成、且产品版本、Git 提交与应用 EXE SHA-256 完全一致的三主题报告；任何缺失、过期或实际 DPI 不符都会失败。正式签名使用 `build-signed-windows-x64.ps1`，证书必须来自仓库外的 PFX 或证书存储，PFX 密码只能存在于当前进程环境，并要求 RFC 3161 时间戳与可信链验证。脚本会输出 `signed-build-report.json`，但使用 `-SkipVerification` 或 `-SuppressMsiValidation` 的构建只能标记为 `passed`，不能进入 RC。完整操作和证据口径见 [`packaging/windows-x64/README.md`](packaging/windows-x64/README.md)。ARM64 MSI 仍为 pending。
+`npm run quality:release-candidate` 无需额外参数，会生成最终构建证据并执行全负载隔离 MSI 生命周期。`merge-windows-visual-matrix.ps1` 仍可严格聚合真实 96/144/192 DPI 报告；`build-signed-windows-x64.ps1` 仍可生成带 RFC 3161 时间戳的可选签名构建。两者都不是个人项目发版的前置条件。完整操作和证据口径见 [`packaging/windows-x64/README.md`](packaging/windows-x64/README.md)。ARM64 MSI 仍为 pending。
 
-当前 Windows 工作站已分别 verified 精简 WinUI 壳和完整 22,594 文件生产负载的隔离生命周期；这证明自动化及当前 0.2.1→0.2.2 QA 包可完成安装、修复、升级、降级阻止和卸载，但每个新的 release candidate 仍必须重新运行，不能沿用本次现场结果。
+当前 Windows 工作站已分别 verified 精简 WinUI 壳和完整 22,594 文件生产负载的隔离生命周期；每个新的 ReleaseCandidate 都会重新运行完整负载，不能沿用历史结果。
 
 已有测试凭据时，可对发布目录执行一次不回显 Key 的真实 DeepSeek/Pi 三角色、三轮全链路验收：
 

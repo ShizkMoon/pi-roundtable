@@ -86,18 +86,6 @@ const ci = await readText(".github/workflows/ci.yml");
 expectContains(".github/workflows/ci.yml", ci, "id: product-version");
 expectContains(".github/workflows/ci.yml", ci, "steps.product-version.outputs.version");
 
-const promotion = await readText(".github/workflows/promote-windows-release.yml");
-const releaseTagBlock = promotion.match(/release_tag:\s*\n(?<block>(?:\s{8}.+\n)+)/)?.groups?.block ?? "";
-if (/\bdefault:/.test(releaseTagBlock)) {
-  failures.push("promote-windows-release.yml release_tag must not default to a stale product version.");
-}
-expectContains("promote-windows-release.yml", promotion, '$checkedOutCommit -ne $run.head_sha');
-expectContains("promote-windows-release.yml", promotion, 'verify-windows-release-candidate.mjs');
-expectContains("promote-windows-release.yml", promotion, 'CANDIDATE_METADATA');
-if (promotion.includes("--clobber") || promotion.includes("$manifest.asset.fileName")) {
-  failures.push("promote-windows-release.yml must not overwrite assets or use stable-manifest asset metadata as candidate identity.");
-}
-
 const stableManifest = await readJson("packaging/windows-x64/update-manifest.json");
 const stableVersionMatch = numericVersion.exec(stableManifest.version ?? "");
 if (!stableVersionMatch) {
@@ -109,11 +97,6 @@ if (!stableVersionMatch) {
   const expectedUrl = `https://github.com/ShizkMoon/pi-roundtable/releases/download/v${stableManifest.version}/${expectedFileName}`;
   if (stableManifest.asset?.url !== expectedUrl) {
     failures.push(`update-manifest.json asset URL must equal ${expectedUrl}.`);
-  }
-  const stableParts = stableVersionMatch.slice(1).map(Number);
-  if ((stableParts[0] > 0 || stableParts[1] >= 4) &&
-      stableManifest.asset?.authenticodeRequired !== true) {
-    failures.push("Stable update manifests from v0.4.0 onward must require Authenticode.");
   }
 }
 

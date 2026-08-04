@@ -37,6 +37,20 @@ public sealed class InstallerContractTests
     }
 
     [TestMethod]
+    public void Full_payload_lifecycle_verifies_installed_files_and_runtime_imports()
+    {
+        var source = File.ReadAllText(FindRepositoryFile(
+            "scripts", "test-windows-msi-lifecycle.ps1"));
+
+        StringAssert.Contains(source, "Assert-InstalledFullPayload");
+        StringAssert.Contains(source, "allManifestFilesPresent = $true");
+        StringAssert.Contains(source, "Invoke-InstalledRuntimeSmoke");
+        StringAssert.Contains(source, "runtime\\node.exe");
+        StringAssert.Contains(source, "await import('@pi-roundtable/protocol')");
+        StringAssert.Contains(source, "await import('./index.js')");
+    }
+
+    [TestMethod]
     public void Visual_matrix_rejects_duplicate_or_mismatched_theme_evidence()
     {
         var source = File.ReadAllText(FindRepositoryFile(
