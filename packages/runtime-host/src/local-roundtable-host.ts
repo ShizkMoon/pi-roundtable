@@ -1,7 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   PROTOCOL_VERSION,
@@ -11,8 +8,6 @@ import {
   type MeetingCommand,
   type MeetingEvent,
   type MeetingEventKind,
-  type ApiFamily,
-  type ModelCapability,
   type RoleScope,
   type ParticipantManifest,
   type RoundtableSession,
@@ -20,14 +15,9 @@ import {
   type DiscussionMode,
   type DiscussionProgressKind,
   type FloorRequestKind,
-  type ThinkingLevel,
 } from "@pi-roundtable/protocol";
 
 import { PiRuntimeAdapter, PiRuntimeError } from "./pi-runtime-adapter.js";
-import {
-  validateRemoteMcpEndpoint,
-  type ResolvedMcpServerRuntimeConfiguration,
-} from "./mcp-client-manager.js";
 import type {
   RuntimeAdapter,
   RuntimeCommandResult,
@@ -69,7 +59,14 @@ import {
   type RoleSessionIdentity,
   type RoleSessionView,
 } from "./role-session-supervisor.js";
-import { RoleCredentialLease } from "./role-credential-lease.js";
+import {
+  DefaultRoleContextAssembler,
+  type ResolvedRoleRuntimeConfiguration,
+  type RoleContextAssembler,
+} from "./role-context-assembler.js";
+import { WorkspaceCapabilityResolver } from "./capability-resolver.js";
+
+export type { ResolvedRoleRuntimeConfiguration } from "./role-context-assembler.js";
 
 export interface LocalRoundtableHostOptions {
   meetingId: string;
@@ -85,28 +82,7 @@ export interface LocalRoundtableHostOptions {
   publicMessagePlanner?: PublicMessagePlanner;
   discussionScheduler?: FacilitatedDiscussionScheduler;
   discussionObserver?: DiscussionObserver;
-}
-
-export interface ResolvedRoleRuntimeConfiguration {
-  displayName: string;
-  providerId: string;
-  providerName: string;
-  apiFamily: ApiFamily;
-  endpoint?: string;
-  modelId: string;
-  modelName: string;
-  modelCapabilities: ModelCapability[];
-  contextWindow?: number;
-  maxOutputTokens?: number;
-  thinkingLevel?: ThinkingLevel;
-  systemPrompt: string;
-  skillPaths: string[];
-  credentialLease: RoleCredentialLease;
-  delegation: {
-    networkAccess: "forbidden" | "subagent_required" | "subagent_preferred" | "direct_allowed";
-    resultMode: "summary_with_citations" | "summary" | "full";
-    maxConcurrentSubagents: number;
-  };
+  roleContextAssembler?: RoleContextAssembler;
 }
 
 interface PendingHandoff {
@@ -187,6 +163,7 @@ export class LocalRoundtableHost {
   readonly #publicMessagePlanner: PublicMessagePlanner;
   readonly #discussionScheduler: FacilitatedDiscussionScheduler;
   readonly #discussionObserver: DiscussionObserver;
+  readonly #roleContextAssembler: RoleContextAssembler;
   readonly #discussionObserverLimiter = new AsyncWorkLimiter(MAX_CONCURRENT_DISCUSSION_OBSERVERS);
   readonly #discussionObservations = new Map<string, RoleChildToken>();
   readonly #scheduledDiscussionObservationIds = new Set<string>();
@@ -229,6 +206,17 @@ export class LocalRoundtableHost {
     this.#publicMessagePlanner = options.publicMessagePlanner ?? new PiPublicMessagePlanner();
     this.#discussionScheduler = options.discussionScheduler ?? new FacilitatedDiscussionScheduler();
     this.#discussionObserver = options.discussionObserver ?? new PiDiscussionObserver();
+    this.#roleContextAssembler = options.roleContextAssembler ?? new DefaultRoleContextAssembler({
+      capabilityResolver: new WorkspaceCapabilityResolver({
+        ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(options.catalogSkillRoot === undefined
+          ? {}
+          : { catalogSkillRoot: options.catalogSkillRoot }),
+        ...(options.catalogMcpRoot === undefined
+          ? {}
+          : { catalogMcpRoot: options.catalogMcpRoot }),
+      }),
+    });
     this.#roleSessions = new RoleSessionSupervisor({
       runtimeGeneration: this.runtimeGeneration,
       rootStopSignal: this.#runtimeOwner.stopSignal,
@@ -2515,258 +2503,14 @@ export class LocalRoundtableHost {
     ) {
       throw new Error("Participant identity or scope does not match the role command");
     }
-    const displayName = participant.displayName;
-    const systemPrompt = participant.systemPromptSnapshot;
-    const modelProfileId = participant.modelRouteSnapshot.primaryModelProfileId;
-    const skillIds = participant.capabilitiesSnapshot.skillIds;
-    if (scope === "long_term") {
-      if (
-        participant.scope !== "long_term" ||
-        !workspace.roles.some((role) => role.roleProfileId === participant.roleProfileId) ||
-        participant.retentionPolicy !== "retain_profile"
-      ) {
-        throw new Error("Long-term role manifest is incomplete");
-      }
-    } else {
-      if (
-        participant.scope !== "temporary" ||
-        participant.invitation.status !== "accepted" ||
-        !["delete_after_session", "review_at_close", "promote_candidate"].includes(
-          participant.retentionPolicy,
-        )
-      ) {
-        throw new Error("Temporary role invitation is incomplete");
-      }
-    }
-
-    const model = workspace.models.find(
-      (candidate) => candidate.modelProfileId === modelProfileId && candidate.enabled,
-    );
-    const provider = model === undefined
-      ? undefined
-      : workspace.providers.find(
-          (candidate) =>
-            candidate.providerProfileId === model.providerProfileId && candidate.enabled,
-        );
-    if (model === undefined || provider === undefined) {
-      throw new Error("Participant model route cannot be resolved");
-    }
-    const apiKey = this.#credentials.get(provider.credentialRef);
-    if (apiKey === undefined || apiKey.length === 0) {
-      throw new Error("Provider credential is unavailable");
-    }
-    const skillPaths = skillIds.map((skillId) => {
-      const skill = workspace.skills.find(
-        (candidate) => candidate.skillId === skillId && candidate.enabled,
-      );
-      if (skill === undefined) {
-        throw new Error("Participant skill grant cannot be resolved");
-      }
-      if (skill.source.kind === "git") {
-        if (
-          skill.importStatus !== "installed" ||
-          skill.installDirectory === undefined ||
-          skill.source.contentDigest === undefined
-        ) {
-          throw new Error("Git Skill source is not a verified local installation");
-        }
-        return this.#resolveApprovedSkillPath(skill.installDirectory);
-      }
-      return this.#resolveApprovedSkillPath(skill.source.locator);
+    return this.#roleContextAssembler.assemble({
+      workspace,
+      participant,
+      roleId,
+      scope,
+      runtimeGeneration: this.runtimeGeneration,
+      resolveCredential: (reference) => this.#credentials.get(reference),
     });
-    const mcpGrants = participant.capabilitiesSnapshot.mcpGrants;
-    if (mcpGrants.length > 16) {
-      throw new Error("Participant MCP server grant limit exceeded");
-    }
-    const mcpServers = mcpGrants.map((grant): ResolvedMcpServerRuntimeConfiguration => {
-      const server = workspace.mcpServers.find(
-        (candidate) => candidate.mcpServerId === grant.mcpServerId && candidate.enabled,
-      );
-      if (server === undefined) {
-        throw new Error("Participant MCP grant cannot be resolved");
-      }
-      if (!["registered", "installed"].includes(server.importStatus ?? "registered")) {
-        throw new Error("Participant MCP server has not completed explicit catalog approval");
-      }
-      if (
-        server.transport === "stdio" &&
-        (server.command === undefined || !this.#isAllowedImportedMcpCommand(server.command))
-      ) {
-        throw new Error("MCP stdio command is outside the approved launcher allowlist");
-      }
-      if (server.transport !== "stdio") {
-        if (server.endpoint === undefined) {
-          throw new Error("Remote MCP server is missing an endpoint");
-        }
-        validateRemoteMcpEndpoint(server.endpoint);
-      }
-      let resolvedWorkingDirectory = server.workingDirectory;
-      if (server.source?.kind === "git") {
-        if (
-          server.importStatus !== "installed" ||
-          server.installDirectory === undefined ||
-          server.contentDigest === undefined ||
-          server.source.contentDigest !== server.contentDigest
-        ) {
-          throw new Error("Git MCP source is not a verified local installation");
-        }
-        resolvedWorkingDirectory = this.#resolveApprovedMcpWorkingDirectory(
-          server.installDirectory,
-          server.workingDirectory,
-        );
-      }
-      return {
-        serverId: server.mcpServerId,
-        displayName: server.displayName,
-        transport: server.transport,
-        ...(server.command === undefined ? {} : { command: server.command }),
-        ...(server.arguments === undefined ? {} : { arguments: server.arguments }),
-        ...(resolvedWorkingDirectory === undefined
-          ? {}
-          : { workingDirectory: resolvedWorkingDirectory }),
-        ...(server.endpoint === undefined ? {} : { endpoint: server.endpoint }),
-        ...this.#optionalCredentialField(
-          "environment",
-          this.#resolveCredentialReferences(server.environmentCredentialRefs),
-        ),
-        ...this.#optionalCredentialField(
-          "headers",
-          this.#resolveCredentialReferences(server.headerCredentialRefs),
-        ),
-        toolAllowlist: [...grant.toolAllowlist],
-        approvalMode: grant.approvalMode,
-        executionMode: grant.executionMode,
-      };
-    });
-    return {
-      displayName,
-      providerId: provider.runtimeProviderId,
-      providerName: provider.displayName,
-      apiFamily: provider.apiFamily,
-      ...(provider.endpoint === undefined ? {} : { endpoint: provider.endpoint }),
-      modelId: model.modelId,
-      modelName: model.displayName,
-      modelCapabilities: [...model.capabilities],
-      ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
-      ...(participant.modelRouteSnapshot.maxOutputTokens === undefined
-        ? {}
-        : { maxOutputTokens: participant.modelRouteSnapshot.maxOutputTokens }),
-      thinkingLevel: participant.modelRouteSnapshot.thinkingLevel,
-      systemPrompt,
-      skillPaths,
-      credentialLease: new RoleCredentialLease({
-        roleId,
-        runtimeGeneration: this.runtimeGeneration,
-        providerId: provider.runtimeProviderId,
-        apiKey,
-        mcpServers,
-      }),
-      delegation: {
-        networkAccess: participant.delegationSnapshot.networkAccess,
-        resultMode: participant.delegationSnapshot.resultMode,
-        maxConcurrentSubagents: Math.min(
-          2,
-          participant.delegationSnapshot.maxConcurrentSubagents,
-        ),
-      },
-    };
-  }
-
-  #resolveApprovedSkillPath(locator: string): string {
-    const lexicalCwd = resolve(this.#options.cwd ?? process.cwd());
-    const lexicalCandidate = resolve(lexicalCwd, locator);
-    const approvedRoots = [
-      lexicalCwd,
-      resolve(homedir(), ".codex", "skills"),
-      resolve(homedir(), ".agents", "skills"),
-      resolve(homedir(), ".pi", "agent", "skills"),
-      ...(this.#options.catalogSkillRoot === undefined
-        ? []
-        : [resolve(this.#options.catalogSkillRoot)]),
-      ...(process.env.LOCALAPPDATA === undefined
-        ? []
-        : [resolve(process.env.LOCALAPPDATA, "PiRoundtable", "catalog", "skills")]),
-    ]
-      .filter((root) => existsSync(root))
-      .map((root) => realpathSync(root));
-    const candidate = realpathSync(lexicalCandidate);
-    const isApproved = approvedRoots.some((root) => {
-      const pathFromRoot = relative(root, candidate);
-      return pathFromRoot === "" ||
-        (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
-    });
-    const leaf = basename(candidate).toLowerCase();
-    const candidateType = statSync(candidate);
-    const isSkillManifest = leaf === "skill.md" && candidateType.isFile();
-    const isSkillDirectory = candidateType.isDirectory();
-    if (!isApproved || (!isSkillManifest && !isSkillDirectory)) {
-      throw new Error("Skill locator is outside approved roots or is not a Skill directory/manifest");
-    }
-    return candidate;
-  }
-
-  #resolveApprovedMcpWorkingDirectory(
-    installDirectory: string,
-    workingDirectory: string | undefined,
-  ): string {
-    const approvedRoots = [
-      ...(this.#options.catalogMcpRoot === undefined
-        ? []
-        : [resolve(this.#options.catalogMcpRoot)]),
-      ...(process.env.LOCALAPPDATA === undefined
-        ? []
-        : [resolve(process.env.LOCALAPPDATA, "PiRoundtable", "catalog", "mcp")]),
-    ]
-      .filter((root) => existsSync(root))
-      .map((root) => realpathSync(root));
-    const installation = realpathSync(resolve(installDirectory));
-    const approved = approvedRoots.some((root) => {
-      const pathFromRoot = relative(root, installation);
-      return pathFromRoot === "" ||
-        (!pathFromRoot.startsWith(".." + sep) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot));
-    });
-    const working = realpathSync(resolve(workingDirectory ?? installDirectory));
-    const pathFromInstallation = relative(installation, working);
-    const contained = pathFromInstallation === "" ||
-      (!pathFromInstallation.startsWith(".." + sep) &&
-        pathFromInstallation !== ".." &&
-        !isAbsolute(pathFromInstallation));
-    if (!approved || !contained || !statSync(working).isDirectory()) {
-      throw new Error("Git MCP working directory is outside its approved installation");
-    }
-    return working;
-  }
-
-  #resolveCredentialReferences(
-    references: Record<string, string> | undefined,
-  ): Record<string, string> | undefined {
-    if (references === undefined) {
-      return undefined;
-    }
-    return Object.fromEntries(Object.entries(references).map(([name, reference]) => {
-      const credential = this.#credentials.get(reference);
-      if (credential === undefined || credential.length === 0) {
-        throw new Error("MCP credential is unavailable");
-      }
-      return [name, credential];
-    }));
-  }
-
-  #optionalCredentialField<K extends "environment" | "headers">(
-    name: K,
-    value: Record<string, string> | undefined,
-  ): { [P in K]?: Record<string, string> } {
-    return value === undefined ? {} : { [name]: value } as { [P in K]: Record<string, string> };
-  }
-
-  #isAllowedImportedMcpCommand(command: string): boolean {
-    return [
-      "node", "node.exe", "python", "python.exe", "python3",
-      "uv", "uv.exe", "uvx", "uvx.exe",
-      "npx", "npx.cmd", "npm", "npm.cmd", "pnpm", "pnpm.cmd",
-      "bun", "bun.exe", "deno", "deno.exe",
-      "dotnet", "dotnet.exe", "cargo", "cargo.exe",
-    ].includes(command.toLowerCase());
   }
 
   #isActiveTurnEvent(roleId: string, event: RuntimeEvent): boolean {

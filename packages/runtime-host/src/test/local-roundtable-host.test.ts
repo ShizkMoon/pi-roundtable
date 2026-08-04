@@ -43,6 +43,10 @@ import type {
   DiscussionObserver,
 } from "../discussion-observer.js";
 import { StdioRuntimeHost } from "../stdio-runtime-host.js";
+import {
+  DefaultRoleContextAssembler,
+  type RoleContextAssembler,
+} from "../role-context-assembler.js";
 
 class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly commands: RuntimeCommand[] = [];
@@ -1196,6 +1200,38 @@ test("resolves a frozen participant manifest into private Pi runtime options", a
     await host.stop();
     assert.equal(resolved?.credentialLease.closed, true);
     rmSync(runtimeDirectory, { recursive: true, force: true });
+  }
+});
+
+test("routes frozen participant assembly through the injected role context seam", async () => {
+  const delegate = new DefaultRoleContextAssembler();
+  const requests: Parameters<RoleContextAssembler["assemble"]>[0][] = [];
+  const host = new LocalRoundtableHost({
+    meetingId: "meeting-local-test",
+    runtimeGeneration: 1,
+    roleContextAssembler: {
+      assemble: (request) => {
+        requests.push(request);
+        return delegate.assemble(request);
+      },
+    },
+    adapterFactory: (roleId) => new FakeRuntimeAdapter(roleId),
+  });
+  host.initializeRuntimeConfiguration(RESUME_WORKSPACE, RESUME_SESSION, {
+    "memory://provider.test": "runtime-secret",
+  });
+  host.start();
+  try {
+    const receipt = await host.execute(command("role.add", "add-through-assembler", {
+      actorId: "participant.secretary",
+    }));
+    assert.equal(receipt.status, "accepted", receipt.message ?? receipt.errorCode ?? undefined);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.participant.participantId, "participant.secretary");
+    assert.equal(requests[0]?.runtimeGeneration, 1);
+    assert.equal(requests[0]?.workspace.workspaceId, "workspace.test");
+  } finally {
+    await host.stop();
   }
 });
 
