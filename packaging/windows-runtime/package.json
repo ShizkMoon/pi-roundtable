@@ -1,5 +1,6 @@
 {
   "name": "pi-roundtable-packaged-runtime",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "dependencies": {
@@ -7,6 +8,14 @@
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@pi-roundtable/protocol": "file:./protocol",
-    "undici": "8.5.0"
+    "undici": "8.9.0"
+  },
+  "overrides": {
+    "@earendil-works/pi-coding-agent": {
+      "undici": "8.9.0"
+    },
+    "@modelcontextprotocol/sdk": {
+      "hono": "4.12.34"
+    }
   }
 }

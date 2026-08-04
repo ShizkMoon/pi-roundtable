@@ -134,19 +134,30 @@ export class DeviceTokenAuthenticator {
   }
 
   static fromEnvironment(raw = process.env.PI_ROUNDTABLE_AUTH_KEYS_JSON): DeviceTokenAuthenticator {
-    if (raw === undefined) {
-      throw new Error("PI_ROUNDTABLE_AUTH_KEYS_JSON is required");
+    const configurationError =
+      "PI_ROUNDTABLE_AUTH_KEYS_JSON must be a non-empty JSON object mapping safe key IDs to base64 keys of at least 32 bytes; refusing unauthenticated startup";
+    if (raw === undefined || raw.trim().length === 0) {
+      throw new Error(configurationError);
     }
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("PI_ROUNDTABLE_AUTH_KEYS_JSON must be a JSON object");
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(configurationError);
+      }
+      const keys = new Map<string, Buffer>();
+      for (const [keyId, encoded] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof encoded !== "string") throw new Error(configurationError);
+        if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+          throw new Error(configurationError);
+        }
+        const key = Buffer.from(encoded, "base64");
+        if (key.toString("base64") !== encoded) throw new Error(configurationError);
+        keys.set(keyId, key);
+      }
+      return new DeviceTokenAuthenticator(keys);
+    } catch {
+      throw new Error(configurationError);
     }
-    const keys = new Map<string, Buffer>();
-    for (const [keyId, encoded] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof encoded !== "string") throw new Error("authentication keys must be base64 strings");
-      keys.set(keyId, Buffer.from(encoded, "base64"));
-    }
-    return new DeviceTokenAuthenticator(keys);
   }
 }
 

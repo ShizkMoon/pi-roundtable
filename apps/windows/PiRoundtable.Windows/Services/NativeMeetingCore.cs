@@ -172,6 +172,12 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
     public void Apply(RuntimeMeetingEvent meetingEvent)
     {
         var kind = MapEventKind(meetingEvent.Kind);
+        var visibility = meetingEvent.Visibility switch
+        {
+            "public" => NativeEventVisibility.Public,
+            "private" => NativeEventVisibility.Private,
+            _ => throw new InvalidOperationException("Meeting event visibility must be public or private."),
+        };
         var actor = StringToUtf8(meetingEvent.ActorId);
         var target = StringToUtf8(meetingEvent.TargetId);
         using var audience = new Utf8StringArray(meetingEvent.Audience);
@@ -183,9 +189,7 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
                 kind,
                 actor,
                 target,
-                meetingEvent.Visibility == "private"
-                    ? NativeEventVisibility.Private
-                    : NativeEventVisibility.Public,
+                visibility,
                 audience.Pointer,
                 audience.Count);
             var result = NativeMeetingCore.ApplyRaw(
@@ -211,6 +215,10 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
         _handle.Dispose();
     }
 
+    public bool SupportsEventKind(string kind) => IsSupportedEventKind(kind);
+
+    internal static bool IsSupportedEventKind(string kind) => TryMapEventKind(kind, out _);
+
     private static nint StringToUtf8(string? value)
     {
         return string.IsNullOrEmpty(value) ? nint.Zero : Marshal.StringToCoTaskMemUTF8(value);
@@ -218,7 +226,14 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
 
     private static NativeEventKind MapEventKind(string kind)
     {
-        return kind switch
+        return TryMapEventKind(kind, out var mapped)
+            ? mapped
+            : throw new NotSupportedException($"Unsupported meeting event kind: {kind}");
+    }
+
+    private static bool TryMapEventKind(string kind, out NativeEventKind mapped)
+    {
+        var candidate = kind switch
         {
             "runtime.lease_acquired" => NativeEventKind.RuntimeLeaseAcquired,
             "runtime.lease_released" => NativeEventKind.RuntimeLeaseReleased,
@@ -253,7 +268,9 @@ internal sealed class MeetingCoreSession : IMeetingCoreSession
             "floor.rejected" => NativeEventKind.FloorRejected,
             "discussion.budget_updated" => NativeEventKind.DiscussionBudgetUpdated,
             "convergence.recorded" => NativeEventKind.ConvergenceRecorded,
-            _ => throw new NotSupportedException($"Unsupported meeting event kind: {kind}"),
+            _ => (NativeEventKind?)null,
         };
+        mapped = candidate.GetValueOrDefault();
+        return candidate.HasValue;
     }
 }

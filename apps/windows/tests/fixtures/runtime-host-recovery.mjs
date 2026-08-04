@@ -25,8 +25,8 @@ function event(kind, causationId, options = {}) {
     targetId: options.targetId ?? null,
     causationId,
     visibility: options.visibility ?? "public",
-    audience: options.audience ?? [],
     payload: options.payload ?? {},
+    ...(options.visibility === "private" ? { audience: options.audience ?? [] } : {}),
   };
 }
 

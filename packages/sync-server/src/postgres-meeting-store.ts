@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 
-import { PROTOCOL_VERSION, type MeetingEvent } from "@pi-roundtable/protocol";
+import {
+  PROTOCOL_VERSION,
+  isValidMeetingEventIdentifier,
+  isValidMeetingEventKind,
+  validateMeetingEvent,
+  type MeetingEvent,
+} from "@pi-roundtable/protocol";
 import { Pool, type PoolClient } from "pg";
 
 import {
@@ -171,6 +177,11 @@ export class PostgresMeetingStore implements MeetingStore {
   }
 
   async append(input: AppendMeetingEventInput): Promise<MeetingEvent> {
+    validateId(input.meetingId, "meetingId");
+    validateId(input.ownerRuntimeId, "ownerRuntimeId");
+    if (!isValidMeetingEventKind(input.kind) || input.kind.startsWith("runtime.lease_")) {
+      throw new MeetingStoreError("invalid_argument", "event kind must be valid and runtime lease events are store-owned");
+    }
     const event = await this.#transaction(async (client) => {
       const record = await this.#lockRecord(client, input.meetingId);
       if (input.runtimeGeneration !== record.runtime_generation) {
@@ -272,6 +283,13 @@ export class PostgresMeetingStore implements MeetingStore {
       ...(input.causationId !== undefined ? { causationId: input.causationId } : {}),
       ...(input.audience !== undefined ? { audience: input.audience } : {}),
     };
+    const validationIssues = validateMeetingEvent(event);
+    if (validationIssues.length > 0) {
+      throw new MeetingStoreError(
+        "invalid_argument",
+        `event violates protocol v1 at ${validationIssues[0]!.path || "envelope"}`,
+      );
+    }
     await client.query(
       `INSERT INTO pi_roundtable_events
        (meeting_id, sequence, event_id, runtime_generation, visibility, audience, occurred_at, event_json)
@@ -302,7 +320,9 @@ export class PostgresMeetingStore implements MeetingStore {
 }
 
 function validateId(value: string, name: string): void {
-  if (value.length === 0 || value.length > 128) throw new MeetingStoreError("invalid_argument", `${name} must contain 1-128 characters`);
+  if (!isValidMeetingEventIdentifier(value)) {
+    throw new MeetingStoreError("invalid_argument", `${name} must be a protocol identifier`);
+  }
 }
 
 function validateVisibility(input: Omit<AppendMeetingEventInput, "ownerRuntimeId">): void {

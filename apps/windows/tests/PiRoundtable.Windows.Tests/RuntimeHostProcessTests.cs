@@ -149,6 +149,64 @@ public sealed class RuntimeHostProcessTests
     }
 
     [TestMethod]
+    public async Task Malformed_event_frame_faults_and_fences_the_runtime_instead_of_being_dropped()
+    {
+        var script = FindFixture("runtime-host-malformed-event.mjs");
+        var previous = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        try
+        {
+            await using var runtime = new RuntimeHostProcess();
+            var faulted = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            runtime.EventStreamFaulted += (_, message) => faulted.TrySetResult(message);
+
+            await runtime.StartAsync(Options(initialSequence: 0), CancellationToken.None);
+            var message = await faulted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            StringAssert.Contains(message, "会议已安全暂停");
+            try
+            {
+                await runtime.SendCommandAsync(
+                    "meeting.open",
+                    null,
+                    null,
+                    new Dictionary<string, object?>(),
+                    CancellationToken.None);
+                Assert.Fail("A protocol-faulted runtime must reject later commands.");
+            }
+            catch (Exception error) when (error is InvalidOperationException or IOException)
+            {
+                // Termination may fence at the supervisor state check or the already-closed pipe.
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previous);
+        }
+    }
+
+    [TestMethod]
+    public async Task Unknown_frame_type_faults_and_fences_the_runtime_instead_of_being_dropped()
+    {
+        var script = FindFixture("runtime-host-unknown-frame.mjs");
+        var previous = Environment.GetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT");
+        Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", script);
+        try
+        {
+            await using var runtime = new RuntimeHostProcess();
+            var faulted = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            runtime.EventStreamFaulted += (_, message) => faulted.TrySetResult(message);
+
+            await runtime.StartAsync(Options(initialSequence: 0), CancellationToken.None);
+            var message = await faulted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            StringAssert.Contains(message, "会议已安全暂停");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("PI_ROUNDTABLE_RUNTIME_HOST_SCRIPT", previous);
+        }
+    }
+
+    [TestMethod]
     public async Task Durable_command_receipt_is_returned_after_runtime_process_restart_without_reexecution()
     {
         var script = FindRuntimeHostScript();
@@ -485,6 +543,18 @@ public sealed class RuntimeHostProcessTests
                 Directory.Delete(root, recursive: true);
             }
         }
+    }
+
+    private static string FindFixture(string fileName)
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+             directory is not null;
+             directory = directory.Parent)
+        {
+            var candidate = Path.Combine(directory.FullName, "apps", "windows", "tests", "fixtures", fileName);
+            if (File.Exists(candidate)) return candidate;
+        }
+        throw new FileNotFoundException($"Runtime Host fixture was not found: {fileName}");
     }
 
     private static RuntimeHostStartOptions Options(ulong initialSequence)

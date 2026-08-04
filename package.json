@@ -1,6 +1,6 @@
 {
   "name": "pi-roundtable",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Native GUI-first multi-agent roundtable platform",
   "type": "module",
@@ -18,7 +18,8 @@
     "quality:fast": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope Fast",
     "quality:release-candidate": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope ReleaseCandidate",
     "quality:windows": "pwsh -NoProfile -File scripts/invoke-quality-gate.ps1 -Scope Windows",
-    "test": "npm run build && npm run test --workspaces --if-present",
+    "test": "npm run build && npm run test:release-metadata && npm run test --workspaces --if-present",
+    "test:release-metadata": "node --test scripts/test/*.test.mjs",
     "version:set": "node scripts/set-repository-version.mjs",
     "dev:runtime": "npm run build --workspace @pi-roundtable/runtime-host && npm run start:stdio --workspace @pi-roundtable/runtime-host",
     "dev:sync": "npm run dev --workspace @pi-roundtable/sync-server"
@@ -26,5 +27,13 @@
   "devDependencies": {
     "@types/node": "24.13.3",
     "typescript": "7.0.2"
+  },
+  "overrides": {
+    "@earendil-works/pi-coding-agent": {
+      "undici": "8.9.0"
+    },
+    "@modelcontextprotocol/sdk": {
+      "hono": "4.12.34"
+    }
   }
 }

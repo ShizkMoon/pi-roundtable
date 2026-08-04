@@ -25,7 +25,6 @@ function event(kind, causationId, payload) {
     actorId: runtimeId,
     causationId,
     visibility: "public",
-    audience: [],
     payload,
   };
 }

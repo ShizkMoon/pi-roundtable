@@ -68,6 +68,33 @@ public sealed class MeetingEventIngestionQueueTests
         StringAssert.Contains(faults[0], "期待 6，收到 7");
     }
 
+    [TestMethod]
+    public async Task Accepted_unknown_event_can_persist_its_cursor_before_faulting_the_stream()
+    {
+        var persisted = new List<ulong>();
+        var faults = new List<string>();
+        var queue = new MeetingEventIngestionQueue(
+            meetingEvent =>
+            {
+                persisted.Add(meetingEvent.Sequence);
+                throw new InvalidOperationException("unsupported event persisted; upgrade required");
+            },
+            message =>
+            {
+                faults.Add(message);
+                return Task.CompletedTask;
+            });
+        await queue.ResetAsync(3, 0);
+
+        queue.Enqueue(Event(1, 3));
+        queue.Enqueue(Event(2, 3));
+        await queue.DrainAsync();
+
+        CollectionAssert.AreEqual(new ulong[] { 1 }, persisted);
+        Assert.HasCount(1, faults);
+        StringAssert.Contains(faults[0], "upgrade required");
+    }
+
     private static RuntimeMeetingEvent Event(ulong sequence, ulong runtimeGeneration) => new(
         "meeting.queue-test",
         $"event-{sequence}",

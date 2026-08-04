@@ -611,7 +611,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         Providers.Count > 0 &&
         Models.Count > 0;
 
-    public bool CanPause => IsRunning && !IsBusy;
+    public bool CanPause => CanOperate;
 
     public bool CanClose => IsRunning && !IsBusy;
 
@@ -622,7 +622,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public Visibility PauseMeetingVisibility => IsRunning ? Visibility.Visible : Visibility.Collapsed;
 
-    public bool CanOperate => IsRunning && !IsBusy;
+    public bool CanOperate => IsRunning && !IsBusy && !_eventStreamFaulted;
 
     public bool CanAddTemporaryRole => !IsBusy;
 
@@ -994,7 +994,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 }
                 if (!TryNormalizeEndpoint(ProviderEndpoint, out var endpoint))
                 {
-                    ShowError("端点必须使用 HTTPS，或使用本机回环 HTTP，且不能包含用户名或密码。");
+                    ShowError("端点必须使用 HTTPS，或使用本机回环 HTTP，长度不超过 2048，且不能包含凭据、空白、查询参数或片段。");
                     return;
                 }
 
@@ -1097,7 +1097,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             if (string.IsNullOrWhiteSpace(RuntimeProviderId) ||
                 !TryNormalizeEndpoint(ProviderEndpoint, out var endpoint))
             {
-                ShowError("请填写 Runtime Provider ID，并使用 HTTPS 或本机回环 HTTP 端点。");
+                ShowError("请填写 Runtime Provider ID，并使用无凭据、查询或片段的 HTTPS 或本机回环 HTTP 端点。");
                 return;
             }
             if (ApiFamily == "custom" && endpoint is null)
@@ -1688,7 +1688,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         string? normalizedEndpoint = null;
         if (server.Transport != "stdio" && !TryNormalizeEndpoint(server.Endpoint ?? string.Empty, out normalizedEndpoint))
         {
-            ShowError("远端 MCP 端点必须使用 HTTPS 或本机回环 HTTP。");
+            ShowError("远端 MCP 端点必须使用无凭据、查询或片段的 HTTPS 或本机回环 HTTP。");
             return;
         }
         if (server.Transport != "stdio")
@@ -1813,7 +1813,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(RemoteSyncEndpoint) &&
             !TryNormalizeEndpoint(RemoteSyncEndpoint, out normalizedEndpoint))
         {
-            ShowError("远端同步服务器必须使用 HTTPS 或本机回环 HTTP。");
+            ShowError("远端同步服务器必须使用无凭据、查询或片段的 HTTPS 或本机回环 HTTP。");
             return;
         }
         else
@@ -1892,10 +1892,36 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 var isRecovery = historicalEvents.Any(meetingEvent => meetingEvent.Kind == "meeting.opened");
 
                 _meetingCore?.Dispose();
-                _meetingCore = _meetingCoreFactory.Create();
+                var meetingCore = _meetingCoreFactory.Create();
+                _meetingCore = meetingCore;
+                var unsupportedEvent = historicalEvents.FirstOrDefault(
+                    meetingEvent => !meetingCore.SupportsEventKind(meetingEvent.Kind));
+                if (unsupportedEvent is not null)
+                {
+                    var supportedPrefix = historicalEvents
+                        .TakeWhile(meetingEvent => meetingCore.SupportsEventKind(meetingEvent.Kind))
+                        .ToArray();
+                    foreach (var historicalEvent in supportedPrefix)
+                    {
+                        meetingCore.Apply(historicalEvent);
+                    }
+                    _sequence = checkpoint?.LastSequence ?? unsupportedEvent.Sequence;
+                    _runtimeGeneration = checkpoint?.RuntimeGeneration ?? unsupportedEvent.RuntimeGeneration;
+                    _eventStreamFaulted = true;
+                    if (supportedPrefix.Length > 0)
+                    {
+                        RebuildProjectionFromEvents(supportedPrefix);
+                    }
+                    meetingCore.Dispose();
+                    _meetingCore = null;
+                    ShowError(
+                        $"本地历史包含当前客户端尚不支持的事件 {unsupportedEvent.Kind}（序号 {unsupportedEvent.Sequence}）。游标已保留，请升级客户端后恢复会议。");
+                    StatusText = "会议需要升级客户端后恢复";
+                    return;
+                }
                 foreach (var historicalEvent in historicalEvents)
                 {
-                    _meetingCore.Apply(historicalEvent);
+                    meetingCore.Apply(historicalEvent);
                 }
                 _sequence = checkpoint?.LastSequence ?? 0;
                 _runtimeGeneration = checkpoint?.RuntimeGeneration ?? 0;
@@ -1919,6 +1945,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 _startingRuntime = runtime;
                 runtime.MeetingEventReceived += OnMeetingEventReceived;
                 runtime.DiagnosticReceived += OnDiagnosticReceived;
+                runtime.EventStreamFaulted += OnEventStreamFaulted;
                 await runtime.StartAsync(
                     new RuntimeHostStartOptions(
                         meetingId,
@@ -2756,8 +2783,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         _dispatcher.TryEnqueue(() => ShowError(message));
     }
 
+    private void OnEventStreamFaulted(object? sender, string message)
+    {
+        _ = ReportEventStreamFaultAsync(message);
+    }
+
     private async Task AcceptMeetingEventAsync(RuntimeMeetingEvent meetingEvent)
     {
+        if (_meetingCore is not null && !_meetingCore.SupportsEventKind(meetingEvent.Kind))
+        {
+            await _eventStore.AppendAsync(meetingEvent, CancellationToken.None);
+            await DispatchAsync(() => _sequence = meetingEvent.Sequence);
+            throw new InvalidOperationException(
+                $"Runtime Host 返回了当前客户端尚不支持的事件 {meetingEvent.Kind}（序号 {meetingEvent.Sequence}）。游标已保留，会议已安全暂停；请升级客户端后恢复。");
+        }
         _meetingCore?.Apply(meetingEvent);
         await _eventStore.AppendAsync(meetingEvent, CancellationToken.None);
 
@@ -3252,6 +3291,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             {
                 StatusText = "事件流已中断";
                 ShowError(message);
+                OnPropertyChanged(nameof(CanOperate));
+                OnPropertyChanged(nameof(CanPause));
+                OnPropertyChanged(nameof(CanSend));
+                OnPropertyChanged(nameof(CanSendPrivate));
+                OnPropertyChanged(nameof(CanControlDiscussion));
                 _ = SuspendAfterStreamFaultAsync();
             });
         }
@@ -3952,6 +3996,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         runtime.MeetingEventReceived -= OnMeetingEventReceived;
         runtime.DiagnosticReceived -= OnDiagnosticReceived;
+        runtime.EventStreamFaulted -= OnEventStreamFaulted;
         try
         {
             await runtime.DisposeAsync();

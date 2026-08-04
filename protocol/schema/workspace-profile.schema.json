@@ -82,8 +82,8 @@
       "type": "string",
       "format": "uri",
       "maxLength": 2048,
-      "pattern": "^https?://[^/@\\s]+(?:[/?#].*)?$",
-      "description": "HTTP(S) endpoint without URI userinfo. Plain HTTP is accepted only for loopback by runtime validation."
+      "pattern": "^https?://[^/@?#\\s]+(?:/[^?#\\s]*)?$",
+      "description": "HTTP(S) endpoint without URI userinfo, query, or fragment. Plain HTTP is accepted only for loopback by runtime validation."
     },
     "providerProfile": {
       "type": "object",

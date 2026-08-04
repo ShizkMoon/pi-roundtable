@@ -11,7 +11,19 @@ The sync server is a normalized-event relay and durable cursor service. It never
 
 All `/v1` routes require a signed bearer device token. A token binds one user and device to an explicit set of meeting IDs, observable audience IDs, authorized runtime IDs, and an expiry. The HMAC key ID is carried separately from the signed payload, so `PI_ROUNDTABLE_AUTH_KEYS_JSON` may contain an old and a new verification key during rotation. Tokens are issued out of band; the relay does not expose a password or token-minting endpoint.
 
+For bounded local development, generate a fresh key in the current PowerShell session before starting the server:
+
+```powershell
+$key = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$env:PI_ROUNDTABLE_AUTH_KEYS_JSON = @{ dev = $key } | ConvertTo-Json -Compress
+npm run dev:sync
+```
+
+The npm command does not load `.env` automatically. The server refuses to start without a valid key map. Only `/healthz` is unauthenticated; every `/v1` route requires a signed device token.
+
 Set `DATABASE_URL` to enable the PostgreSQL store. Startup applies the idempotent migration in `migrations/001_durable_meetings.sql`; lease acquisition, generation fencing, sequence allocation, and event insert/update run under one database transaction. Without `DATABASE_URL`, the server intentionally reports `persistence: memory` and is suitable only for bounded local development. PostgreSQL live notifications are currently process-local; reconnecting clients must use their durable `after`/`Last-Event-ID` cursor, and multi-replica LISTEN/NOTIFY remains pending.
+
+The default `deploy/compose.yaml` is also a single-process, memory-only development deployment. Export `PI_ROUNDTABLE_AUTH_KEYS_JSON` before running `docker compose`; no insecure default key is provided. Restarting that container loses meetings, leases, and replay history unless a PostgreSQL deployment is configured separately.
 
 Private events are accepted only with a non-empty unique audience. Replay and SSE return them only when the authenticated user, device, or delegated audience identity intersects that audience. Public and private clients share the same meeting-wide high-water sequence.
 

@@ -63,9 +63,9 @@
       ]
     },
     "occurredAt": { "type": "string", "format": "date-time" },
-    "actorId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
-    "targetId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
-    "causationId": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+    "actorId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "targetId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "causationId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
     "visibility": { "enum": ["public", "private"] },
     "audience": {
       "type": "array",

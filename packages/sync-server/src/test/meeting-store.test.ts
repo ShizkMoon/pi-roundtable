@@ -179,3 +179,28 @@ test("event visibility obeys the public and private audience contract", () => {
   });
   assert.equal(privateEvent.visibility, "private");
 });
+
+test("store rejects malformed event identifiers, kinds, and store-owned lease events", () => {
+  const store = new InMemoryMeetingStore();
+  const lease = store.acquireLease({
+    meetingId: "meeting-strict-envelope",
+    ownerRuntimeId: "runtime.windows",
+    ttlMs: 10_000,
+  }).lease;
+  for (const input of [
+    { kind: "vendor", actorId: "role.valid" },
+    { kind: "vendor.future_event", actorId: "bad id" },
+    { kind: "runtime.lease_released", actorId: "runtime.windows" },
+  ]) {
+    assert.throws(
+      () => store.append({
+        meetingId: lease.meetingId,
+        ownerRuntimeId: lease.ownerRuntimeId,
+        runtimeGeneration: lease.runtimeGeneration,
+        ...input,
+      }),
+      (error: unknown) => error instanceof MeetingStoreError && error.code === "invalid_argument",
+    );
+  }
+  assert.equal(store.eventsAfter(lease.meetingId, 0).length, 1);
+});

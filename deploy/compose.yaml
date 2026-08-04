@@ -6,6 +6,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 4317
+      PI_ROUNDTABLE_AUTH_KEYS_JSON: "${PI_ROUNDTABLE_AUTH_KEYS_JSON:?set PI_ROUNDTABLE_AUTH_KEYS_JSON to a JSON key map}"
     ports:
       - "127.0.0.1:4317:4317"
     restart: unless-stopped

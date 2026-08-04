@@ -4,17 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful main-branch workflow run containing the Windows artifact
+        description: Successful current-main workflow run containing the Windows candidate
         required: true
         type: string
       release_tag:
-        description: Existing draft release tag
+        description: Existing draft release tag matching the candidate version
         required: true
         type: string
 
 permissions:
   actions: read
   contents: write
+
+concurrency:
+  group: promote-windows-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
   promote:
@@ -30,96 +34,168 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
 
-      - name: Verify successful main artifact source
+      - name: Bind candidate to the exact successful current-main run
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:RUN_ID -notmatch '^\d+$') {
+            throw 'run_id must be a decimal GitHub Actions run ID.'
+          }
           $run = gh api "repos/$env:REPOSITORY/actions/runs/$env:RUN_ID" | ConvertFrom-Json
           if ($run.status -ne 'completed' -or $run.conclusion -ne 'success') {
             throw "Run $env:RUN_ID is not a successful completed run."
           }
-          if ($run.event -ne 'push' -or $run.head_branch -ne 'main') {
-            throw "Run $env:RUN_ID is not a main-branch push run."
+          if ($run.event -ne 'push' -or $run.head_branch -ne 'main' -or
+              $run.name -ne 'Pi Roundtable CI' -or $run.head_sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Run $env:RUN_ID is not an eligible Pi Roundtable main-branch push run."
           }
-          git merge-base --is-ancestor $run.head_sha HEAD
-          if ($LASTEXITCODE -ne 0) {
-            throw "Run commit $($run.head_sha) is not an ancestor of the checked-out main commit."
+          $checkedOutCommit = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $checkedOutCommit -ne $run.head_sha) {
+            throw "Run commit $($run.head_sha) is not the current protected-main commit $checkedOutCommit."
           }
+          $versionSpec = "$($run.head_sha):VERSION"
+          $candidateVersion = (& git show $versionSpec).Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $candidateVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw 'The exact run commit does not contain a valid candidate VERSION.'
+          }
+          $parts = @($candidateVersion.Split('.') | ForEach-Object { [uint32]$_ })
+          if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {
+            throw 'Candidate VERSION exceeds Windows Installer limits.'
+          }
+          if ($env:RELEASE_TAG -ne "v$candidateVersion") {
+            throw "Release tag must be exactly v$candidateVersion."
+          }
+          & git fetch --force --no-tags origin "refs/tags/$($env:RELEASE_TAG):refs/tags/$($env:RELEASE_TAG)"
+          if ($LASTEXITCODE -ne 0) { throw "Release tag $env:RELEASE_TAG does not exist." }
+          $tagCommit = (& git rev-parse "$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $run.head_sha) {
+            throw "Release tag $env:RELEASE_TAG is not bound to candidate commit $($run.head_sha)."
+          }
+          $artifactName = "PiRoundtable-$candidateVersion-win-x64"
+          "CANDIDATE_VERSION=$candidateVersion" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_COMMIT=$($run.head_sha)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_ARTIFACT=$artifactName" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_MSI=$artifactName.msi" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_METADATA=$artifactName.release.json" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_INVENTORY=$artifactName.dependencies.json" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_SBOM=$artifactName.sbom.cdx.json" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "CANDIDATE_NOTICES=$artifactName.third-party-notices.txt" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $stableHash = (Get-FileHash -LiteralPath 'packaging/windows-x64/update-manifest.json' -Algorithm SHA256).Hash
+          "STABLE_MANIFEST_SHA256=$stableHash" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Download Windows artifact
+      - name: Download exact-run Windows candidate
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $manifest = Get-Content -Raw 'packaging/windows-x64/update-manifest.json' | ConvertFrom-Json
-          $artifactName = [System.IO.Path]::GetFileNameWithoutExtension($manifest.asset.fileName)
-          gh run download $env:RUN_ID --name $artifactName --dir release-asset
+          gh run download $env:RUN_ID --name $env:CANDIDATE_ARTIFACT --dir release-asset
           if ($LASTEXITCODE -ne 0) {
-            throw "Unable to download artifact $artifactName from run $env:RUN_ID."
+            throw "Unable to download artifact $env:CANDIDATE_ARTIFACT from run $env:RUN_ID."
           }
 
-      - name: Verify manifest binding and upload draft asset
+      - name: Verify candidate metadata and upload draft asset
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $manifest = Get-Content -Raw 'packaging/windows-x64/update-manifest.json' | ConvertFrom-Json
-          $expectedUrl = "https://github.com/$env:REPOSITORY/releases/download/$env:RELEASE_TAG/$($manifest.asset.fileName)"
-          if ($manifest.asset.url -ne $expectedUrl) {
-            throw "Manifest URL does not bind to $env:RELEASE_TAG in $env:REPOSITORY."
+          $metadataPath = Join-Path 'release-asset' $env:CANDIDATE_METADATA
+          $msiPath = Join-Path 'release-asset' $env:CANDIDATE_MSI
+          $verifyArguments = @(
+            'scripts/verify-windows-release-candidate.mjs',
+            '--metadata', $metadataPath,
+            '--msi', $msiPath,
+            '--materials-directory', 'release-asset',
+            '--stable-manifest', 'packaging/windows-x64/update-manifest.json',
+            '--version', $env:CANDIDATE_VERSION,
+            '--source-commit', $env:CANDIDATE_COMMIT,
+            '--release-tag', $env:RELEASE_TAG
+          )
+          & node @verifyArguments
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate metadata verification failed.' }
+
+          $metadata = Get-Content -Raw -LiteralPath $metadataPath | ConvertFrom-Json
+          . ./scripts/windows-packaging.ps1
+          $msiProductVersion = Get-MsiProperty -Path $msiPath -Name 'ProductVersion'
+          $msiProductName = Get-MsiProperty -Path $msiPath -Name 'ProductName'
+          $msiUpgradeCode = (Get-MsiProperty -Path $msiPath -Name 'UpgradeCode').ToUpperInvariant()
+          if ($msiProductVersion -ne $metadata.productVersion -or
+              $msiProductName -ne $metadata.productName -or
+              $msiUpgradeCode -ne $metadata.upgradeCode) {
+            throw 'Candidate MSI internal identity does not match exact-run metadata.'
           }
-          $release = gh release view $env:RELEASE_TAG --json isDraft | ConvertFrom-Json
-          if (!$release.isDraft) {
-            throw "Release $env:RELEASE_TAG must remain a draft during artifact promotion."
-          }
-          function Assert-ReleaseMsi {
-            param(
-              [Parameter(Mandatory = $true)]
-              [string]$Path,
-              [Parameter(Mandatory = $true)]
-              [object]$Manifest,
-              [string]$ExpectedSigner = ''
-            )
-            $file = Get-Item -LiteralPath $Path
-            $sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
-            if ($file.Length -ne [int64]$Manifest.asset.size -or
-                $sha256 -ne ([string]$Manifest.asset.sha256).ToUpperInvariant()) {
-              throw "$($file.FullName) does not match the manifest size and SHA-256."
-            }
-            if ($Manifest.asset.authenticodeRequired) {
-              $signature = Get-AuthenticodeSignature -LiteralPath $file.FullName
-              if ($signature.Status -ne 'Valid' -or
-                  $null -eq $signature.SignerCertificate -or
-                  $null -eq $signature.TimeStamperCertificate -or
-                  $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $ExpectedSigner) {
-                throw "$($file.FullName) does not have the required trusted, timestamped Authenticode signature. Status=$($signature.Status)."
-              }
-            }
-          }
-          $msiPath = Join-Path 'release-asset' $manifest.asset.fileName
-          $msi = Get-Item -LiteralPath $msiPath
           $expectedSigner = ''
-          if ($manifest.asset.authenticodeRequired) {
+          function Assert-CandidateAuthenticode {
+            param([Parameter(Mandatory = $true)][string]$Path)
+            if (!$metadata.authenticodeRequired) { return }
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne 'Valid' -or
+                $null -eq $signature.SignerCertificate -or
+                $null -eq $signature.TimeStamperCertificate -or
+                $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedSigner) {
+              throw "$Path does not have the required trusted, timestamped Authenticode signature. Status=$($signature.Status)."
+            }
+          }
+          if ($metadata.authenticodeRequired) {
             $expectedSigner = ($env:WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT -replace '\s', '').ToUpperInvariant()
             if ($expectedSigner -notmatch '^[0-9A-F]{40}$') {
               throw 'Repository variable WINDOWS_SIGNING_CERTIFICATE_THUMBPRINT must contain the production signing certificate SHA-1 thumbprint.'
             }
           }
-          Assert-ReleaseMsi -Path $msi.FullName -Manifest $manifest -ExpectedSigner $expectedSigner
-          gh release upload $env:RELEASE_TAG $msi.FullName --clobber
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to upload $($msi.Name) to release $env:RELEASE_TAG."
+          Assert-CandidateAuthenticode -Path $msiPath
+
+          $release = gh release view $env:RELEASE_TAG --json isDraft,assets | ConvertFrom-Json
+          if (!$release.isDraft) {
+            throw "Release $env:RELEASE_TAG must remain a draft during artifact promotion."
           }
-          $asset = (gh release view $env:RELEASE_TAG --json assets | ConvertFrom-Json).assets |
-            Where-Object name -eq $msi.Name |
-            Select-Object -First 1
-          if ($null -eq $asset -or [int64]$asset.size -ne $msi.Length) {
-            throw 'Uploaded GitHub release asset size does not match the verified MSI.'
+          $candidateAssetNames = @(
+            $env:CANDIDATE_MSI,
+            $env:CANDIDATE_METADATA,
+            $env:CANDIDATE_INVENTORY,
+            $env:CANDIDATE_SBOM,
+            $env:CANDIDATE_NOTICES
+          )
+          foreach ($assetName in $candidateAssetNames) {
+            $currentRelease = gh release view $env:RELEASE_TAG --json isDraft,assets | ConvertFrom-Json
+            if (!$currentRelease.isDraft) { throw "Release $env:RELEASE_TAG is no longer a draft." }
+            $matchingAssets = @($currentRelease.assets | Where-Object name -eq $assetName)
+            if ($matchingAssets.Count -gt 1) { throw "Draft release contains duplicate asset name $assetName." }
+            if ($matchingAssets.Count -eq 0) {
+              gh release upload $env:RELEASE_TAG (Join-Path 'release-asset' $assetName)
+              if ($LASTEXITCODE -ne 0) {
+                throw "Unable to upload $assetName to release $env:RELEASE_TAG."
+              }
+            }
           }
+
           $uploadedAssetDirectory = Join-Path $env:RUNNER_TEMP "pi-roundtable-upload-$env:GITHUB_RUN_ID"
           New-Item -ItemType Directory -Force -Path $uploadedAssetDirectory | Out-Null
-          gh release download $env:RELEASE_TAG --pattern $msi.Name --dir $uploadedAssetDirectory
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Unable to download the uploaded GitHub release asset for independent verification.'
+          foreach ($assetName in $candidateAssetNames) {
+            gh release download $env:RELEASE_TAG --pattern $assetName --dir $uploadedAssetDirectory
+            if ($LASTEXITCODE -ne 0) {
+              throw "Unable to download draft GitHub release asset $assetName for independent verification."
+            }
+            $sourceHash = (Get-FileHash -LiteralPath (Join-Path 'release-asset' $assetName) -Algorithm SHA256).Hash
+            $uploadedHash = (Get-FileHash -LiteralPath (Join-Path $uploadedAssetDirectory $assetName) -Algorithm SHA256).Hash
+            if ($sourceHash -ne $uploadedHash) {
+              throw "Draft release asset $assetName differs from the exact-run artifact."
+            }
           }
-          $uploadedMsi = Get-Item -LiteralPath (Join-Path $uploadedAssetDirectory $msi.Name)
-          Assert-ReleaseMsi -Path $uploadedMsi.FullName -Manifest $manifest -ExpectedSigner $expectedSigner
+          $uploadedMsi = Join-Path $uploadedAssetDirectory $env:CANDIDATE_MSI
+          $uploadedArguments = @($verifyArguments)
+          $uploadedArguments[2] = Join-Path $uploadedAssetDirectory $env:CANDIDATE_METADATA
+          $uploadedArguments[4] = $uploadedMsi
+          $uploadedArguments[6] = $uploadedAssetDirectory
+          & node @uploadedArguments
+          if ($LASTEXITCODE -ne 0) { throw 'Re-downloaded candidate verification failed.' }
+          Assert-CandidateAuthenticode -Path $uploadedMsi
+
+          $finalRelease = gh release view $env:RELEASE_TAG --json isDraft | ConvertFrom-Json
+          if (!$finalRelease.isDraft) { throw "Release $env:RELEASE_TAG was published during candidate verification." }
+
+          $stableHashAfter = (Get-FileHash -LiteralPath 'packaging/windows-x64/update-manifest.json' -Algorithm SHA256).Hash
+          if ($stableHashAfter -ne $env:STABLE_MANIFEST_SHA256) {
+            throw 'Candidate promotion changed the independently signed stable update manifest.'
+          }

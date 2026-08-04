@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { get, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
@@ -35,6 +36,33 @@ function token(
 function bearer(value: string): { authorization: string } {
   return { authorization: `Bearer ${value}` };
 }
+
+test("device-token environment configuration fails closed without leaking key material", () => {
+  const secret = Buffer.alloc(32, 0x41).toString("base64");
+  for (const raw of [undefined, "", "not-json", "[]", "{}", JSON.stringify({ dev: "short" })]) {
+    assert.throws(
+      () => DeviceTokenAuthenticator.fromEnvironment(raw),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /PI_ROUNDTABLE_AUTH_KEYS_JSON/);
+        assert.doesNotMatch(error.message, new RegExp(secret));
+        return true;
+      },
+    );
+  }
+
+  assert.doesNotThrow(() => DeviceTokenAuthenticator.fromEnvironment(JSON.stringify({ dev: secret })));
+});
+
+test("development deployment requires an explicit auth key and stays memory-only", () => {
+  const compose = readFileSync(new URL("../../../../deploy/compose.yaml", import.meta.url), "utf8");
+  const environmentExample = readFileSync(new URL("../../../../.env.example", import.meta.url), "utf8");
+
+  assert.match(compose, /PI_ROUNDTABLE_AUTH_KEYS_JSON:\s*"\$\{PI_ROUNDTABLE_AUTH_KEYS_JSON:\?/);
+  assert.doesNotMatch(compose, /DATABASE_URL/);
+  assert.match(environmentExample, /^PI_ROUNDTABLE_AUTH_KEYS_JSON=\s*$/m);
+  assert.doesNotMatch(environmentExample, /is unauthenticated/i);
+});
 
 test("health endpoint advertises development persistence", async (context) => {
   const server = createSyncServer();
@@ -105,6 +133,96 @@ test("authenticated runtime can append a private event with an explicit audience
   const event = (await response.json()) as { visibility: string; audience: string[] };
   assert.equal(event.visibility, "private");
   assert.deepEqual(event.audience, ["user.direct_host", "role.secretary"]);
+});
+
+test("sync relay preserves additive namespaced event kinds and rejects malformed kinds", async (context) => {
+  const server = createSyncServer(new InMemoryMeetingStore(), authenticator);
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  context.after(() => server.close());
+  const address = server.address() as AddressInfo;
+  const meetingId = "future-event-meeting";
+  const headers = {
+    "content-type": "application/json",
+    ...bearer(token(meetingId)),
+  };
+
+  const leaseResponse = await fetch(
+    `http://127.0.0.1:${address.port}/v1/meetings/${meetingId}/leases`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ownerRuntimeId: "runtime.windows", ttlMs: 30_000 }),
+    },
+  );
+  const lease = (await leaseResponse.json()) as { lease: { runtimeGeneration: number } };
+  const appendResponse = await fetch(
+    `http://127.0.0.1:${address.port}/v1/meetings/${meetingId}/events`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ownerRuntimeId: "runtime.windows",
+        runtimeGeneration: lease.lease.runtimeGeneration,
+        kind: "vendor.future_event",
+        visibility: "public",
+        payload: { value: "preserved" },
+      }),
+    },
+  );
+  assert.equal(appendResponse.status, 201);
+  const appended = (await appendResponse.json()) as MeetingEvent;
+  assert.equal(appended.kind, "vendor.future_event");
+
+  const replayResponse = await fetch(
+    `http://127.0.0.1:${address.port}/v1/meetings/${meetingId}/events?after=0`,
+    { headers: bearer(token(meetingId)) },
+  );
+  const replay = (await replayResponse.json()) as { events: MeetingEvent[] };
+  assert.equal(replay.events.at(-1)?.kind, "vendor.future_event");
+  assert.equal(replay.events.at(-1)?.sequence, appended.sequence);
+
+  const malformedResponse = await fetch(
+    `http://127.0.0.1:${address.port}/v1/meetings/${meetingId}/events`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ownerRuntimeId: "runtime.windows",
+        runtimeGeneration: lease.lease.runtimeGeneration,
+        kind: "vendor",
+        visibility: "public",
+        payload: {},
+      }),
+    },
+  );
+  assert.equal(malformedResponse.status, 400);
+
+  for (const body of [
+    {
+      ownerRuntimeId: "runtime.windows",
+      runtimeGeneration: lease.lease.runtimeGeneration,
+      kind: "message.published",
+      visibility: "public",
+      audience: ["role.secretary"],
+      payload: {},
+    },
+    {
+      ownerRuntimeId: "runtime.windows",
+      runtimeGeneration: lease.lease.runtimeGeneration,
+      kind: "message.direct_sent",
+      actorId: "bad id",
+      visibility: "private",
+      audience: ["role.secretary"],
+      payload: {},
+    },
+  ]) {
+    const invalidEnvelopeResponse = await fetch(
+      `http://127.0.0.1:${address.port}/v1/meetings/${meetingId}/events`,
+      { method: "POST", headers, body: JSON.stringify(body) },
+    );
+    assert.equal(invalidEnvelopeResponse.status, 400);
+  }
 });
 
 test("development sync server never replays or streams private store events", async (context) => {

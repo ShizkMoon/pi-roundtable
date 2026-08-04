@@ -113,7 +113,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64
-          path: out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.msi
+          path: |
+            out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.msi
+            out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.release.json
+            out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.dependencies.json
+            out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.sbom.cdx.json
+            out/installer/PiRoundtable-${{ steps.product-version.outputs.version }}-win-x64.third-party-notices.txt
           if-no-files-found: error
       - name: Upload Windows release QA evidence
         if: always()

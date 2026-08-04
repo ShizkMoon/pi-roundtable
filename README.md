@@ -55,6 +55,8 @@ ctest --preset dev
 npm install
 npm run build
 npm test
+$key = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$env:PI_ROUNDTABLE_AUTH_KEYS_JSON = @{ dev = $key } | ConvertTo-Json -Compress
 npm run dev:sync
 ```
 
@@ -74,7 +76,7 @@ npm run dev:sync
 smoke 和隔离 QA UpgradeCode 生命周期都不能替代这些证据。完整契约见
 [`Release Candidate evidence contract`](docs/quality/release-candidate-evidence.md)。
 
-同步服务默认监听 `http://127.0.0.1:4317`。健康检查无需认证；所有 `/v1` 路由都要求由 `PI_ROUNDTABLE_AUTH_KEYS_JSON` 验证的签名设备令牌。未设置 `DATABASE_URL` 时仅使用内存存储，适合有界本机开发；配置 PostgreSQL 后启动时会应用幂等迁移。令牌约束和待完成的 TLS/E2EE 边界见 [`packages/sync-server/README.md`](packages/sync-server/README.md)。
+同步服务默认监听 `http://127.0.0.1:4317`。`npm run dev:sync` 不会自动加载 `.env`；服务在密钥映射缺失或无效时拒绝启动。健康检查无需认证；所有 `/v1` 路由都要求由 `PI_ROUNDTABLE_AUTH_KEYS_JSON` 验证的签名设备令牌。未设置 `DATABASE_URL` 时仅使用内存存储，适合有界本机开发且重启即丢失；配置 PostgreSQL 后启动时会应用幂等迁移。令牌约束和待完成的 TLS/E2EE 边界见 [`packages/sync-server/README.md`](packages/sync-server/README.md)。
 
 ### Android
 
@@ -102,10 +104,10 @@ dotnet build apps/windows/PiRoundtable.Windows/PiRoundtable.Windows.csproj
 生成未签名但可由签名清单安全分发的自包含 x64 MSI：
 
 ```powershell
-pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.3.0
+pwsh -File .\scripts\build-windows-x64.ps1 -Version 0.4.0
 ```
 
-脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.3.0-win-x64.msi` 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，清单必须保持 `authenticodeRequired: false`。
+脚本先运行 C++、TypeScript 和 Windows 测试，再发布 WinUI、自带 Node/Pi Runtime Host 和 C++ Core，最后输出 `out\installer\PiRoundtable-0.4.0-win-x64.msi`、提交绑定的候选元数据、依赖清单、CycloneDX SBOM、第三方 NOTICE 及 SHA-256。WiX ICE03 警告按明确 allowlist 严格核对，出现未知、缺失或额外 warning 都失败；`-SuppressMsiValidation` 只能在等价发布包已经通过验证后用于受限环境重打包，不能算验证路径。客户端更新器只接受固定 ECDSA P-256 公钥验证通过的规范清单，并逐字节验证 MSI 大小和 SHA-256。未提供正式代码签名证书时 MSI 仍为未签名本地 alpha，候选元数据必须保持 `authenticodeRequired: false`。
 
 无依赖的 `PiRoundtable.Distribution` 还实现了可供后续更新、模块目录、离线布局和工件导入复用的 v1 签名目录纯验证层：严格拒绝重复、未知或缺失字段，绑定密钥/算法、有效期、epoch/sequence 防回滚和同源资产策略，并只返回封闭的无凭据诊断。与纯验证器分离的 Windows 工件事务会锁定全部目标目录组件，以同一 no-follow 文件句柄完成复制、落盘后二次哈希、可选 Authenticode 和原子提升，并通过跨进程目录租约恢复崩溃残留；状态旁车失败时保留已验证包供下次离线修复。它当前没有连接目录刷新或模块安装；模块解析、依赖、授权、下载、健康检查和完整安装回滚事务仍是后续工作。架构边界见 [`ADR 0011`](docs/adr/0011-signed-catalog-trust-boundary.md) 与 [`ADR 0012`](docs/adr/0012-handle-owned-windows-artifact-staging.md)。
 

@@ -14,6 +14,7 @@ const trackedPaths = Object.freeze([
   "packages/protocol-ts/package.json",
   "packages/runtime-host/package.json",
   "packages/sync-server/package.json",
+  "packaging/windows-runtime/package.json",
   "packaging/windows-runtime/protocol/package.json",
   "packaging/windows-runtime/package-lock.json",
   "packages/runtime-host/src/mcp-client-manager.ts",
@@ -43,6 +44,7 @@ try {
   const protocolPackage = parseJson(originals, "packages/protocol-ts/package.json");
   const runtimePackage = parseJson(originals, "packages/runtime-host/package.json");
   const syncPackage = parseJson(originals, "packages/sync-server/package.json");
+  const packagedRuntimePackage = parseJson(originals, "packaging/windows-runtime/package.json");
   const packagedProtocol = parseJson(originals, "packaging/windows-runtime/protocol/package.json");
   const packagedRuntimeLock = parseJson(originals, "packaging/windows-runtime/package-lock.json");
 
@@ -52,6 +54,7 @@ try {
   requireRecord(rootLock.packages?.["packages/sync-server"]?.dependencies, "package-lock sync dependencies");
   requireRecord(runtimePackage.dependencies, "runtime-host dependencies");
   requireRecord(syncPackage.dependencies, "sync-server dependencies");
+  requireRecord(packagedRuntimeLock.packages?.[""], "packaged runtime root lock entry");
   requireRecord(packagedRuntimeLock.packages?.protocol, "packaged runtime protocol lock entry");
 
   rootPackage.version = nextVersion;
@@ -67,6 +70,9 @@ try {
   rootLock.packages["packages/runtime-host"].dependencies["@pi-roundtable/protocol"] = nextVersion;
   rootLock.packages["packages/sync-server"].version = nextVersion;
   rootLock.packages["packages/sync-server"].dependencies["@pi-roundtable/protocol"] = nextVersion;
+  packagedRuntimePackage.version = nextVersion;
+  packagedRuntimeLock.version = nextVersion;
+  packagedRuntimeLock.packages[""].version = nextVersion;
   packagedProtocol.version = nextVersion;
   packagedRuntimeLock.packages.protocol.version = nextVersion;
 
@@ -88,6 +94,7 @@ try {
     )],
     ["packages/runtime-host/package.json", serializeJsonIfChanged(originals.get("packages/runtime-host/package.json"), runtimePackage)],
     ["packages/sync-server/package.json", serializeJsonIfChanged(originals.get("packages/sync-server/package.json"), syncPackage)],
+    ["packaging/windows-runtime/package.json", serializeJsonIfChanged(originals.get("packaging/windows-runtime/package.json"), packagedRuntimePackage)],
     ["packaging/windows-runtime/protocol/package.json", serializeJsonIfChanged(originals.get("packaging/windows-runtime/protocol/package.json"), packagedProtocol)],
     ["packaging/windows-runtime/package-lock.json", serializeJsonIfChanged(originals.get("packaging/windows-runtime/package-lock.json"), packagedRuntimeLock)],
     [runtimeIdentityPath, runtimeIdentity.replace(identityPattern, `$1${nextVersion}$3`)],
