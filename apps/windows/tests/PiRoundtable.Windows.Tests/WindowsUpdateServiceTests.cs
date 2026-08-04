@@ -86,6 +86,23 @@ public sealed class WindowsUpdateServiceTests
     }
 
     [TestMethod]
+    [DataRow("https://example.test/ShizkMoon/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi")]
+    [DataRow("https://github.com/OtherOwner/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi")]
+    [DataRow("https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.1.0/PiRoundtable-0.2.0-win-x64.msi")]
+    [DataRow("https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi?download=1")]
+    public void Signed_manifest_rejects_assets_outside_the_exact_repository_release_path(string assetUrl)
+    {
+        using var fixture = new UpdateFixture();
+        var manifest = fixture.CreateManifest([1], "0.2.0");
+        manifest.Asset.Url = assetUrl;
+        var verifier = new UpdateManifestVerifier(fixture.ProductionPolicy);
+
+        Assert.ThrowsExactly<InvalidDataException>(() => verifier.ParseAndVerify(
+            fixture.SignAndSerialize(manifest),
+            DateTimeOffset.UtcNow));
+    }
+
+    [TestMethod]
     public async Task Wrong_payload_hash_is_deleted_and_never_promoted()
     {
         using var fixture = new UpdateFixture();
@@ -127,6 +144,20 @@ public sealed class WindowsUpdateServiceTests
         Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, manifest.Asset.FileName)));
         Assert.IsFalse(File.Exists(Path.Combine(versionDirectory, "staged-update.json")));
         AssertNoPartialArtifacts(versionDirectory);
+    }
+
+    [TestMethod]
+    public void Production_policy_rejects_unsigned_manifest_from_0_4_0_onward()
+    {
+        using var fixture = new UpdateFixture();
+        var manifest = fixture.CreateManifest(Encoding.UTF8.GetBytes("unsigned-msi"), "0.4.0");
+        var verifier = new UpdateManifestVerifier(fixture.Policy with
+        {
+            MinimumAuthenticodeVersion = new Version(0, 4, 0),
+        });
+
+        Assert.ThrowsExactly<InvalidDataException>(() =>
+            verifier.ParseAndVerify(fixture.SignAndSerialize(manifest), DateTimeOffset.UtcNow));
     }
 
     [TestMethod]
@@ -425,6 +456,63 @@ public sealed class WindowsUpdateServiceTests
     }
 
     [TestMethod]
+    public async Task Production_asset_redirect_to_the_GitHub_release_CDN_is_accepted()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("release-cdn-payload");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        manifest.Asset.Url = "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi";
+        var cdnUri = new Uri(
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123/01234567-89ab-cdef-0123-456789abcdef?token=bounded");
+        using var client = CreateClient(request => request.RequestUri!.Host switch
+        {
+            "raw.githubusercontent.com" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "github.com" => new HttpResponseMessage(HttpStatusCode.Redirect)
+            {
+                Headers = { Location = cdnUri },
+            },
+            "release-assets.githubusercontent.com" => BytesResponse(payload),
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+        using var service = fixture.CreateService(
+            client,
+            authenticodeTrusted: false,
+            manifestUri: UpdateFixture.ProductionManifestUri,
+            policy: fixture.ProductionPolicy);
+
+        var check = await service.CheckAsync();
+        var staged = await service.DownloadAndStageAsync(check.Manifest);
+
+        CollectionAssert.AreEqual(payload, await File.ReadAllBytesAsync(staged.PackagePath));
+    }
+
+    [TestMethod]
+    public async Task Production_asset_redirect_to_an_arbitrary_HTTPS_host_is_rejected()
+    {
+        using var fixture = new UpdateFixture();
+        var payload = Encoding.UTF8.GetBytes("release-redirect-payload");
+        var manifest = fixture.CreateManifest(payload, "0.2.0");
+        manifest.Asset.Url = "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.2.0/PiRoundtable-0.2.0-win-x64.msi";
+        using var client = CreateClient(request => request.RequestUri!.Host switch
+        {
+            "raw.githubusercontent.com" => JsonResponse(fixture.SignAndSerialize(manifest)),
+            "github.com" => new HttpResponseMessage(HttpStatusCode.Redirect)
+            {
+                Headers = { Location = new Uri("https://example.test/release.msi") },
+            },
+            _ => new HttpResponseMessage(HttpStatusCode.NotFound),
+        });
+        using var service = fixture.CreateService(
+            client,
+            authenticodeTrusted: false,
+            manifestUri: UpdateFixture.ProductionManifestUri,
+            policy: fixture.ProductionPolicy);
+        var check = await service.CheckAsync();
+
+        await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.DownloadAndStageAsync(check.Manifest));
+    }
+
+    [TestMethod]
     public async Task Equal_or_older_signed_release_is_not_offered_as_an_update()
     {
         using var fixture = new UpdateFixture();
@@ -435,6 +523,26 @@ public sealed class WindowsUpdateServiceTests
         var check = await service.CheckAsync();
 
         Assert.AreEqual(UpdateAvailability.UpToDate, check.Availability);
+    }
+
+    [TestMethod]
+    public async Task Equal_or_older_signed_release_cannot_be_staged_directly()
+    {
+        using var fixture = new UpdateFixture();
+        var manifest = fixture.CreateManifest([1], "0.1.0");
+        var requests = 0;
+        using var client = CreateClient(_ =>
+        {
+            requests += 1;
+            return JsonResponse(fixture.SignAndSerialize(manifest));
+        });
+        using var service = fixture.CreateService(client, authenticodeTrusted: false);
+        var check = await service.CheckAsync();
+
+        await Assert.ThrowsExactlyAsync<InvalidDataException>(() => service.DownloadAndStageAsync(check.Manifest));
+
+        Assert.AreEqual(1, requests, "Rollback rejection must occur before any package request.");
+        Assert.IsFalse(Directory.Exists(Path.Combine(fixture.StagingRoot, "0.1.0")));
     }
 
     [TestMethod]
@@ -513,7 +621,9 @@ public sealed class WindowsUpdateServiceTests
             new Dictionary<string, string>
             {
                 [UpdateTrustAnchor.KeyId] = UpdateTrustAnchor.PublicKeyPem,
-            }));
+            },
+            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
+            MinimumAuthenticodeVersion: new Version(0, 4, 0)));
 
         var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-04T00:00:00Z"));
 
@@ -706,12 +816,23 @@ public sealed class WindowsUpdateServiceTests
 
         public string StagingRoot { get; }
 
+        public static Uri ProductionManifestUri { get; } = new(
+            "https://raw.githubusercontent.com/ShizkMoon/pi-roundtable/main/packaging/windows-x64/update-manifest.json");
+
         public UpdateManifestPolicy Policy => new(
             "PiRoundtable.Windows",
             "stable",
             "x64",
             new Dictionary<string, string> { ["test-key"] = _key.ExportSubjectPublicKeyInfoPem() },
             AllowLoopbackHttp: _allowLoopbackHttp);
+
+        public UpdateManifestPolicy ProductionPolicy => new(
+            "PiRoundtable.Windows",
+            "stable",
+            "x64",
+            new Dictionary<string, string> { ["test-key"] = _key.ExportSubjectPublicKeyInfoPem() },
+            ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/"),
+            MinimumAuthenticodeVersion: new Version(0, 4, 0));
 
         public UpdateManifestDocument CreateManifest(
             byte[] payload,
@@ -751,18 +872,28 @@ public sealed class WindowsUpdateServiceTests
             return JsonSerializer.SerializeToUtf8Bytes(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         }
 
-        public WindowsUpdateService CreateService(HttpClient client, bool authenticodeTrusted)
+        public WindowsUpdateService CreateService(
+            HttpClient client,
+            bool authenticodeTrusted,
+            Uri? manifestUri = null,
+            UpdateManifestPolicy? policy = null)
         {
-            return CreateService(client, new ConstantAuthenticodeVerifier(authenticodeTrusted));
+            return CreateService(
+                client,
+                new ConstantAuthenticodeVerifier(authenticodeTrusted),
+                manifestUri,
+                policy);
         }
 
         public WindowsUpdateService CreateService(
             HttpClient client,
-            IAuthenticodeVerifier authenticodeVerifier)
+            IAuthenticodeVerifier authenticodeVerifier,
+            Uri? manifestUri = null,
+            UpdateManifestPolicy? policy = null)
         {
             var options = new WindowsUpdateServiceOptions(
-                new Uri("http://127.0.0.1/manifest"),
-                Policy,
+                manifestUri ?? new Uri("http://127.0.0.1/manifest"),
+                policy ?? Policy,
                 StagingRoot,
                 new Version(0, 1, 0));
             return new WindowsUpdateService(options, client, authenticodeVerifier);

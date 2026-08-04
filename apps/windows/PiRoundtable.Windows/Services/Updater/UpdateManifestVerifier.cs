@@ -13,7 +13,9 @@ internal sealed record UpdateManifestPolicy(
     string Architecture,
     IReadOnlyDictionary<string, string> TrustedPublicKeys,
     long MaximumAssetBytes = 2L * 1024 * 1024 * 1024,
-    bool AllowLoopbackHttp = false);
+    bool AllowLoopbackHttp = false,
+    Uri? ReleaseAssetBaseUri = null,
+    Version? MinimumAuthenticodeVersion = null);
 
 internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy)
 {
@@ -114,6 +116,12 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
         {
             throw new InvalidDataException("更新发布时间无效或来自未来。");
         }
+        if (policy.MinimumAuthenticodeVersion is { } minimumAuthenticodeVersion &&
+            version >= minimumAuthenticodeVersion &&
+            !document.Asset.AuthenticodeRequired)
+        {
+            throw new InvalidDataException("该版本的更新包必须要求 Windows Authenticode 验证。");
+        }
         if (document.Asset.Size <= 0 || document.Asset.Size > policy.MaximumAssetBytes)
         {
             throw new InvalidDataException("更新包大小无效或超过限制。");
@@ -126,10 +134,15 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
         {
             throw new InvalidDataException("更新包文件名无效。");
         }
-        if (!Uri.TryCreate(document.Asset.Url, UriKind.Absolute, out var assetUri) ||
-            !IsAllowedNetworkUri(assetUri, policy.AllowLoopbackHttp, allowQuery: false))
+        var expectedFileName = $"PiRoundtable-{document.Version}-win-{policy.Architecture}.msi";
+        if (!string.Equals(document.Asset.FileName, expectedFileName, StringComparison.Ordinal))
         {
-            throw new InvalidDataException("更新包地址必须是无凭据、查询或片段的 HTTPS 地址。");
+            throw new InvalidDataException("更新包文件名与版本或架构不匹配。");
+        }
+        if (!Uri.TryCreate(document.Asset.Url, UriKind.Absolute, out var assetUri) ||
+            !IsAllowedAssetUri(assetUri, document.Version, expectedFileName))
+        {
+            throw new InvalidDataException("更新包地址不属于受信任的版本化发布目录。");
         }
 
         return new VerifiedUpdateManifest(
@@ -149,6 +162,24 @@ internal sealed partial class UpdateManifestVerifier(UpdateManifestPolicy policy
             (allowQuery || string.IsNullOrEmpty(uri.Query)) &&
             (uri.Scheme == Uri.UriSchemeHttps ||
              (allowLoopbackHttp && uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback));
+    }
+
+    private bool IsAllowedAssetUri(Uri uri, string version, string expectedFileName)
+    {
+        if (policy.AllowLoopbackHttp && uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback)
+        {
+            return IsAllowedNetworkUri(uri, allowLoopbackHttp: true, allowQuery: false);
+        }
+        if (!IsAllowedNetworkUri(uri, allowLoopbackHttp: false, allowQuery: false) ||
+            policy.ReleaseAssetBaseUri is not { } baseUri ||
+            !IsAllowedNetworkUri(baseUri, allowLoopbackHttp: false, allowQuery: false) ||
+            !baseUri.AbsolutePath.EndsWith("/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var expectedUri = new Uri(baseUri, $"v{version}/{expectedFileName}");
+        return string.Equals(uri.AbsoluteUri, expectedUri.AbsoluteUri, StringComparison.Ordinal);
     }
 
     private static bool IsSafeMsiFileName(string value)

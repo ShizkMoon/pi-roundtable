@@ -106,9 +106,14 @@ if (!stableVersionMatch) {
   assertWindowsInstallerRange("The signed stable update manifest", stableVersionMatch.slice(1).map(Number));
   const expectedFileName = `PiRoundtable-${stableManifest.version}-win-${stableManifest.architecture}.msi`;
   expect("update-manifest.json#/asset/fileName", stableManifest.asset?.fileName, expectedFileName);
-  const expectedUrlSuffix = `/releases/download/v${stableManifest.version}/${expectedFileName}`;
-  if (typeof stableManifest.asset?.url !== "string" || !stableManifest.asset.url.endsWith(expectedUrlSuffix)) {
-    failures.push(`update-manifest.json asset URL must end with ${expectedUrlSuffix}.`);
+  const expectedUrl = `https://github.com/ShizkMoon/pi-roundtable/releases/download/v${stableManifest.version}/${expectedFileName}`;
+  if (stableManifest.asset?.url !== expectedUrl) {
+    failures.push(`update-manifest.json asset URL must equal ${expectedUrl}.`);
+  }
+  const stableParts = stableVersionMatch.slice(1).map(Number);
+  if ((stableParts[0] > 0 || stableParts[1] >= 4) &&
+      stableManifest.asset?.authenticodeRequired !== true) {
+    failures.push("Stable update manifests from v0.4.0 onward must require Authenticode.");
   }
 }
 

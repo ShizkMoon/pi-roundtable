@@ -906,6 +906,22 @@ foreach ($required in @($appExecutable, $runtimeHost, $runtimeNode, $KeyFile)) {
         throw "Required E2E input is missing: $required"
     }
 }
+$productVersion = [IO.File]::ReadAllText((Join-Path $repoRoot 'VERSION')).Trim()
+if ($productVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+    throw 'VERSION is not a canonical three-part product version.'
+}
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceCommit -notmatch '^[0-9a-f]{40}$') {
+    throw 'The real-provider evidence cannot resolve a full source commit.'
+}
+$gitStatus = @(& git -C $repoRoot status --porcelain)
+if ($LASTEXITCODE -ne 0) {
+    throw 'Real-provider release evidence could not inspect the repository state.'
+}
+if ($gitStatus.Count -ne 0) {
+    throw 'Real-provider release evidence requires a clean repository.'
+}
+$appExecutableSha256 = (Get-FileHash -LiteralPath $appExecutable -Algorithm SHA256).Hash.ToUpperInvariant()
 
 $runId = 'deepseek-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -915,6 +931,10 @@ $evidenceRoot = [IO.Path]::GetFullPath($OutputRoot)
 $approvedOutputRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'out'))
 if (!$evidenceRoot.StartsWith($approvedOutputRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw "OutputRoot must remain inside $approvedOutputRoot"
+}
+if ((Test-Path -LiteralPath $evidenceRoot) -and
+    @(Get-ChildItem -LiteralPath $evidenceRoot -Force).Count -ne 0) {
+    throw 'OutputRoot must be new or empty so earlier sessions cannot contaminate real-provider evidence.'
 }
 $dataRoot = Join-Path $evidenceRoot 'data-root'
 New-Item -ItemType Directory -Force -Path $dataRoot | Out-Null
@@ -1136,8 +1156,8 @@ try {
     if ($activeOutputs.Count -gt 0) {
         throw "The meeting closed with $($activeOutputs.Count) non-terminal role turn(s)."
     }
-    if ($completedOutputs.Count -lt 4) {
-        throw "Expected the three addressed outputs plus at least one autonomous floor response, found $($completedOutputs.Count) completed outputs."
+    if ($completedOutputs.Count -lt 5) {
+        throw "Expected three addressed outputs plus the architect trigger and at least one autonomous floor response, found $($completedOutputs.Count) completed outputs."
     }
     $publicMessages = @($session.messages | Where-Object { $_.kind -in @('host', 'role') })
     $hostIndexes = @(for ($index = 0; $index -lt $publicMessages.Count; $index++) {
@@ -1237,7 +1257,9 @@ try {
     if (!([string]$publicMessages[$facilitatedStart].text).Contains('自由讨论与抢答真实验收', [StringComparison]::Ordinal)) {
         throw 'The facilitated free-discussion prompt marker was not persisted.'
     }
-    $initialSpeakerTurns = @($facilitatedSlice | Where-Object { $_.speakerId -eq 'role.architect' })
+    $initialSpeakerTurns = @($facilitatedSlice | Where-Object {
+        $_.speakerId -eq 'role.architect' -and $_.state -eq 'completed'
+    })
     if ($initialSpeakerTurns.Count -lt 1) {
         throw 'The addressed architect never started the free-discussion trigger turn.'
     }
@@ -1246,6 +1268,25 @@ try {
     })
     if ($autonomousTurns.Count -lt 1) {
         throw 'No non-addressed role obtained the floor through bounded autonomous observation.'
+    }
+    $initialSpeakerText = [string]$initialSpeakerTurns[0].text
+    $forbiddenLabels = @('决策：', '异议：', '需证据：', '行动：')
+    $initialMarkerVerified = $initialSpeakerText.Contains('FREE_DISCUSSION_TRIGGER', [StringComparison]::Ordinal) -and
+        $initialSpeakerText.Contains('同步服务器应默认直接执行所有模型调用', [StringComparison]::Ordinal)
+    $initialLengthVerified = $initialSpeakerText.Length -ge 260
+    $forbiddenLabelsAbsent = @($forbiddenLabels | Where-Object {
+        $initialSpeakerText.Contains($_, [StringComparison]::Ordinal)
+    }).Count -eq 0
+    $autonomousBoundaryChallengeVerified = @($autonomousTurns | Where-Object {
+        $text = [string]$_.text
+        $text.Length -ge 60 -and
+            @('runtimeGeneration', 'Runtime Owner', '本地运行时', '转发', '持久化' | Where-Object {
+                $text.Contains($_, [StringComparison]::OrdinalIgnoreCase)
+            }).Count -gt 0
+    }).Count -gt 0
+    if (!$initialMarkerVerified -or !$initialLengthVerified -or
+        !$forbiddenLabelsAbsent -or !$autonomousBoundaryChallengeVerified) {
+        throw 'The facilitated scenario did not preserve the adversarial prompt or produce a substantive autonomous boundary challenge.'
     }
     $facilitatedOutputs = @($facilitatedSlice | ForEach-Object {
         $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.text)
@@ -1269,19 +1310,66 @@ try {
         initialSpeakerStates = @($initialSpeakerTurns | ForEach-Object { $_.state })
         autonomousSpeakerIds = @($autonomousTurns | ForEach-Object { $_.speakerId } | Sort-Object -Unique)
         autonomousCompletedCount = $autonomousTurns.Count
+        initialMarkerVerified = $initialMarkerVerified
+        initialLengthVerified = $initialLengthVerified
+        forbiddenLabelsAbsent = $forbiddenLabelsAbsent
+        autonomousBoundaryChallengeVerified = $autonomousBoundaryChallengeVerified
         outputs = $facilitatedOutputs
     }
-    $outputEvidence = @($roundEvidence | ForEach-Object { $_.outputs }) + @($facilitatedOutputs)
+    $outputEvidence = @($completedOutputs | ForEach-Object {
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$_.text)
+        try {
+            [ordered]@{
+                speakerId = $_.speakerId
+                speakerName = $_.speakerName
+                characterCount = ([string]$_.text).Length
+                sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            }
+        } finally {
+            [Security.Cryptography.CryptographicOperations]::ZeroMemory($bytes)
+        }
+    })
     $visualEvidence = @($roundOneVisual, $roundTwoVisual, $roundThreeVisual)
     $visualStatus = if (@($visualEvidence | Where-Object { $_.status -ne 'verified' }).Count -eq 0) {
         'verified'
     } else {
         'pending'
     }
+    $artifactSpecifications = @(
+        [ordered]@{ role = 'session'; path = $sessionFile.FullName }
+        [ordered]@{ role = 'screenshot.single-at-markdown'; path = $roundOneVisual.screenshot }
+        [ordered]@{ role = 'screenshot.multi-at'; path = $roundTwoVisual.screenshot }
+        [ordered]@{ role = 'screenshot.free-discussion-autonomous-floor'; path = $roundThreeVisual.screenshot }
+    )
+    $artifactEvidence = @($artifactSpecifications | ForEach-Object {
+        if ([string]::IsNullOrWhiteSpace([string]$_.path)) {
+            throw "Release-grade provider evidence is missing artifact: $($_.role)"
+        }
+        $artifactPath = [IO.Path]::GetFullPath([string]$_.path)
+        if (!$artifactPath.StartsWith(
+                $evidenceRoot + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase) -or
+            !(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+            throw "Provider artifact must be a file inside the current evidence root: $artifactPath"
+        }
+        $artifactFile = Get-Item -LiteralPath $artifactPath
+        [ordered]@{
+            role = $_.role
+            path = $artifactFile.FullName
+            size = $artifactFile.Length
+            sha256 = (Get-FileHash -LiteralPath $artifactFile.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
+        }
+    })
     $evidence = [ordered]@{
+        schemaVersion = 1
+        evidenceId = [Guid]::NewGuid().ToString()
+        evidenceClass = 'real-provider-windows-roundtable'
         status = if ($visualStatus -eq 'verified') { 'verified' } else { 'pending' }
         functionalStatus = 'verified'
         visualStatus = $visualStatus
+        productVersion = $productVersion
+        sourceCommit = $sourceCommit
+        appExecutableSha256 = $appExecutableSha256
         runId = $runId
         verifiedAt = [DateTimeOffset]::UtcNow.ToString('O')
         client = 'PiRoundtable.Windows'
@@ -1298,6 +1386,7 @@ try {
         facilitatedEvidence = $facilitatedEvidence
         outputEvidence = $outputEvidence
         visualEvidence = $visualEvidence
+        artifacts = $artifactEvidence
         screenshots = @($visualEvidence | Where-Object { $null -ne $_.screenshot } | ForEach-Object { $_.screenshot })
         uiAutomationSnapshots = @($visualEvidence | Where-Object { $null -ne $_.uiAutomationSnapshot } | ForEach-Object { $_.uiAutomationSnapshot })
         sessionFile = $sessionFile.FullName
@@ -1313,18 +1402,27 @@ try {
         [PiRoundtableE2EInterop]::FileContainsUtf8Secret($_.FullName, $apiKey)
     })
     if ($leakFiles.Count -gt 0) {
-        [IO.File]::Delete($evidencePath)
+        # evidenceRoot is already verified as a strict child of the repository's
+        # ignored out directory. Remove the complete run so no leaked credential
+        # bytes survive in a session, database, screenshot metadata, or report.
+        Remove-Item -LiteralPath $evidenceRoot -Recurse -Force
         throw "Credential leak scan failed in $($leakFiles.Count) local evidence file(s)."
     }
     Write-Host "Functionally verified DeepSeek single-@, multi-@, Markdown/LaTeX, and autonomous free-discussion floor scenarios with $($completedOutputs.Count) completed outputs."
     Write-Host "Visual evidence status: $visualStatus"
     Write-Host "Evidence: $evidencePath"
 } finally {
+    $credentialCleanupFailure = $null
     if ($null -ne $process -and !$process.HasExited) {
         try { $process.Kill($true) } catch { }
     }
     if (!$credentialDeleted -and $credentialTransport -eq 'windows-credential-manager') {
-        try { [PiRoundtableE2EInterop]::DeleteCredential($credentialTarget) } catch { }
+        try {
+            [PiRoundtableE2EInterop]::DeleteCredential($credentialTarget)
+            $credentialDeleted = $true
+        } catch {
+            $credentialCleanupFailure = $_.Exception.Message
+        }
     }
     if ($null -ne $credentialPipeCancellation) {
         try { $credentialPipeCancellation.Cancel() } catch { }
@@ -1333,4 +1431,7 @@ try {
     [Environment]::SetEnvironmentVariable('PI_ROUNDTABLE_DATA_ROOT', $previousDataRoot, 'Process')
     [Environment]::SetEnvironmentVariable('PI_ROUNDTABLE_E2E_CREDENTIAL_PIPE', $previousE2eCredentialPipe, 'Process')
     $apiKey = $null
+    if ($null -ne $credentialCleanupFailure) {
+        throw "Failed to delete the temporary Windows credential $credentialTarget`: $credentialCleanupFailure"
+    }
 }

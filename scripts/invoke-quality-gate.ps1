@@ -7,9 +7,14 @@
 
     [string]$SignedBuildReportPath,
 
+    [ValidatePattern('^[0-9A-Fa-f]{40}$')]
+    [string]$ExpectedSignerThumbprint,
+
     [string]$StableMsiPath,
 
     [string]$ProductionLifecycleReportPath,
+
+    [string]$RealProviderEvidencePath,
 
     [string[]]$VisualReportPath,
 
@@ -210,6 +215,23 @@ function Read-VerifiedEvidenceReport {
             $now - $verifiedAt -gt $MaximumAge) {
             throw "Evidence report is stale, predates this run, or comes from the future: $resolved"
         }
+        $startedProperty = $report.PSObject.Properties['startedAt']
+        $completedProperty = $report.PSObject.Properties['completedAt']
+        if ($null -ne $startedProperty) {
+            $evidenceStartedAt = [DateTimeOffset]::MinValue
+            if (![DateTimeOffset]::TryParse([string]$startedProperty.Value, [ref]$evidenceStartedAt) -or
+                $evidenceStartedAt -gt $verifiedAt) {
+                throw "Evidence report has an invalid execution start: $resolved"
+            }
+        }
+        if ($null -ne $completedProperty) {
+            $evidenceCompletedAt = [DateTimeOffset]::MinValue
+            if (![DateTimeOffset]::TryParse([string]$completedProperty.Value, [ref]$evidenceCompletedAt) -or
+                $evidenceCompletedAt -ne $verifiedAt -or
+                ($null -ne $startedProperty -and $evidenceCompletedAt -lt $evidenceStartedAt)) {
+                throw "Evidence report completion does not match its verification time: $resolved"
+            }
+        }
         & $Validation $report $resolved
         $descriptor = [ordered]@{
             evidenceId = [string]$report.evidenceId
@@ -392,10 +414,13 @@ try {
                 throw 'ReleaseCandidate requires a clean repository so evidence can bind to one immutable commit.'
             }
             if ([string]::IsNullOrWhiteSpace($SignedBuildReportPath) -or
+                [string]::IsNullOrWhiteSpace($ExpectedSignerThumbprint) -or
                 [string]::IsNullOrWhiteSpace($StableMsiPath) -or
-                [string]::IsNullOrWhiteSpace($ProductionLifecycleReportPath)) {
-                throw 'ReleaseCandidate requires SignedBuildReportPath, StableMsiPath, and ProductionLifecycleReportPath.'
+                [string]::IsNullOrWhiteSpace($ProductionLifecycleReportPath) -or
+                [string]::IsNullOrWhiteSpace($RealProviderEvidencePath)) {
+                throw 'ReleaseCandidate requires SignedBuildReportPath, ExpectedSignerThumbprint, StableMsiPath, ProductionLifecycleReportPath, and RealProviderEvidencePath.'
             }
+            $expectedSigner = ($ExpectedSignerThumbprint -replace '\s', '').ToUpperInvariant()
             $explicitVisualPaths = @($VisualReportPath96, $VisualReportPath144, $VisualReportPath192)
             $hasVisualArray = $null -ne $VisualReportPath -and $VisualReportPath.Count -ne 0
             $hasExplicitVisualPaths = @($explicitVisualPaths | Where-Object {
@@ -420,6 +445,8 @@ try {
             $candidateMsi = Resolve-InputPath ([string]$candidateMsiArtifact.path)
             $candidateApp = Resolve-InputPath ([string]$candidateAppArtifact.path)
             $candidatePackageRoot = Resolve-InputPath ([string]$signedReport.packageRoot)
+            $candidateInstallerRoot = Resolve-InputPath ([string]$signedReport.installerRoot)
+            $candidateAppHash = (Get-FileHash -LiteralPath $candidateApp -Algorithm SHA256).Hash.ToUpperInvariant()
 
             $evidence.signedBuild = Read-VerifiedEvidenceReport `
                 -Name 'production-signed-build-evidence' `
@@ -439,9 +466,24 @@ try {
                         throw 'Signed build evidence is not release-grade or is not bound to the current clean commit.'
                     }
                     $requiredRoles = @('windowsExecutable', 'windowsAssembly', 'updaterExecutable', 'nativeCore', 'installer')
+                    $expectedArtifactPaths = @{
+                        windowsExecutable = Join-Path $candidatePackageRoot 'app\PiRoundtable.Windows.exe'
+                        windowsAssembly = Join-Path $candidatePackageRoot 'app\PiRoundtable.Windows.dll'
+                        updaterExecutable = Join-Path $candidatePackageRoot 'app\PiRoundtable.Updater.exe'
+                        nativeCore = Join-Path $candidatePackageRoot 'app\pi_roundtable_core.dll'
+                        installer = Join-Path $candidateInstallerRoot "PiRoundtable-$Version-win-x64.msi"
+                    }
+                    $seenArtifactPaths = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
                     foreach ($role in $requiredRoles) {
                         $artifact = Get-ArtifactFromSignedReport $report $role
                         $artifactPath = Resolve-InputPath ([string]$artifact.path)
+                        if (![string]::Equals(
+                                $artifactPath,
+                                [System.IO.Path]::GetFullPath($expectedArtifactPaths[$role]),
+                                [StringComparison]::OrdinalIgnoreCase) -or
+                            !$seenArtifactPaths.Add($artifactPath)) {
+                            throw "Signed artifact role has a noncanonical or duplicate path: $role"
+                        }
                         if (!(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
                             throw "Signed artifact is missing: $artifactPath"
                         }
@@ -454,13 +496,124 @@ try {
                             $null -eq $signature.SignerCertificate -or
                             $null -eq $signature.TimeStamperCertificate -or
                             $signature.SignerCertificate.Thumbprint -ne [string]$artifact.signerThumbprint -or
+                            $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedSigner -or
                             !$artifact.timestamped) {
                             throw "Signed artifact identity, trust, or timestamp validation failed: $artifactPath"
                         }
                     }
                 }
 
+            $candidatePrefix = "PiRoundtable-$Version-win-x64"
+            $candidateMetadataPath = Join-Path $candidateInstallerRoot "$candidatePrefix.release.json"
             $stableManifestPath = Join-Path $repoRoot 'packaging\windows-x64\update-manifest.json'
+            Invoke-QualityCommand 'release-candidate-asset-integrity' 'node' @(
+                'scripts/verify-windows-release-candidate.mjs',
+                '--metadata', $candidateMetadataPath,
+                '--msi', $candidateMsi,
+                '--materials-directory', $candidateInstallerRoot,
+                '--stable-manifest', $stableManifestPath,
+                '--version', $Version,
+                '--source-commit', $sourceCommit,
+                '--release-tag', "v$Version")
+            $candidateMetadata = Get-Content -LiteralPath $candidateMetadataPath -Raw | ConvertFrom-Json
+            if ($candidateMetadata.authenticodeRequired -ne $true) {
+                throw 'ReleaseCandidate metadata must require production Authenticode.'
+            }
+
+            $evidence.realProvider = Read-VerifiedEvidenceReport `
+                -Name 'real-provider-evidence' `
+                -Path $RealProviderEvidencePath `
+                -Validation {
+                    param($report, $resolved)
+                    if ($report.schemaVersion -ne 1 -or
+                        $report.evidenceClass -ne 'real-provider-windows-roundtable' -or
+                        $report.productVersion -ne $Version -or
+                        $report.sourceCommit -ne $sourceCommit -or
+                        $report.appExecutableSha256 -ne $candidateAppHash -or
+                        $report.functionalStatus -ne 'verified' -or
+                        $report.visualStatus -ne 'verified' -or
+                        $report.client -ne 'PiRoundtable.Windows' -or
+                        $report.provider -ne 'DeepSeek' -or
+                        [int]$report.rounds -lt 3 -or
+                        @($report.outputEvidence).Count -lt 5 -or
+                        (@($report.scenarios) -join ',') -ne 'single-at-markdown,multi-at,free-discussion-autonomous-floor' -or
+                        $report.credentialDeletedAfterRun -ne $true -or
+                        $report.secretLeakScan -ne 'passed') {
+                        throw 'Real-provider evidence is incomplete or is not bound to the signed candidate executable.'
+                    }
+                    if ($report.facilitatedEvidence.initialMarkerVerified -ne $true -or
+                        $report.facilitatedEvidence.initialLengthVerified -ne $true -or
+                        $report.facilitatedEvidence.forbiddenLabelsAbsent -ne $true -or
+                        $report.facilitatedEvidence.autonomousBoundaryChallengeVerified -ne $true) {
+                        throw 'Real-provider facilitated-discussion semantics were not verified.'
+                    }
+                    $providerRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolved))
+                    $requiredArtifactRoles = @(
+                        'session',
+                        'screenshot.single-at-markdown',
+                        'screenshot.multi-at',
+                        'screenshot.free-discussion-autonomous-floor')
+                    if ((@($report.artifacts.role | Sort-Object) -join ',') -ne
+                        (@($requiredArtifactRoles | Sort-Object) -join ',')) {
+                        throw 'Real-provider evidence does not contain the exact session and screenshot artifact set.'
+                    }
+                    foreach ($artifact in @($report.artifacts)) {
+                        $artifactPath = [System.IO.Path]::GetFullPath([string]$artifact.path)
+                        if (!$artifactPath.StartsWith(
+                                $providerRoot + [System.IO.Path]::DirectorySeparatorChar,
+                                [StringComparison]::OrdinalIgnoreCase) -or
+                            !(Test-Path -LiteralPath $artifactPath -PathType Leaf) -or
+                            (Get-Item -LiteralPath $artifactPath).Length -ne [long]$artifact.size -or
+                            (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToUpperInvariant() -ne [string]$artifact.sha256) {
+                            throw "Real-provider artifact is missing, outside its run, or changed: $artifactPath"
+                        }
+                        if ([string]$artifact.role -like 'screenshot.*') {
+                            $header = [byte[]]::new(8)
+                            $stream = [System.IO.File]::OpenRead($artifactPath)
+                            try { $read = $stream.Read($header, 0, $header.Length) } finally { $stream.Dispose() }
+                            if ($read -ne 8 -or [Convert]::ToHexString($header) -ne '89504E470D0A1A0A') {
+                                throw "Real-provider screenshot artifact is not a PNG: $artifactPath"
+                            }
+                        }
+                    }
+                    $visualPaths = @($report.visualEvidence | Where-Object status -eq 'verified' | ForEach-Object {
+                        [System.IO.Path]::GetFullPath([string]$_.screenshot)
+                    } | Sort-Object)
+                    $screenshotArtifactPaths = @($report.artifacts | Where-Object { $_.role -like 'screenshot.*' } | ForEach-Object {
+                        [System.IO.Path]::GetFullPath([string]$_.path)
+                    } | Sort-Object)
+                    if ($visualPaths.Count -ne 3 -or
+                        ($visualPaths -join "`n") -cne ($screenshotArtifactPaths -join "`n")) {
+                        throw 'Real-provider screenshot artifacts are not bound to the three verified visual evidence entries.'
+                    }
+                    $sessionArtifact = @($report.artifacts | Where-Object role -eq 'session')[0]
+                    $sessionPath = [System.IO.Path]::GetFullPath([string]$sessionArtifact.path)
+                    if (![string]::Equals(
+                            $sessionPath,
+                            [System.IO.Path]::GetFullPath([string]$report.sessionFile),
+                            [StringComparison]::OrdinalIgnoreCase)) {
+                        throw 'Real-provider session artifact does not match sessionFile.'
+                    }
+                    $session = Get-Content -LiteralPath $sessionPath -Raw | ConvertFrom-Json
+                    $actualOutputFacts = @($session.messages | Where-Object {
+                        $_.kind -eq 'role' -and $_.state -eq 'completed'
+                    } | ForEach-Object {
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$_.text)
+                        try {
+                            '{0}|{1}|{2}|{3}' -f $_.speakerId, $_.speakerName, ([string]$_.text).Length,
+                                [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+                        } finally {
+                            [Security.Cryptography.CryptographicOperations]::ZeroMemory($bytes)
+                        }
+                    } | Sort-Object)
+                    $reportedOutputFacts = @($report.outputEvidence | ForEach-Object {
+                        '{0}|{1}|{2}|{3}' -f $_.speakerId, $_.speakerName, [int]$_.characterCount, [string]$_.sha256
+                    } | Sort-Object)
+                    if (($actualOutputFacts -join "`n") -cne ($reportedOutputFacts -join "`n")) {
+                        throw 'Real-provider output hashes do not match the persisted session.'
+                    }
+                }
+
             $stableManifest = Get-Content -LiteralPath $stableManifestPath -Raw | ConvertFrom-Json
             $stableMsi = Resolve-InputPath $StableMsiPath
             $evidence.stableBaseline = Invoke-DirectEvidenceValidation 'stable-baseline-evidence' {
@@ -478,6 +631,14 @@ try {
                     $stableFile.Length -ne [long]$stableManifest.asset.size -or
                     $stableHash -ne [string]$stableManifest.asset.sha256) {
                     throw 'Stable MSI bytes do not match the separately signed stable update manifest.'
+                }
+                if ($stableManifest.asset.authenticodeRequired) {
+                    $stableSignature = Get-AuthenticodeSignature -LiteralPath $stableMsi
+                    if ($stableSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+                        $null -eq $stableSignature.SignerCertificate -or
+                        $null -eq $stableSignature.TimeStamperCertificate) {
+                        throw 'Stable manifest requires Authenticode, but the baseline MSI is not trusted and timestamped.'
+                    }
                 }
                 return [ordered]@{
                     manifestPath = $stableManifestPath
@@ -512,6 +673,19 @@ try {
                         -ExpectedPayloadScope 'full-production-payload'
                 }
 
+            foreach ($artifact in @($signedReport.artifacts)) {
+                $artifactPath = Resolve-InputPath ([string]$artifact.path)
+                $signature = Get-AuthenticodeSignature -LiteralPath $artifactPath
+                if ((Get-Item -LiteralPath $artifactPath).Length -ne [long]$artifact.size -or
+                    (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToUpperInvariant() -ne [string]$artifact.sha256 -or
+                    $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+                    $null -eq $signature.SignerCertificate -or
+                    $null -eq $signature.TimeStamperCertificate -or
+                    $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedSigner) {
+                    throw "Signed artifact changed while the full-payload lifecycle ran: $artifactPath"
+                }
+            }
+
             $candidateMsiHash = (Get-FileHash -LiteralPath $candidateMsi -Algorithm SHA256).Hash.ToUpperInvariant()
             $candidateMsiSize = (Get-Item -LiteralPath $candidateMsi).Length
             $evidence.productionLifecycle = Read-VerifiedEvidenceReport `
@@ -523,6 +697,8 @@ try {
                         $report.evidenceClass -ne 'production-clean-vm-stable-to-candidate' -or
                         $report.sourceCommit -ne $sourceCommit -or
                         !$report.environment.cleanVm -or
+                        !$report.environment.disposable -or
+                        !$report.environment.virtualMachineDetected -or
                         $report.environment.architecture -ne 'x64' -or
                         [string]::IsNullOrWhiteSpace([string]$report.environment.vmImage) -or
                         [string]::IsNullOrWhiteSpace([string]$report.environment.snapshotId) -or
@@ -570,7 +746,6 @@ try {
                     '-OutputPath', $visualMatrixPath,
                     '-MaximumAgeHours', '24')
             Invoke-QualityCommand 'real-dpi-visual-matrix' 'pwsh' $visualArguments
-            $candidateAppHash = (Get-FileHash -LiteralPath $candidateApp -Algorithm SHA256).Hash.ToUpperInvariant()
             $evidence.visualMatrix = Read-VerifiedEvidenceReport `
                 -Name 'real-dpi-visual-matrix-evidence' `
                 -Path $visualMatrixPath `

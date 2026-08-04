@@ -15,6 +15,12 @@
 
     [string]$OutputPath,
 
+    [string]$CurrentManifestPath,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9A-Fa-f]{40}$')]
+    [string]$ExpectedSignerThumbprint,
+
     [switch]$AuthenticodeRequired
 )
 
@@ -24,17 +30,22 @@ if ($versionParts[0] -gt 255 -or $versionParts[1] -gt 255 -or $versionParts[2] -
     throw 'Version exceeds Windows Installer limits (major/minor <= 255 and patch <= 65535).'
 }
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'windows-packaging.ps1')
 if ([string]::IsNullOrWhiteSpace($TrustedPublicKeyPath)) {
     $TrustedPublicKeyPath = Join-Path $repoRoot 'packaging\windows-x64\update-public-key.pem'
 }
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $OutputPath = Join-Path $repoRoot 'packaging\windows-x64\update-manifest.json'
 }
+if ([string]::IsNullOrWhiteSpace($CurrentManifestPath)) {
+    $CurrentManifestPath = Join-Path $repoRoot 'packaging\windows-x64\update-manifest.json'
+}
 
 $resolvedMsi = [System.IO.Path]::GetFullPath($MsiPath)
 $resolvedPrivateKey = [System.IO.Path]::GetFullPath($PrivateKeyPath)
 $resolvedPublicKey = [System.IO.Path]::GetFullPath($TrustedPublicKeyPath)
 $resolvedOutput = [System.IO.Path]::GetFullPath($OutputPath)
+$resolvedCurrentManifest = [System.IO.Path]::GetFullPath($CurrentManifestPath)
 if (!(Test-Path -LiteralPath $resolvedMsi -PathType Leaf) -or
     ![string]::Equals([System.IO.Path]::GetExtension($resolvedMsi), '.msi', [StringComparison]::OrdinalIgnoreCase)) {
     throw 'MsiPath must identify an existing MSI file.'
@@ -48,6 +59,31 @@ if (!(Test-Path -LiteralPath $resolvedPublicKey -PathType Leaf)) {
 if ($resolvedPrivateKey.StartsWith($repoRoot + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'The update signing private key must remain outside the repository.'
 }
+if (!$AuthenticodeRequired) {
+    throw 'Stable release manifests must require production Authenticode.'
+}
+
+$expectedFileName = "PiRoundtable-$Version-win-x64.msi"
+$expectedAssetUrl = "https://github.com/ShizkMoon/pi-roundtable/releases/download/v$Version/$expectedFileName"
+if (![string]::Equals([System.IO.Path]::GetFileName($resolvedMsi), $expectedFileName, [StringComparison]::Ordinal)) {
+    throw "MsiPath must use the canonical release file name $expectedFileName."
+}
+$msiProductVersion = Get-MsiProperty -Path $resolvedMsi -Name 'ProductVersion'
+$msiProductName = Get-MsiProperty -Path $resolvedMsi -Name 'ProductName'
+$msiUpgradeCode = (Get-MsiProperty -Path $resolvedMsi -Name 'UpgradeCode').ToUpperInvariant()
+if ($msiProductVersion -ne $Version -or
+    $msiProductName -ne 'Pi Roundtable' -or
+    $msiUpgradeCode -ne '{8F84BF2C-3DBB-4F28-8B97-78D8B384365A}') {
+    throw 'MSI internal product identity does not match the requested production release.'
+}
+$expectedSigner = ($ExpectedSignerThumbprint -replace '\s', '').ToUpperInvariant()
+$authenticode = Get-AuthenticodeSignature -LiteralPath $resolvedMsi
+if ($authenticode.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+    $null -eq $authenticode.SignerCertificate -or
+    $null -eq $authenticode.TimeStamperCertificate -or
+    $authenticode.SignerCertificate.Thumbprint.ToUpperInvariant() -ne $expectedSigner) {
+    throw 'MSI must carry the expected trusted, RFC 3161 timestamped production Authenticode signature.'
+}
 
 $assetUri = $null
 if (![Uri]::TryCreate($AssetUrl, [UriKind]::Absolute, [ref]$assetUri) -or
@@ -55,8 +91,23 @@ if (![Uri]::TryCreate($AssetUrl, [UriKind]::Absolute, [ref]$assetUri) -or
     [string]::IsNullOrWhiteSpace($assetUri.Host) -or
     ![string]::IsNullOrEmpty($assetUri.UserInfo) -or
     ![string]::IsNullOrEmpty($assetUri.Query) -or
-    ![string]::IsNullOrEmpty($assetUri.Fragment)) {
-    throw 'AssetUrl must be an absolute HTTPS URL without credentials, query, or fragment.'
+    ![string]::IsNullOrEmpty($assetUri.Fragment) -or
+    ![string]::Equals($assetUri.AbsoluteUri, $expectedAssetUrl, [StringComparison]::Ordinal)) {
+    throw "AssetUrl must exactly match $expectedAssetUrl."
+}
+
+if (Test-Path -LiteralPath $resolvedCurrentManifest -PathType Leaf) {
+    $currentManifest = Get-Content -LiteralPath $resolvedCurrentManifest -Raw | ConvertFrom-Json
+    $currentVersion = $null
+    if ($currentManifest.version -isnot [string] -or
+        ![Version]::TryParse([string]$currentManifest.version, [ref]$currentVersion) -or
+        $currentVersion.ToString(3) -ne [string]$currentManifest.version) {
+        throw 'CurrentManifestPath does not contain a canonical three-part version.'
+    }
+    $candidateVersion = [Version]$Version
+    if ($candidateVersion -le $currentVersion) {
+        throw "Version $Version must be newer than the current stable version $currentVersion."
+    }
 }
 
 $key = [System.Security.Cryptography.ECDsa]::Create()
