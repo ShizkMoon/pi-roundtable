@@ -6,7 +6,7 @@ using PiRoundtable.Windows.Models;
 
 namespace PiRoundtable.Windows.Services;
 
-internal sealed class LlmCatalogAnalysisService
+internal sealed class LlmCatalogAnalysisService : IDisposable
 {
     private const int MaxResponseBytes = 1024 * 1024;
     private const string SystemInstruction = """
@@ -344,4 +344,6 @@ internal sealed class LlmCatalogAnalysisService
         var baseUri = NetworkEndpointPolicy.RequireBaseUri(configuredEndpoint, defaultBase);
         return new Uri($"{baseUri.AbsoluteUri.TrimEnd('/')}/{path}", UriKind.Absolute);
     }
+
+    public void Dispose() => _httpClient.Dispose();
 }

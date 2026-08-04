@@ -1,5 +1,26 @@
 namespace PiRoundtable.Windows.Services;
 
+internal interface IMeetingEventIngestionQueueFactory
+{
+    MeetingEventIngestionQueue Create(
+        Func<RuntimeMeetingEvent, Task> acceptEventAsync,
+        Func<string, Task> reportFaultAsync,
+        Action<string>? trace = null);
+}
+
+internal sealed class MeetingEventIngestionQueueFactory : IMeetingEventIngestionQueueFactory
+{
+    public MeetingEventIngestionQueue Create(
+        Func<RuntimeMeetingEvent, Task> acceptEventAsync,
+        Func<string, Task> reportFaultAsync,
+        Action<string>? trace = null)
+    {
+        ArgumentNullException.ThrowIfNull(acceptEventAsync);
+        ArgumentNullException.ThrowIfNull(reportFaultAsync);
+        return new MeetingEventIngestionQueue(acceptEventAsync, reportFaultAsync, trace);
+    }
+}
+
 internal sealed class MeetingEventIngestionQueue(
     Func<RuntimeMeetingEvent, Task> acceptEventAsync,
     Func<string, Task> reportFaultAsync,

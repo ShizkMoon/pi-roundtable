@@ -9,15 +9,102 @@ public sealed class DependencyBoundaryTests
     [TestMethod]
     public void ViewModel_can_be_created_without_a_WinUI_dispatcher_or_native_core()
     {
-        var viewModel = new MainViewModel(
-            new ImmediateDispatcher(),
-            new ThrowingRuntimeHostFactory(),
-            new ThrowingMeetingCoreFactory(),
-            new ThrowingMeetingEventStore());
+        var root = TestRoot();
+        try
+        {
+            using var services = new MainViewModelServices(
+                new ThrowingRuntimeHostFactory(),
+                new ThrowingMeetingCoreFactory(),
+                new MeetingEventIngestionQueueFactory(),
+                new ThrowingMeetingEventStore(),
+                new WorkspaceConfigurationStore(root),
+                new RoundtableSessionStore(root),
+                new WindowsCredentialStore(),
+                new ClientSettingsStore(root),
+                new ProviderModelDiscoveryService(),
+                new CatalogImportService(root),
+                new LlmCatalogAnalysisService());
+            var viewModel = new MainViewModel(
+                new ImmediateDispatcher(),
+                services);
 
-        Assert.AreEqual("等待配置", viewModel.StatusText);
-        Assert.HasCount(2, viewModel.Roles);
-        Assert.IsNotNull(viewModel.SelectedSession);
+            Assert.AreEqual("等待配置", viewModel.StatusText);
+            Assert.HasCount(2, viewModel.Roles);
+            Assert.IsNotNull(viewModel.SelectedSession);
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void Views_delegate_concrete_application_construction_to_the_composition_root()
+    {
+        var rootSource = File.ReadAllText(FindRepositoryFile(
+            "apps", "windows", "PiRoundtable.Windows", "ApplicationCompositionRoot.cs"));
+        var appSource = File.ReadAllText(FindRepositoryFile(
+            "apps", "windows", "PiRoundtable.Windows", "App.xaml.cs"));
+        var windowSource = File.ReadAllText(FindRepositoryFile(
+            "apps", "windows", "PiRoundtable.Windows", "MainWindow.xaml.cs"));
+        var viewModelSource = File.ReadAllText(FindRepositoryFile(
+            "apps", "windows", "PiRoundtable.Windows", "ViewModels", "MainViewModel.cs"));
+        string[] productionConstructions =
+        [
+            "new RuntimeHostFactory(",
+            "new MeetingCoreFactory(",
+            "new MeetingEventIngestionQueueFactory(",
+            "new MeetingEventStore(",
+            "new WorkspaceConfigurationStore(",
+            "new RoundtableSessionStore(",
+            "new WindowsCredentialStore(",
+            "new ClientSettingsStore(",
+            "new ProviderModelDiscoveryService(",
+            "new CatalogImportService(",
+            "new LlmCatalogAnalysisService(",
+            "new WindowsUpdateService(",
+        ];
+
+        foreach (var construction in productionConstructions)
+        {
+            StringAssert.Contains(rootSource, construction);
+            Assert.IsFalse(appSource.Contains(construction, StringComparison.Ordinal));
+            Assert.IsFalse(windowSource.Contains(construction, StringComparison.Ordinal));
+            Assert.IsFalse(viewModelSource.Contains(construction, StringComparison.Ordinal));
+        }
+        StringAssert.Contains(appSource, "_compositionRoot.CreateMainWindow()");
+        StringAssert.Contains(rootSource, "_viewModelServices.Dispose()");
+        var closedCheckpointGate = viewModelSource.IndexOf(
+            "if (checkpoint?.IsClosed == true)",
+            StringComparison.Ordinal);
+        var runtimeCreation = viewModelSource.IndexOf(
+            "runtime = _runtimeHostFactory.Create(_eventStore);",
+            StringComparison.Ordinal);
+        Assert.IsGreaterThanOrEqualTo(0, closedCheckpointGate);
+        Assert.IsGreaterThan(closedCheckpointGate, runtimeCreation);
+    }
+
+    private static string TestRoot() => Path.Combine(
+        Path.GetTempPath(),
+        "pi-roundtable-tests",
+        Guid.NewGuid().ToString("N"));
+
+    private static string FindRepositoryFile(params string[] segments)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null)
+        {
+            var candidate = Path.Combine([directory.FullName, .. segments]);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+            directory = directory.Parent;
+        }
+        throw new FileNotFoundException($"Repository file was not found: {Path.Combine(segments)}");
     }
 
     private sealed class ImmediateDispatcher : IUiDispatcher

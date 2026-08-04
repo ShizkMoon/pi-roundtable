@@ -8,6 +8,7 @@ import type { ApiFamily, ModelCapability, ThinkingLevel } from "@pi-roundtable/p
 export interface SubagentRunRequest {
   subagentId: string;
   parentRoleId: string;
+  runtimeGeneration: number;
   providerId: string;
   providerName: string;
   apiFamily: ApiFamily;
@@ -56,10 +57,13 @@ export class PiSubagentRunner implements SubagentRunner {
     signal: AbortSignal,
   ): Promise<string> {
     signal.throwIfAborted();
+    if (!Number.isSafeInteger(request.runtimeGeneration) || request.runtimeGeneration < 1) {
+      throw new RangeError("runtimeGeneration must be a positive safe integer");
+    }
     const adapter = this.#adapterFactory({
       roleId: request.parentRoleId,
-      runtimeId: `subagent-runtime:${request.subagentId}`,
-      sessionId: `subagent-session.${request.subagentId}`,
+      runtimeId: `subagent-runtime:${request.runtimeGeneration}:${request.subagentId}`,
+      sessionId: `subagent-session.${request.runtimeGeneration}.${request.subagentId}`,
       providerId: request.providerId,
       providerName: request.providerName,
       apiFamily: request.apiFamily,

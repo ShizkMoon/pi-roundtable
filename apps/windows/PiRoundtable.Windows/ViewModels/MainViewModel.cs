@@ -21,13 +21,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private readonly ObservableCollection<TranscriptItem> _emptyTranscript = [];
     private readonly ObservableCollection<TranscriptItem> _emptyPrivateThread = [];
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
-    private readonly WorkspaceConfigurationStore _workspaceStore = new();
-    private readonly RoundtableSessionStore _sessionStore = new();
-    private readonly WindowsCredentialStore _credentialStore = new();
-    private readonly ClientSettingsStore _clientSettingsStore = new();
-    private readonly ProviderModelDiscoveryService _providerModelDiscovery = new();
-    private readonly CatalogImportService _catalogImport = new();
-    private readonly LlmCatalogAnalysisService _llmCatalogAnalysis = new();
+    private readonly WorkspaceConfigurationStore _workspaceStore;
+    private readonly RoundtableSessionStore _sessionStore;
+    private readonly WindowsCredentialStore _credentialStore;
+    private readonly ClientSettingsStore _clientSettingsStore;
+    private readonly ProviderModelDiscoveryService _providerModelDiscovery;
+    private readonly CatalogImportService _catalogImport;
+    private readonly LlmCatalogAnalysisService _llmCatalogAnalysis;
     private WorkspaceConfiguration _workspace = new();
     private ClientSettingsConfiguration _clientSettings = new();
     private DiscussionSchedulerStateConfiguration _discussionState = new();
@@ -78,26 +78,23 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private bool _initialized;
     private bool _disposed;
 
-    public MainViewModel(Microsoft.UI.Dispatching.DispatcherQueue dispatcher)
-        : this(
-            new DispatcherQueueAdapter(dispatcher),
-            new RuntimeHostFactory(),
-            new MeetingCoreFactory(),
-            new MeetingEventStore())
-    {
-    }
-
     internal MainViewModel(
         IUiDispatcher dispatcher,
-        IRuntimeHostFactory runtimeHostFactory,
-        IMeetingCoreFactory meetingCoreFactory,
-        IMeetingEventStore eventStore)
+        MainViewModelServices services)
     {
-        _dispatcher = dispatcher;
-        _runtimeHostFactory = runtimeHostFactory;
-        _meetingCoreFactory = meetingCoreFactory;
-        _eventStore = eventStore;
-        _eventQueue = new MeetingEventIngestionQueue(
+        _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        ArgumentNullException.ThrowIfNull(services);
+        _runtimeHostFactory = services.RuntimeHostFactory;
+        _meetingCoreFactory = services.MeetingCoreFactory;
+        _eventStore = services.EventStore;
+        _workspaceStore = services.WorkspaceStore;
+        _sessionStore = services.SessionStore;
+        _credentialStore = services.CredentialStore;
+        _clientSettingsStore = services.ClientSettingsStore;
+        _providerModelDiscovery = services.ProviderModelDiscovery;
+        _catalogImport = services.CatalogImport;
+        _llmCatalogAnalysis = services.LlmCatalogAnalysis;
+        _eventQueue = services.EventIngestionQueueFactory.Create(
             AcceptMeetingEventAsync,
             ReportEventStreamFaultAsync,
             WriteEventIngestionTrace);
@@ -1874,10 +1871,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             IsBusy = true;
             ErrorMessage = string.Empty;
             StatusText = "正在启动 Runtime Host";
-            var runtime = _runtimeHostFactory.Create(_eventStore);
-            _startingRuntime = runtime;
-            runtime.MeetingEventReceived += OnMeetingEventReceived;
-            runtime.DiagnosticReceived += OnDiagnosticReceived;
+            IRuntimeHostProcess? runtime = null;
             try
             {
                 SynchronizeWorkspaceConfiguration();
@@ -1919,6 +1913,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 var nextGeneration = checked(_runtimeGeneration + 1);
                 _runtimeGeneration = nextGeneration;
                 await _eventQueue.ResetAsync(nextGeneration, _sequence);
+                // Create the process only after every preflight gate that can
+                // return without entering runtime ownership has succeeded.
+                runtime = _runtimeHostFactory.Create(_eventStore);
+                _startingRuntime = runtime;
+                runtime.MeetingEventReceived += OnMeetingEventReceived;
+                runtime.DiagnosticReceived += OnDiagnosticReceived;
                 await runtime.StartAsync(
                     new RuntimeHostStartOptions(
                         meetingId,
@@ -1934,12 +1934,20 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                     cancellationToken);
                 if (_disposed)
                 {
-                    runtime.MeetingEventReceived -= OnMeetingEventReceived;
-                    runtime.DiagnosticReceived -= OnDiagnosticReceived;
                     _startingRuntime = null;
-                    await runtime.DisposeAsync();
-                    _meetingCore?.Dispose();
-                    _meetingCore = null;
+                    try
+                    {
+                        await DisposeRuntimeAndDrainEventsAsync(runtime);
+                    }
+                    catch
+                    {
+                        runtime.Terminate();
+                    }
+                    finally
+                    {
+                        _meetingCore?.Dispose();
+                        _meetingCore = null;
+                    }
                     return;
                 }
                 _runtime = runtime;
@@ -1994,15 +2002,26 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             }
             catch
             {
-                runtime.MeetingEventReceived -= OnMeetingEventReceived;
-                runtime.DiagnosticReceived -= OnDiagnosticReceived;
-                await runtime.DisposeAsync();
                 _runtime = null;
                 _startingRuntime = null;
-                _meetingCore?.Dispose();
-                _meetingCore = null;
-                ShowError("启动失败：请检查 Runtime Host、角色模型路由和 Credential Manager 中的提供商凭据。");
-                StatusText = "启动失败";
+                try
+                {
+                    if (runtime is not null)
+                    {
+                        await DisposeRuntimeAndDrainEventsAsync(runtime);
+                    }
+                }
+                catch
+                {
+                    runtime?.Terminate();
+                }
+                finally
+                {
+                    _meetingCore?.Dispose();
+                    _meetingCore = null;
+                    ShowError("启动失败：请检查 Runtime Host、角色模型路由和 Credential Manager 中的提供商凭据。");
+                    StatusText = "启动失败";
+                }
             }
             finally
             {
@@ -2547,16 +2566,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             IsRunning = false;
             if (runtime is null)
             {
-                if (startingRuntime is not null)
+                try
                 {
-                    startingRuntime.MeetingEventReceived -= OnMeetingEventReceived;
-                    startingRuntime.DiagnosticReceived -= OnDiagnosticReceived;
-                    startingRuntime.Terminate();
-                    await startingRuntime.DisposeAsync();
+                    if (startingRuntime is not null)
+                    {
+                        startingRuntime.Terminate();
+                        await DisposeRuntimeAndDrainEventsAsync(startingRuntime);
+                    }
+                    else
+                    {
+                        await WaitForEventQueueAsync();
+                    }
                 }
-                _meetingCore?.Dispose();
-                _meetingCore = null;
-                await PersistSelectedSessionAsync(CancellationToken.None);
+                finally
+                {
+                    _meetingCore?.Dispose();
+                    _meetingCore = null;
+                    await PersistSelectedSessionAsync(CancellationToken.None);
+                }
                 return;
             }
 
@@ -2564,7 +2591,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             try
             {
                 await runtime.StopAsync(RuntimeHostShutdownMode.Suspend, cancellationToken);
-                await WaitForEventQueueAsync();
             }
             catch (Exception error) when (error is not OperationCanceledException)
             {
@@ -2573,21 +2599,25 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             }
             finally
             {
-                runtime.MeetingEventReceived -= OnMeetingEventReceived;
-                runtime.DiagnosticReceived -= OnDiagnosticReceived;
-                await runtime.DisposeAsync();
-                _meetingCore?.Dispose();
-                _meetingCore = null;
-                _streamingMessages.Clear();
-                _privateStreamingMessages.Clear();
-                IsBusy = false;
-                StatusText = _eventStreamFaulted ? "会议因事件故障暂停" : "会议已暂停，可从本地检查点恢复";
-                foreach (var role in Roles.Where(role => !role.IsArchived))
+                try
                 {
-                    role.Status = "未连接";
+                    await DisposeRuntimeAndDrainEventsAsync(runtime);
                 }
-                NotifySummary();
-                await PersistSelectedSessionAsync(CancellationToken.None);
+                finally
+                {
+                    _meetingCore?.Dispose();
+                    _meetingCore = null;
+                    _streamingMessages.Clear();
+                    _privateStreamingMessages.Clear();
+                    IsBusy = false;
+                    StatusText = _eventStreamFaulted ? "会议因事件故障暂停" : "会议已暂停，可从本地检查点恢复";
+                    foreach (var role in Roles.Where(role => !role.IsArchived))
+                    {
+                        role.Status = "未连接";
+                    }
+                    NotifySummary();
+                    await PersistSelectedSessionAsync(CancellationToken.None);
+                }
             }
         }
         finally
@@ -2606,16 +2636,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             {
                 var startingRuntime = _startingRuntime;
                 _startingRuntime = null;
-                if (startingRuntime is not null)
+                try
                 {
-                    startingRuntime.MeetingEventReceived -= OnMeetingEventReceived;
-                    startingRuntime.DiagnosticReceived -= OnDiagnosticReceived;
-                    startingRuntime.Terminate();
-                    await startingRuntime.DisposeAsync();
+                    if (startingRuntime is not null)
+                    {
+                        startingRuntime.Terminate();
+                        await DisposeRuntimeAndDrainEventsAsync(startingRuntime);
+                    }
+                    else
+                    {
+                        await WaitForEventQueueAsync();
+                    }
                 }
-                _meetingCore?.Dispose();
-                _meetingCore = null;
-                await PersistSelectedSessionAsync(CancellationToken.None);
+                finally
+                {
+                    _meetingCore?.Dispose();
+                    _meetingCore = null;
+                    await PersistSelectedSessionAsync(CancellationToken.None);
+                }
                 return;
             }
             _runtime = null;
@@ -2647,17 +2685,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 try
                 {
                     await runtime.StopAsync(RuntimeHostShutdownMode.Close, CancellationToken.None);
-                    await WaitForEventQueueAsync();
                 }
                 catch
                 {
                     runtime.Terminate();
                 }
-                runtime.MeetingEventReceived -= OnMeetingEventReceived;
-                runtime.DiagnosticReceived -= OnDiagnosticReceived;
                 try
                 {
-                    await runtime.DisposeAsync();
+                    await DisposeRuntimeAndDrainEventsAsync(runtime);
                 }
                 finally
                 {
@@ -3911,6 +3946,23 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private Task WaitForEventQueueAsync()
     {
         return _eventQueue.DrainAsync();
+    }
+
+    private async Task DisposeRuntimeAndDrainEventsAsync(IRuntimeHostProcess runtime)
+    {
+        runtime.MeetingEventReceived -= OnMeetingEventReceived;
+        runtime.DiagnosticReceived -= OnDiagnosticReceived;
+        try
+        {
+            await runtime.DisposeAsync();
+        }
+        finally
+        {
+            // Dispose waits for the stdout reader to finish. Draining afterward
+            // therefore fences callbacks that were already in flight when the
+            // event handlers were detached.
+            await WaitForEventQueueAsync();
+        }
     }
 
     private async Task SuspendAfterStreamFaultAsync()

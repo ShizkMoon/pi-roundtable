@@ -42,20 +42,36 @@ import {
   resolveRuntimeContextPolicy,
   type RuntimeContextPolicyOptions,
 } from "./runtime-context-policy.js";
+import {
+  finishContextCompaction,
+  startContextCompaction,
+  type ContextCompactionTrackerV1,
+} from "./context-compaction.js";
+import {
+  createProviderCacheDiagnostic,
+  resolveProviderCacheRequestPolicy,
+} from "./provider-cache-adapter.js";
+import { resolveProviderCapabilityProfile } from "./provider-capability-profile.js";
+import type { ProviderContextDiagnosticListener } from "./provider-context-diagnostics.js";
+import { parseProviderUsageSample } from "./provider-usage.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
+  /** Materializes transient MCP boundary strings without retaining them on the adapter. */
+  materializeMcpServers?(): readonly ResolvedMcpServerRuntimeConfiguration[];
 }
 
 export interface PiSessionHandle {
   readonly sessionId: string;
   readonly isStreaming: boolean;
+  readonly isCompacting?: boolean;
   getActiveToolNames(): string[];
   subscribe(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string, options?: PromptOptions): Promise<void>;
   steer(text: string): Promise<void>;
   followUp(text: string): Promise<void>;
   abort(): Promise<void>;
+  abortCompaction?(): void;
   dispose(): void | Promise<void>;
 }
 
@@ -86,6 +102,7 @@ export interface PiSessionCreateOptions {
   mcpServers: readonly ResolvedMcpServerRuntimeConfiguration[];
   approvalHandler?: (request: McpToolApprovalRequest) => Promise<boolean>;
   customTools?: readonly ToolDefinition[];
+  diagnosticListener?: ProviderContextDiagnosticListener;
 }
 
 export interface PiSessionFactory {
@@ -113,6 +130,7 @@ export interface PiRuntimeAdapterOptions {
   systemPrompt?: string;
   contextPolicy?: RuntimeContextPolicyOptions;
   skillPaths?: readonly string[];
+  /** @deprecated Prefer credentialProvider.materializeMcpServers for secret-bearing configurations. */
   mcpServers?: readonly ResolvedMcpServerRuntimeConfiguration[];
   /** Internal, host-defined tools; never populated from meeting message content. */
   customTools?: readonly ToolDefinition[];
@@ -120,6 +138,8 @@ export interface PiRuntimeAdapterOptions {
   sessionFactory?: PiSessionFactory;
   now?: () => Date;
   toolApprovalTimeoutMs?: number;
+  runtimeGeneration?: number;
+  diagnosticListener?: ProviderContextDiagnosticListener;
 }
 
 export class PiRuntimeError extends Error {
@@ -146,32 +166,59 @@ interface PendingToolApproval {
   causationId?: string;
 }
 
-class MemoryCredentialStore implements CredentialStore {
+/** @internal Exported only for contract-level verification. */
+export class MemoryCredentialStore implements CredentialStore {
   readonly #credentials = new Map<string, Credential>();
+  readonly #writeChains = new Map<string, Promise<unknown>>();
+
+  constructor(providerId?: string, apiKey?: string) {
+    if (providerId !== undefined && apiKey !== undefined) {
+      this.#credentials.set(providerId, { type: "api_key", key: apiKey });
+    }
+  }
 
   async read(providerId: string): Promise<Credential | undefined> {
     return this.#credentials.get(providerId);
   }
 
   async list(): Promise<readonly CredentialInfo[]> {
-    return [];
+    return [...this.#credentials].map(([providerId, credential]) => ({
+      providerId,
+      type: credential.type,
+    }));
   }
 
-  async modify(
+  modify(
     providerId: string,
     update: (current: Credential | undefined) => Promise<Credential | undefined>,
   ): Promise<Credential | undefined> {
-    const current = this.#credentials.get(providerId);
-    const next = await update(current);
-    if (next !== undefined) {
-      this.#credentials.set(providerId, next);
-      return next;
-    }
-    return current;
+    return this.#enqueueWrite(providerId, async () => {
+      const current = this.#credentials.get(providerId);
+      const next = await update(current);
+      if (next !== undefined) {
+        this.#credentials.set(providerId, next);
+        return next;
+      }
+      // CredentialStore treats undefined as "leave unchanged". Explicit
+      // deletion belongs to delete(); this matters for OAuth refresh callbacks.
+      return current;
+    });
   }
 
-  async delete(providerId: string): Promise<void> {
-    this.#credentials.delete(providerId);
+  delete(providerId: string): Promise<void> {
+    return this.#enqueueWrite(providerId, async () => {
+      this.#credentials.delete(providerId);
+    });
+  }
+
+  #enqueueWrite<T>(providerId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#writeChains.get(providerId) ?? Promise.resolve();
+    const next = (async () => {
+      await previous.catch(() => undefined);
+      return operation();
+    })();
+    this.#writeChains.set(providerId, next.catch(() => undefined));
+    return next;
   }
 }
 
@@ -188,17 +235,36 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
     }
     let modelRuntime: ModelRuntime;
     let providerTransport: ProviderTransport | undefined;
+    const providerId = options.providerId;
+    const credentialStore = new MemoryCredentialStore(providerId, options.apiKey);
+    // This factory owns the create-options object. Drop its API-key reference
+    // once the isolated in-memory store has accepted the SDK boundary copy.
+    options.apiKey = "";
     try {
       modelRuntime = await ModelRuntime.create({
-        credentials: new MemoryCredentialStore(),
+        credentials: credentialStore,
+        modelsPath: null,
         allowModelNetwork: false,
       });
     } catch (error) {
+      await credentialStore.delete(providerId);
       throw toStageError("model_runtime_init_failed", error);
     }
-    const endpoint = options.endpoint === undefined
-      ? undefined
-      : normalizeProviderEndpoint(options.endpoint);
+    const clearRuntimeCredential = async (): Promise<void> => {
+      // The SDK boundary stores an immutable string in our isolated in-memory
+      // store. Deletion drops that reference; unlike owned Buffers, it cannot
+      // physically wipe strings already materialized by the SDK.
+      await credentialStore.delete(providerId);
+    };
+    let endpoint: string | undefined;
+    try {
+      endpoint = options.endpoint === undefined
+        ? undefined
+        : normalizeProviderEndpoint(options.endpoint);
+    } catch (error) {
+      await clearRuntimeCredential();
+      throw error;
+    }
     let model;
     try {
       model = modelRuntime.getModel(options.providerId, options.modelId);
@@ -216,7 +282,6 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         modelRuntime.registerProvider(options.providerId, {
           name: options.providerName,
           baseUrl,
-          apiKey: options.apiKey,
           api,
           models: [{
             id: options.modelId,
@@ -248,16 +313,11 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         model = modelRuntime.getModel(options.providerId, options.modelId);
       }
     } catch (error) {
+      await clearRuntimeCredential();
       throw toStageError("model_registration_failed", error);
     }
-    try {
-      await modelRuntime.setRuntimeApiKey(options.providerId, options.apiKey, {
-        allowNetwork: false,
-      });
-    } catch (error) {
-      throw toStageError("credential_install_failed", error);
-    }
     if (model === undefined) {
+      await clearRuntimeCredential();
       throw new PiRuntimeError(
         "model_not_found",
         `Pi model is not available: ${options.providerId}/${options.modelId}`,
@@ -270,11 +330,20 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
       };
     }
 
-    const mcpManager = new McpClientManager(
-      options.mcpServers,
-      undefined,
-      options.approvalHandler,
-    );
+    let mcpManager: McpClientManager;
+    try {
+      mcpManager = new McpClientManager(
+        options.mcpServers,
+        undefined,
+        options.approvalHandler,
+      );
+    } catch (error) {
+      options.mcpServers = [];
+      await clearRuntimeCredential();
+      throw toStageError("mcp_configuration_failed", error);
+    }
+    options.mcpServers = [];
+    let createdSession: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     try {
       let mcpTools;
       try {
@@ -283,13 +352,32 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         throw toStageError("mcp_connect_failed", error);
       }
       const customTools = [...mcpTools, ...(options.customTools ?? [])];
-      // The model registry is authoritative for the final window. Computing
-      // from adapter defaults before model resolution can compact too late for
-      // a smaller built-in model or unnecessarily early for a larger one.
+      const capabilityProfile = resolveProviderCapabilityProfile({
+        providerId: options.providerId,
+        modelId: options.modelId,
+        apiFamily: options.apiFamily,
+        ...(endpoint === undefined ? {} : { endpoint }),
+        ...(options.contextWindow === undefined
+          ? {}
+          : { declaredContextWindow: options.contextWindow }),
+        runtimeContextWindow: model.contextWindow,
+      });
+      // Resolve disagreement conservatively. A declared window or stale SDK
+      // registry entry must never make compaction later than the smaller bound.
       const contextPolicy = resolveRuntimeContextPolicy(
-        model.contextWindow,
+        capabilityProfile.resolvedContextWindow,
         options.contextPolicy,
       );
+      const cacheRequestPolicy = resolveProviderCacheRequestPolicy(
+        capabilityProfile,
+        contextPolicy.cacheRetention,
+        options.sessionId,
+      );
+      emitContextDiagnostic(options.diagnosticListener, createProviderCacheDiagnostic(
+        capabilityProfile,
+        Buffer.byteLength(options.systemPrompt, "utf8"),
+        "initial_session",
+      ));
       const settingsManager = createIsolatedSettingsManager(
         options.thinkingLevel ?? "off",
         contextPolicy,
@@ -331,25 +419,36 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
           : { providerFetch: options.providerFetch }),
       });
       providerTransport = activeProviderTransport;
-      let session;
       try {
-        ({ session } = await createAgentSession(createOptions));
+        ({ session: createdSession } = await createAgentSession(createOptions));
       } catch (error) {
         throw toStageError("session_create_failed", error);
       }
+      const session = createdSession;
       const piStreamFunction = session.agent.streamFunction;
-      session.agent.streamFunction = (streamModel, context, streamOptions) =>
-        piStreamFunction(streamModel, context, {
+      session.agent.streamFunction = (streamModel, context, streamOptions) => {
+        const cacheOptions = cacheRequestPolicy.cacheRetention === "none"
+          ? {}
+          : {
+              cacheRetention: cacheRequestPolicy.cacheRetention,
+              ...(cacheRequestPolicy.sessionId === undefined
+                ? {}
+                : { sessionId: cacheRequestPolicy.sessionId }),
+            };
+        return piStreamFunction(streamModel, context, {
           ...streamOptions,
           fetch: activeProviderTransport.fetch,
-          cacheRetention: streamOptions?.cacheRetention ?? contextPolicy.cacheRetention,
-          sessionId: streamOptions?.sessionId ?? options.sessionId,
+          ...cacheOptions,
         });
+      };
       let disposePromise: Promise<void> | undefined;
       return {
         sessionId: session.sessionId,
         get isStreaming() {
           return session.isStreaming;
+        },
+        get isCompacting() {
+          return session.isCompacting;
         },
         getActiveToolNames: () => session.getActiveToolNames(),
         subscribe: (listener) => session.subscribe(listener),
@@ -357,19 +456,26 @@ const DEFAULT_PI_SESSION_FACTORY: PiSessionFactory = {
         steer: (text) => session.steer(text),
         followUp: (text) => session.followUp(text),
         abort: () => session.abort(),
+        abortCompaction: () => session.abortCompaction(),
         dispose: () => {
           disposePromise ??= (async () => {
             try {
               await session.dispose();
             } finally {
-              await Promise.all([mcpManager.close(), activeProviderTransport.close()]);
+              try {
+                await Promise.all([mcpManager.close(), activeProviderTransport.close()]);
+              } finally {
+                await clearRuntimeCredential();
+              }
             }
           })();
           return disposePromise;
         },
       };
     } catch (error) {
-      await Promise.all([mcpManager.close(), providerTransport?.close()]);
+      await Promise.resolve(createdSession?.dispose()).catch(() => undefined);
+      await Promise.allSettled([mcpManager.close(), providerTransport?.close()]);
+      await clearRuntimeCredential();
       throw error;
     }
   },
@@ -379,6 +485,18 @@ function toStageError(code: string, error: unknown): PiRuntimeError {
   return error instanceof PiRuntimeError
     ? error
     : new PiRuntimeError(code, `Pi runtime stage failed: ${code}`);
+}
+
+function emitContextDiagnostic(
+  listener: ProviderContextDiagnosticListener | undefined,
+  diagnostic: Parameters<ProviderContextDiagnosticListener>[0],
+): void {
+  try {
+    listener?.(diagnostic);
+  } catch {
+    // Diagnostics are private observations and cannot affect the authoritative
+    // role session or normalized meeting event stream.
+  }
 }
 
 export class PiRuntimeAdapter implements RuntimeAdapter {
@@ -401,10 +519,17 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #turnFailureTerminalEmitted = false;
   #turnStartedEmitted = false;
   #activeTurnCommandId: string | undefined;
+  #compactionTracker: ContextCompactionTrackerV1 | undefined;
+  #lastUsageSignature: string | undefined;
   readonly #pendingToolApprovals = new Map<string, PendingToolApproval>();
 
   constructor(options: PiRuntimeAdapterOptions) {
-    this.#options = options;
+    this.#options = {
+      ...options,
+      ...(options.mcpServers === undefined
+        ? {}
+        : { mcpServers: [...options.mcpServers] }),
+    };
     this.#runtimeId = options.runtimeId ?? randomUUID();
     this.#sessionId = options.sessionId ?? randomUUID();
     this.#now = options.now ?? (() => new Date());
@@ -418,7 +543,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     }
 
     this.#state = "starting";
-    const operation = this.#startSession();
+    // Defer user/provider seams until #startPromise is published. A synchronous
+    // reentrant stop can then await and cancel the same startup operation.
+    const operation = Promise.resolve().then(() => this.#startSession());
     this.#startPromise = operation;
     void operation.then(
       () => {
@@ -536,6 +663,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#turnCancellationEmitted = false;
       }
       try {
+        if (session.isCompacting && session.abortCompaction !== undefined) {
+          try {
+            session.abortCompaction();
+          } catch {
+            // The turn abort below remains authoritative even if Pi's optional
+            // compaction-specific hook races with natural completion.
+          }
+        }
         await session.abort();
         return remember({ commandId: command.commandId, accepted: true });
       } catch (error) {
@@ -611,6 +746,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   async #startSession(): Promise<RuntimeSessionInfo> {
     let session: PiSessionHandle | undefined;
     let unsubscribe: (() => void) | undefined;
+    let sessionPublished = false;
+    // Move deprecated secret-bearing configuration out of adapter-owned state
+    // before invoking any fallible or reentrant credential seam. A failed
+    // startup may be retried without stop(), so retaining this reference on the
+    // adapter would otherwise revive stale headers or environment values.
+    const legacyMcpServers = this.#options.mcpServers ?? [];
+    this.#options.mcpServers = [];
 
     try {
       const apiKey = await this.#options.credentialProvider.resolveApiKey(
@@ -622,6 +764,8 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
           `No runtime credential is available for provider ${this.#options.providerId}`,
         );
       }
+      const mcpServers = this.#options.credentialProvider.materializeMcpServers?.() ??
+        legacyMcpServers;
 
       const factory = this.#options.sessionFactory ?? DEFAULT_PI_SESSION_FACTORY;
       const createOptions: PiSessionCreateOptions = {
@@ -648,7 +792,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         systemPrompt: this.#options.systemPrompt ?? "",
         contextPolicy: { ...this.#options.contextPolicy },
         skillPaths: [...(this.#options.skillPaths ?? [])],
-        mcpServers: [...(this.#options.mcpServers ?? [])],
+        mcpServers: [...mcpServers],
         approvalHandler: (request) => this.#requestToolApproval(request),
         customTools: [
           ...(this.#options.customTools ?? []),
@@ -656,6 +800,9 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
             ? []
             : [this.#createSubagentTool(this.#options.subagentSpawner)]),
         ],
+        ...(this.#options.diagnosticListener === undefined
+          ? {}
+          : { diagnosticListener: this.#options.diagnosticListener }),
       };
       if (this.#options.agentDir !== undefined) {
         createOptions.agentDir = this.#options.agentDir;
@@ -681,14 +828,29 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       this.#session = session;
       this.#unsubscribeSession = unsubscribe;
       this.#state = "running";
+      sessionPublished = true;
 
       const info = this.#sessionInfo(session);
       this.#emit("runtime.ready", { engine: "pi" });
+      if (this.#state !== "running" || this.#session !== session) {
+        throw new PiRuntimeError(
+          "start_cancelled",
+          "Pi runtime adapter was stopped while publishing runtime readiness",
+        );
+      }
       return info;
     } catch (error) {
-      unsubscribe?.();
-      await session?.dispose();
-      const cancelled = this.#state === "stopping";
+      const cancelled = this.#state === "stopping" || this.#state === "stopped";
+      try {
+        unsubscribe?.();
+      } catch {
+        // Preserve the startup error while continuing credential/resource cleanup.
+      }
+      // Once a published session has been removed from #session, stop() owns
+      // its disposal. Other startup failures still clean up their local handle.
+      if (!sessionPublished || this.#session === session) {
+        await Promise.resolve(session?.dispose()).catch(() => undefined);
+      }
       if (this.#state === "starting") {
         this.#state = "stopped";
       }
@@ -700,6 +862,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   }
 
   async #stopSession(): Promise<void> {
+    this.#options.mcpServers = [];
     if (this.#state === "stopped") {
       return;
     }
@@ -725,13 +888,15 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#session = undefined;
     this.#unsubscribeSession?.();
     this.#unsubscribeSession = undefined;
-    const shouldAbort = session.isStreaming || this.#promptDispatchPending;
+    const shouldAbort = session.isStreaming || session.isCompacting || this.#promptDispatchPending;
     this.#promptDispatchPending = false;
     this.#clearCancellationOutcome();
     this.#turnFailed = false;
     this.#turnFailureTerminalEmitted = false;
     this.#turnStartedEmitted = false;
     this.#activeTurnCommandId = undefined;
+    this.#compactionTracker = undefined;
+    this.#lastUsageSignature = undefined;
     for (const pending of this.#pendingToolApprovals.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(false);
@@ -739,6 +904,13 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     this.#pendingToolApprovals.clear();
     try {
       if (shouldAbort) {
+        if (session.isCompacting && session.abortCompaction !== undefined) {
+          try {
+            session.abortCompaction();
+          } catch {
+            // dispose() is still required and is the final cleanup boundary.
+          }
+        }
         await session.abort();
       }
     } finally {
@@ -848,6 +1020,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         this.#turnFailed = false;
         this.#turnFailureErrorCode = undefined;
         this.#turnFailureTerminalEmitted = false;
+        this.#lastUsageSignature = undefined;
         if (!this.#turnStartedEmitted) {
           this.#turnStartedEmitted = true;
           this.#emit("turn.started", {}, this.#activeTurnCommandId);
@@ -873,6 +1046,66 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       case "turn_end":
         this.#observeFinalMessage(event.message);
         break;
+      case "compaction_start": {
+        const policy = this.#resolveDiagnosticContextPolicy();
+        this.#compactionTracker = startContextCompaction({
+          startedAtMs: this.#now().getTime(),
+          trigger: event.reason,
+          triggerRatio: policy.compactAtTokens / policy.contextWindow,
+          providerId: this.#options.providerId,
+          modelId: this.#options.modelId,
+          roleId: this.#options.roleId,
+          sessionId: this.#sessionId,
+          ...(this.#options.runtimeGeneration === undefined
+            ? {}
+            : { runtimeGeneration: this.#options.runtimeGeneration }),
+        });
+        break;
+      }
+      case "compaction_end": {
+        const policy = this.#resolveDiagnosticContextPolicy();
+        const tracker = this.#compactionTracker ?? startContextCompaction({
+          startedAtMs: this.#now().getTime(),
+          trigger: event.reason,
+          triggerRatio: policy.compactAtTokens / policy.contextWindow,
+          providerId: this.#options.providerId,
+          modelId: this.#options.modelId,
+          roleId: this.#options.roleId,
+          sessionId: this.#sessionId,
+          ...(this.#options.runtimeGeneration === undefined
+            ? {}
+            : { runtimeGeneration: this.#options.runtimeGeneration }),
+        });
+        const status = event.aborted
+          ? "aborted" as const
+          : event.errorMessage !== undefined
+            ? "failed" as const
+            : event.result === undefined
+              ? "fallback" as const
+              : "completed" as const;
+        emitContextDiagnostic(this.#options.diagnosticListener, finishContextCompaction(tracker, {
+          finishedAtMs: this.#now().getTime(),
+          status,
+          ...(event.result?.tokensBefore === undefined
+            ? {}
+            : { tokensBefore: event.result.tokensBefore }),
+          ...(event.result?.estimatedTokensAfter === undefined
+            ? {}
+            : { estimatedTokensAfter: event.result.estimatedTokensAfter }),
+          ...(event.result?.firstKeptEntryId === undefined
+            ? {}
+            : { firstKeptEntryId: event.result.firstKeptEntryId }),
+          ...(event.result?.summary === undefined ? {} : { summary: event.result.summary }),
+          ...(status === "failed" ? { failureCode: "pi_compaction_failed" } : {}),
+          ...(status === "fallback" ? { fallbackReason: "missing_compaction_result" } : {}),
+          willRetry: event.willRetry,
+        }));
+        if (event.result?.usage !== undefined) {
+          this.#observeProviderUsage(event.result.usage, true);
+        }
+        this.#compactionTracker = undefined;
+        break;
+      }
       case "agent_settled":
         if (this.#turnCancellationPending) {
           if (!this.#turnCancellationEmitted) {
@@ -949,10 +1182,12 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       role?: unknown;
       stopReason?: unknown;
       errorMessage?: unknown;
+      usage?: unknown;
     };
     if (finalMessage.role !== "assistant") {
       return;
     }
+    this.#observeProviderUsage(finalMessage.usage, false);
     if (finalMessage.stopReason === "aborted") {
       this.#markTurnCancelled();
     } else if (finalMessage.stopReason === "error") {
@@ -961,6 +1196,63 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       );
       this.#markTurnFailed(failure.code, failure.message);
     }
+  }
+
+  #observeProviderUsage(usage: unknown, partial: boolean): void {
+    const sample = parseProviderUsageSample(usage, {
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      observedAt: this.#now().toISOString(),
+      source: "sdk_normalized",
+      partial,
+    });
+    if (sample === undefined) {
+      return;
+    }
+    const signature = JSON.stringify([
+      sample.inputTokens,
+      sample.outputTokens,
+      sample.cacheReadTokens,
+      sample.cacheWriteTokens,
+      sample.totalTokens,
+      sample.partial,
+    ]);
+    if (signature === this.#lastUsageSignature) {
+      return;
+    }
+    this.#lastUsageSignature = signature;
+    emitContextDiagnostic(this.#options.diagnosticListener, sample);
+    const profile = resolveProviderCapabilityProfile({
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      apiFamily: this.#options.apiFamily ?? "custom",
+      ...(this.#options.endpoint === undefined ? {} : { endpoint: this.#options.endpoint }),
+      ...(this.#options.contextWindow === undefined
+        ? {}
+        : { declaredContextWindow: this.#options.contextWindow }),
+    });
+    emitContextDiagnostic(this.#options.diagnosticListener, createProviderCacheDiagnostic(
+      profile,
+      Buffer.byteLength(this.#options.systemPrompt ?? "", "utf8"),
+      "initial_session",
+      sample,
+    ));
+  }
+
+  #resolveDiagnosticContextPolicy(): ReturnType<typeof resolveRuntimeContextPolicy> {
+    const profile = resolveProviderCapabilityProfile({
+      providerId: this.#options.providerId,
+      modelId: this.#options.modelId,
+      apiFamily: this.#options.apiFamily ?? "custom",
+      ...(this.#options.endpoint === undefined ? {} : { endpoint: this.#options.endpoint }),
+      ...(this.#options.contextWindow === undefined
+        ? {}
+        : { declaredContextWindow: this.#options.contextWindow }),
+    });
+    return resolveRuntimeContextPolicy(
+      profile.resolvedContextWindow,
+      this.#options.contextPolicy,
+    );
   }
 
   #markTurnCancelled(): void {

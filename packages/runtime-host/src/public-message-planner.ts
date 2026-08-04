@@ -15,6 +15,9 @@ export interface PublicMessagePlanningRole {
 }
 
 export interface PublicMessagePlanningModel {
+  ownerRoleId: string;
+  runtimeGeneration: number;
+  roleSessionToken: string;
   providerId: string;
   providerName: string;
   apiFamily: ApiFamily;
@@ -90,8 +93,8 @@ export class PiPublicMessagePlanner implements PublicMessagePlanner {
     const roleId = "internal.semantic_planner";
     const adapter = this.#adapterFactory({
       roleId,
-      runtimeId: `semantic-planner-runtime:${plannerId}`,
-      sessionId: `semantic-planner-session.${plannerId}`,
+      runtimeId: `semantic-planner-runtime:g${model.runtimeGeneration}:${model.ownerRoleId}:${plannerId}`,
+      sessionId: `semantic-planner-session.${model.runtimeGeneration}.${model.roleSessionToken}.${plannerId}`,
       providerId: model.providerId,
       providerName: model.providerName,
       apiFamily: model.apiFamily,

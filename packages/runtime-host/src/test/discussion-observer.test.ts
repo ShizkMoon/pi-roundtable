@@ -94,6 +94,9 @@ const REQUEST: DiscussionObservationRequest = {
   meetingContext: "会议要求同步服务器只转发并持久化规范化事件。",
   speechComplete: false,
   model: {
+    ownerRoleId: "role.risk",
+    runtimeGeneration: 3,
+    roleSessionToken: "3.2",
     providerId: "deepseek",
     providerName: "DeepSeek",
     apiFamily: "openai_chat_completions",
@@ -131,6 +134,8 @@ test("runs a bounded isolated observer and accepts an exact-evidence interruptio
   assert.equal(adapter?.options.customTools?.[0]?.name, "report_floor_decision");
   assert.deepEqual(adapter?.options.skillPaths, []);
   assert.deepEqual(adapter?.options.mcpServers, []);
+  assert.match(adapter?.options.runtimeId ?? "", /g3:role\.risk/);
+  assert.match(adapter?.options.sessionId ?? "", /\.3\.3\.2\./);
   assert.equal(adapter?.options.subagentSpawner, undefined);
   assert.equal(adapter?.options.maxOutputTokens, 384);
   assert.match(adapter?.options.systemPrompt ?? "", /hidden, bounded floor-request observer/);
