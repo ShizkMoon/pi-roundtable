@@ -95,4 +95,60 @@ internal sealed class RoundtableSessionStore
             }
         }
     }
+
+    internal string StageDelete(string sessionId)
+    {
+        if (!SafeIdPattern.IsMatch(sessionId))
+        {
+            throw new InvalidDataException("会话 ID 不符合安全删除规则。");
+        }
+        Directory.CreateDirectory(_sessionsDirectory);
+        var source = Path.Combine(_sessionsDirectory, $"{sessionId}.json");
+        if (!File.Exists(source))
+        {
+            throw new FileNotFoundException("找不到要删除的会话定义。", source);
+        }
+        var ticket = Path.Combine(_sessionsDirectory, $".{sessionId}.{Guid.NewGuid():N}.delete-pending");
+        File.Move(source, ticket);
+        return ticket;
+    }
+
+    internal void RollbackDelete(string sessionId, string ticket)
+    {
+        var destination = Path.Combine(_sessionsDirectory, $"{sessionId}.json");
+        if (File.Exists(ticket) && !File.Exists(destination))
+        {
+            File.Move(ticket, destination);
+        }
+    }
+
+    internal static void CompleteDelete(string ticket)
+    {
+        if (File.Exists(ticket))
+        {
+            File.Delete(ticket);
+        }
+    }
+
+    internal IReadOnlyList<(string SessionId, string Ticket)> GetPendingDeletes()
+    {
+        if (!Directory.Exists(_sessionsDirectory))
+        {
+            return [];
+        }
+        var result = new List<(string SessionId, string Ticket)>();
+        foreach (var ticket in Directory.EnumerateFiles(_sessionsDirectory, ".*.delete-pending"))
+        {
+            var name = Path.GetFileName(ticket);
+            const string suffix = ".delete-pending";
+            var body = name[1..^suffix.Length];
+            var separator = body.LastIndexOf('.');
+            var sessionId = separator > 0 ? body[..separator] : string.Empty;
+            if (SafeIdPattern.IsMatch(sessionId))
+            {
+                result.Add((sessionId, ticket));
+            }
+        }
+        return result;
+    }
 }

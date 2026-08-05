@@ -23,7 +23,11 @@ public sealed class DependencyBoundaryTests
                 new ClientSettingsStore(root),
                 new ProviderModelDiscoveryService(),
                 new CatalogImportService(root),
-                new LlmCatalogAnalysisService());
+                new LlmCatalogAnalysisService(),
+                new MeetingCommandGateway(),
+                new RoleMemoryStore(root),
+                new DocumentPipeline(),
+                new ArtifactStore(root));
             var viewModel = new MainViewModel(
                 new ImmediateDispatcher(),
                 services);
@@ -65,6 +69,10 @@ public sealed class DependencyBoundaryTests
             "new ProviderModelDiscoveryService(",
             "new CatalogImportService(",
             "new LlmCatalogAnalysisService(",
+            "new MeetingCommandGateway(",
+            "new RoleMemoryStore(",
+            "new DocumentPipeline(",
+            "new ArtifactStore(",
             "new WindowsUpdateService(",
         ];
 
@@ -81,10 +89,15 @@ public sealed class DependencyBoundaryTests
             "if (checkpoint?.IsClosed == true)",
             StringComparison.Ordinal);
         var runtimeCreation = viewModelSource.IndexOf(
-            "runtime = _runtimeHostFactory.Create(_eventStore);",
+            "runtime = _sessionController.CreateRuntime();",
             StringComparison.Ordinal);
         Assert.IsGreaterThanOrEqualTo(0, closedCheckpointGate);
         Assert.IsGreaterThan(closedCheckpointGate, runtimeCreation);
+        Assert.IsLessThanOrEqualTo(
+            4_810,
+            File.ReadLines(FindRepositoryFile(
+                "apps", "windows", "PiRoundtable.Windows", "ViewModels", "MainViewModel.cs")).Count(),
+            "Lower this presentation-adapter budget whenever another use case moves behind a controller.");
     }
 
     private static string TestRoot() => Path.Combine(
@@ -170,5 +183,15 @@ public sealed class DependencyBoundaryTests
             string fingerprint,
             CancellationToken cancellationToken = default) =>
             throw new AssertFailedException("Command journal access is not expected during construction.");
+
+        public Task<MeetingDeletionImpact> GetDeletionImpactAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            throw new AssertFailedException("Meeting deletion is not expected during construction.");
+
+        public Task DeleteMeetingAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            throw new AssertFailedException("Meeting deletion is not expected during construction.");
     }
 }

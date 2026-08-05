@@ -4,6 +4,7 @@ import {
   type PiRuntimeAdapterOptions,
 } from "./pi-runtime-adapter.js";
 import type { ApiFamily, ModelCapability, ThinkingLevel } from "@pi-roundtable/protocol";
+import type { WebSearchProvider } from "./web-search.js";
 
 export interface SubagentRunRequest {
   subagentId: string;
@@ -24,6 +25,7 @@ export interface SubagentRunRequest {
   systemPrompt: string;
   skillPaths: string[];
   task: string;
+  webSearchProvider?: WebSearchProvider;
 }
 
 export interface SubagentRunProgress {
@@ -87,6 +89,9 @@ export class PiSubagentRunner implements SubagentRunner {
       ].join("\n\n"),
       skillPaths: request.skillPaths,
       mcpServers: [],
+      ...(request.webSearchProvider === undefined
+        ? {}
+        : { webSearch: { provider: request.webSearchProvider, approvalMode: "never" as const } }),
       credentialProvider: {
         resolveApiKey: async (providerId) =>
           providerId === request.providerId ? request.apiKey : undefined,

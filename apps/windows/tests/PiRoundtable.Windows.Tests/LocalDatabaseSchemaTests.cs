@@ -6,11 +6,15 @@ namespace PiRoundtable.Windows.Tests;
 [TestClass]
 public sealed class LocalDatabaseSchemaTests
 {
-    private static readonly string[] Version2TableNames =
+    private static readonly string[] Version3TableNames =
     [
         "command_journal",
         "legacy_projections",
         "meeting_events",
+        "memory_candidates",
+        "memory_recall_audits",
+        "memory_retention_jobs",
+        "role_context_snapshots",
         "role_memories",
         "role_memory_revisions",
         "runtime_checkpoints",
@@ -19,7 +23,7 @@ public sealed class LocalDatabaseSchemaTests
     ];
 
     [TestMethod]
-    public async Task Fresh_initialization_creates_only_the_reviewed_version_2_schema()
+    public async Task Fresh_initialization_creates_only_the_reviewed_version_3_schema()
     {
         var root = TestRoot();
         try
@@ -28,14 +32,18 @@ public sealed class LocalDatabaseSchemaTests
 
             await LocalDatabaseSchema.InitializeAsync(connection, CancellationToken.None);
 
-            Assert.AreEqual(2L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
-            CollectionAssert.AreEqual(Version2TableNames, await ReadUserTableNamesAsync(connection));
+            Assert.AreEqual(3L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
+            CollectionAssert.AreEqual(Version3TableNames, await ReadUserTableNamesAsync(connection));
             CollectionAssert.AreEqual(
                 new[]
                 {
                     "command_journal|meeting_id:TEXT:required:pk1:hidden0,command_id:TEXT:required:pk2:hidden0,fingerprint:TEXT:required:pk0:hidden0,status:TEXT:required:pk0:hidden0,sequence:INTEGER:optional:pk0:hidden0,protected_receipt:BLOB:optional:pk0:hidden0,updated_at:TEXT:required:pk0:hidden0",
                     "legacy_projections|meeting_id:TEXT:optional:pk1:hidden0,protected_projection:BLOB:required:pk0:hidden0,imported_at:TEXT:required:pk0:hidden0",
                     "meeting_events|meeting_id:TEXT:required:pk1:hidden0,event_id:TEXT:required:pk0:hidden0,sequence:INTEGER:required:pk2:hidden0,runtime_generation:INTEGER:required:pk0:hidden0,event_kind:TEXT:required:pk0:hidden0,occurred_at:TEXT:required:pk0:hidden0,visibility:TEXT:required:pk0:hidden0,protected_event:BLOB:required:pk0:hidden0",
+                    "memory_candidates|candidate_id:TEXT:optional:pk1:hidden0,workspace_id:TEXT:required:pk0:hidden0,role_profile_id:TEXT:required:pk0:hidden0,source_meeting_id:TEXT:required:pk0:hidden0,source_event_id:TEXT:optional:pk0:hidden0,memory_kind:TEXT:required:pk0:hidden0,protected_content:BLOB:required:pk0:hidden0,confidence:REAL:optional:pk0:hidden0,status:TEXT:required:pk0:hidden0,decision_revision:INTEGER:required:pk0:hidden0,created_at:TEXT:required:pk0:hidden0,updated_at:TEXT:required:pk0:hidden0",
+                    "memory_recall_audits|audit_id:TEXT:optional:pk1:hidden0,meeting_id:TEXT:required:pk0:hidden0,workspace_id:TEXT:required:pk0:hidden0,role_profile_id:TEXT:required:pk0:hidden0,runtime_generation:INTEGER:required:pk0:hidden0,considered_refs:TEXT:required:pk0:hidden0,selected_refs:TEXT:required:pk0:hidden0,injected_refs:TEXT:required:pk0:hidden0,created_at:TEXT:required:pk0:hidden0",
+                    "memory_retention_jobs|job_id:TEXT:optional:pk1:hidden0,workspace_id:TEXT:required:pk0:hidden0,role_profile_id:TEXT:optional:pk0:hidden0,source_meeting_id:TEXT:optional:pk0:hidden0,status:TEXT:required:pk0:hidden0,not_before:TEXT:required:pk0:hidden0,created_at:TEXT:required:pk0:hidden0,updated_at:TEXT:required:pk0:hidden0",
+                    "role_context_snapshots|snapshot_id:TEXT:optional:pk1:hidden0,meeting_id:TEXT:required:pk0:hidden0,role_profile_id:TEXT:required:pk0:hidden0,runtime_generation:INTEGER:required:pk0:hidden0,source_sequence:INTEGER:required:pk0:hidden0,policy_version:TEXT:required:pk0:hidden0,prefix_fingerprint:TEXT:required:pk0:hidden0,protected_snapshot:BLOB:required:pk0:hidden0,created_at:TEXT:required:pk0:hidden0",
                     "role_memories|workspace_id:TEXT:required:pk1:hidden0,role_profile_id:TEXT:required:pk2:hidden0,memory_id:TEXT:required:pk3:hidden0,memory_kind:TEXT:required:pk0:hidden0,current_revision:INTEGER:required:pk0:hidden0,created_at:TEXT:required:pk0:hidden0,updated_at:TEXT:required:pk0:hidden0,superseded_at:TEXT:optional:pk0:hidden0",
                     "role_memory_revisions|workspace_id:TEXT:required:pk1:hidden0,role_profile_id:TEXT:required:pk2:hidden0,memory_id:TEXT:required:pk3:hidden0,revision:INTEGER:required:pk4:hidden0,protected_content:BLOB:required:pk0:hidden0,write_authority:TEXT:required:pk0:hidden0,source_meeting_id:TEXT:optional:pk0:hidden0,source_event_id:TEXT:optional:pk0:hidden0,confidence:REAL:optional:pk0:hidden0,created_at:TEXT:required:pk0:hidden0",
                     "runtime_checkpoints|meeting_id:TEXT:optional:pk1:hidden0,last_sequence:INTEGER:required:pk0:hidden0,runtime_generation:INTEGER:required:pk0:hidden0,clean_shutdown:INTEGER:required:pk0:hidden0,is_closed:INTEGER:required:pk0:hidden0,updated_at:TEXT:required:pk0:hidden0",
@@ -59,6 +67,14 @@ public sealed class LocalDatabaseSchemaTests
                     "legacy_projections|meeting_id:asc:BINARY|unique|pk|complete",
                     "meeting_events|event_id:asc:BINARY|unique|u|complete",
                     "meeting_events|meeting_id:asc:BINARY,sequence:asc:BINARY|unique|pk|complete",
+                    "memory_candidates|candidate_id:asc:BINARY|unique|pk|complete",
+                    "memory_candidates|ix_memory_candidates_review|workspace_id:asc:BINARY,role_profile_id:asc:BINARY,status:asc:BINARY,updated_at:desc:BINARY|nonunique|c|complete",
+                    "memory_recall_audits|audit_id:asc:BINARY|unique|pk|complete",
+                    "memory_recall_audits|ix_memory_recall_meeting|meeting_id:asc:BINARY,role_profile_id:asc:BINARY,runtime_generation:asc:BINARY|nonunique|c|complete",
+                    "memory_retention_jobs|ix_memory_retention_due|status:asc:BINARY,not_before:asc:BINARY|nonunique|c|complete",
+                    "memory_retention_jobs|job_id:asc:BINARY|unique|pk|complete",
+                    "role_context_snapshots|ix_role_context_restore|meeting_id:asc:BINARY,role_profile_id:asc:BINARY,runtime_generation:asc:BINARY,source_sequence:asc:BINARY|unique|c|complete",
+                    "role_context_snapshots|snapshot_id:asc:BINARY|unique|pk|complete",
                     "role_memories|ix_role_memories_active|workspace_id:asc:BINARY,role_profile_id:asc:BINARY,superseded_at:asc:BINARY,updated_at:desc:BINARY|nonunique|c|complete",
                     "role_memories|workspace_id:asc:BINARY,role_profile_id:asc:BINARY,memory_id:asc:BINARY|unique|pk|complete",
                     "role_memory_revisions|workspace_id:asc:BINARY,role_profile_id:asc:BINARY,memory_id:asc:BINARY,revision:asc:BINARY|unique|pk|complete",
@@ -68,14 +84,7 @@ public sealed class LocalDatabaseSchemaTests
                 await ReadIndexContractsAsync(connection));
             Assert.AreEqual(0L, await ScalarInt64Async(connection, """
                 SELECT COUNT(*) FROM sqlite_schema
-                WHERE type = 'table' AND name IN (
-                    'memory_candidates',
-                    'memory_recall_audits',
-                    'role_context_snapshots',
-                    'memory_retention_jobs',
-                    'platform_schema_info',
-                    'platform_migration_journal'
-                )
+                WHERE type = 'table' AND name IN ('platform_schema_info', 'platform_migration_journal')
                 """));
         }
         finally
@@ -85,7 +94,7 @@ public sealed class LocalDatabaseSchemaTests
     }
 
     [TestMethod]
-    public async Task Version_1_migration_and_version_2_reinitialization_preserve_existing_rows()
+    public async Task Version_1_migration_and_version_3_reinitialization_preserve_existing_rows()
     {
         var root = TestRoot();
         try
@@ -97,7 +106,7 @@ public sealed class LocalDatabaseSchemaTests
             await LocalDatabaseSchema.InitializeAsync(connection, CancellationToken.None);
 
             CollectionAssert.AreEqual(version1Rows, await ReadVersion1RowSnapshotAsync(connection));
-            Assert.AreEqual(2L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
+            Assert.AreEqual(3L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
             Assert.AreEqual("event-preserved", await ScalarStringAsync(
                 connection,
                 "SELECT event_id FROM meeting_events WHERE meeting_id = 'meeting-preserved'"));
@@ -164,7 +173,7 @@ public sealed class LocalDatabaseSchemaTests
 
             StringAssert.Contains(error.Message, "999");
             Assert.AreEqual(999L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
-            CollectionAssert.AreEqual(Version2TableNames, await ReadUserTableNamesAsync(connection));
+            CollectionAssert.AreEqual(Version3TableNames, await ReadUserTableNamesAsync(connection));
         }
         finally
         {
@@ -246,7 +255,7 @@ public sealed class LocalDatabaseSchemaTests
     }
 
     [TestMethod]
-    public async Task Declared_version_2_with_a_changed_table_shape_is_rejected()
+    public async Task Declared_version_3_with_a_changed_table_shape_is_rejected()
     {
         var root = TestRoot();
         try
@@ -260,7 +269,7 @@ public sealed class LocalDatabaseSchemaTests
                 LocalDatabaseSchema.InitializeAsync(connection, CancellationToken.None));
 
             StringAssert.Contains(error.Message, "role_memories");
-            Assert.AreEqual(2L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
+            Assert.AreEqual(3L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
             CollectionAssert.AreEqual(schemaBefore, await ReadSchemaSqlAsync(connection));
         }
         finally
@@ -290,7 +299,7 @@ public sealed class LocalDatabaseSchemaTests
                 LocalDatabaseSchema.InitializeAsync(connection, CancellationToken.None));
 
             CollectionAssert.AreEqual(schemaBefore, await ReadSchemaSqlAsync(connection));
-            Assert.AreEqual(2L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
+            Assert.AreEqual(3L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
         }
         finally
         {
@@ -397,8 +406,8 @@ public sealed class LocalDatabaseSchemaTests
 
             await using var connection = await OpenConnectionAsync(
                 Path.Combine(root, "data", "roundtable.db"));
-            Assert.AreEqual(2L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
-            CollectionAssert.AreEqual(Version2TableNames, await ReadUserTableNamesAsync(connection));
+            Assert.AreEqual(3L, await ScalarInt64Async(connection, "SELECT schema_version FROM schema_info"));
+            CollectionAssert.AreEqual(Version3TableNames, await ReadUserTableNamesAsync(connection));
         }
         finally
         {
@@ -427,8 +436,8 @@ public sealed class LocalDatabaseSchemaTests
             start.SetResult();
             await Task.WhenAll(initializers).WaitAsync(TimeSpan.FromSeconds(15));
 
-            Assert.AreEqual(2L, await ScalarInt64Async(connections[0], "SELECT schema_version FROM schema_info"));
-            CollectionAssert.AreEqual(Version2TableNames, await ReadUserTableNamesAsync(connections[0]));
+            Assert.AreEqual(3L, await ScalarInt64Async(connections[0], "SELECT schema_version FROM schema_info"));
+            CollectionAssert.AreEqual(Version3TableNames, await ReadUserTableNamesAsync(connections[0]));
         }
         finally
         {
@@ -469,7 +478,7 @@ public sealed class LocalDatabaseSchemaTests
             }
 
             await LocalDatabaseSchema.InitializeAsync(blocked, CancellationToken.None);
-            Assert.AreEqual(2L, await ScalarInt64Async(blocked, "SELECT schema_version FROM schema_info"));
+            Assert.AreEqual(3L, await ScalarInt64Async(blocked, "SELECT schema_version FROM schema_info"));
         }
         finally
         {
@@ -498,7 +507,7 @@ public sealed class LocalDatabaseSchemaTests
 
             await store.InitializeAsync().WaitAsync(TimeSpan.FromSeconds(5));
             await using var verified = await OpenConnectionAsync(store.DatabasePath);
-            Assert.AreEqual(2L, await ScalarInt64Async(verified, "SELECT schema_version FROM schema_info"));
+            Assert.AreEqual(3L, await ScalarInt64Async(verified, "SELECT schema_version FROM schema_info"));
         }
         finally
         {
@@ -639,7 +648,7 @@ public sealed class LocalDatabaseSchemaTests
     private static async Task<string[]> ReadTableContractsAsync(SqliteConnection connection)
     {
         var contracts = new List<string>();
-        foreach (var table in Version2TableNames)
+        foreach (var table in Version3TableNames)
         {
             await using var command = connection.CreateCommand();
             command.CommandText = $"PRAGMA table_xinfo(\"{table}\")";
@@ -658,7 +667,7 @@ public sealed class LocalDatabaseSchemaTests
     private static async Task<string[]> ReadIndexContractsAsync(SqliteConnection connection)
     {
         var contracts = new List<string>();
-        foreach (var table in Version2TableNames)
+        foreach (var table in Version3TableNames)
         {
             var indexes = new List<(string Name, bool Unique, string Origin, bool Partial)>();
             await using (var list = connection.CreateCommand())

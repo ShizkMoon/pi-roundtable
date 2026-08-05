@@ -861,6 +861,16 @@ public sealed class RuntimeHostProcessTests
             string fingerprint,
             CancellationToken cancellationToken = default) =>
             inner.MarkCommandInterruptedAsync(meetingId, commandId, fingerprint, cancellationToken);
+
+        public Task<MeetingDeletionImpact> GetDeletionImpactAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.GetDeletionImpactAsync(meetingId, cancellationToken);
+
+        public Task DeleteMeetingAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.DeleteMeetingAsync(meetingId, cancellationToken);
     }
 
     private sealed class BlockingCommandJournal(IMeetingEventStore inner) : IMeetingEventStore
@@ -924,5 +934,15 @@ public sealed class RuntimeHostProcessTests
             string fingerprint,
             CancellationToken cancellationToken = default) =>
             inner.MarkCommandInterruptedAsync(meetingId, commandId, fingerprint, cancellationToken);
+
+        public Task<MeetingDeletionImpact> GetDeletionImpactAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.GetDeletionImpactAsync(meetingId, cancellationToken);
+
+        public Task DeleteMeetingAsync(
+            string meetingId,
+            CancellationToken cancellationToken = default) =>
+            inner.DeleteMeetingAsync(meetingId, cancellationToken);
     }
 }

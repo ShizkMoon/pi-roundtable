@@ -1,4 +1,17 @@
 export {
+  WEB_SEARCH_TOOL_ID,
+  ProviderNativeWebSearchFactory,
+  createWebSearchTool,
+  type WebSearchCitation,
+  type WebSearchProvider,
+  type WebSearchProviderFactory,
+  type WebSearchProviderFactoryRequest,
+  type WebSearchRequest,
+  type WebSearchResult,
+  type WebSearchToolOptions,
+} from "./web-search.js";
+
+export {
   LOCAL_HOST_PROTOCOL_VERSION,
   LocalHostProtocolError,
   MAX_LOCAL_HOST_LINE_BYTES,

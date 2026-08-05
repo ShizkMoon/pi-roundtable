@@ -13,6 +13,16 @@ internal sealed record MeetingStoreCheckpoint(
     bool IsClosed,
     DateTimeOffset UpdatedAt);
 
+internal sealed record MeetingDeletionImpact(
+    long EventCount,
+    long CommandCount,
+    long SubagentCount,
+    long MemoryCandidateCount,
+    long RecallAuditCount,
+    long ContextSnapshotCount,
+    long RetentionJobCount,
+    long ArtifactCount = 0);
+
 internal enum CommandJournalReservationDisposition
 {
     Reserved,
@@ -58,6 +68,12 @@ internal interface IMeetingEventStore
         string commandId,
         string fingerprint,
         CancellationToken cancellationToken = default);
+
+    Task<MeetingDeletionImpact> GetDeletionImpactAsync(
+        string meetingId,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteMeetingAsync(string meetingId, CancellationToken cancellationToken = default);
 }
 
 internal interface IContentProtector
@@ -296,6 +312,72 @@ internal sealed class MeetingEventStore : IMeetingEventStore
         }
         await transaction.CommitAsync(cancellationToken);
         return events;
+    }
+
+    public async Task<MeetingDeletionImpact> GetDeletionImpactAsync(
+        string meetingId,
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        return new MeetingDeletionImpact(
+            await CountAsync(connection, "meeting_events", "meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "command_journal", "meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "subagent_runs", "meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "memory_candidates", "source_meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "memory_recall_audits", "meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "role_context_snapshots", "meeting_id", meetingId, cancellationToken),
+            await CountAsync(connection, "memory_retention_jobs", "source_meeting_id", meetingId, cancellationToken));
+    }
+
+    public async Task DeleteMeetingAsync(
+        string meetingId,
+        CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            foreach (var (table, column) in new[]
+            {
+                ("memory_candidates", "source_meeting_id"),
+                ("memory_recall_audits", "meeting_id"),
+                ("role_context_snapshots", "meeting_id"),
+                ("memory_retention_jobs", "source_meeting_id"),
+                ("subagent_runs", "meeting_id"),
+                ("command_journal", "meeting_id"),
+                ("meeting_events", "meeting_id"),
+                ("runtime_checkpoints", "meeting_id"),
+                ("legacy_projections", "meeting_id"),
+            })
+            {
+                await using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = $"DELETE FROM {table} WHERE {column} = $meeting_id";
+                command.Parameters.AddWithValue("$meeting_id", meetingId);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    private static async Task<long> CountAsync(
+        SqliteConnection connection,
+        string table,
+        string column,
+        string meetingId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {table} WHERE {column} = $meeting_id";
+        command.Parameters.AddWithValue("$meeting_id", meetingId);
+        return (long)(await command.ExecuteScalarAsync(cancellationToken) ?? 0L);
     }
 
     public async Task<MeetingStoreCheckpoint?> GetCheckpointAsync(

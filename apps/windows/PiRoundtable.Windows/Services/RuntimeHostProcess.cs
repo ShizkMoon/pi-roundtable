@@ -17,7 +17,11 @@ internal sealed record RuntimeHostStartOptions(
     WorkspaceConfiguration Workspace,
     RoundtableSessionConfiguration Session,
     IReadOnlyDictionary<string, string> Credentials,
-    DiscussionSchedulerStateConfiguration? DiscussionState = null);
+    DiscussionSchedulerStateConfiguration? DiscussionState = null,
+    IReadOnlyDictionary<string, IReadOnlyList<RoleMemoryRecallConfiguration>>? RoleMemoryRecall = null,
+    IReadOnlyDictionary<string, string>? RecoveryContext = null);
+
+internal sealed record RoleMemoryRecallConfiguration(string MemoryId, int Revision, string Content);
 
 internal sealed record RuntimeCommandReceipt(
     string CommandId,
@@ -151,6 +155,8 @@ internal sealed class RuntimeHostProcess : IRuntimeHostProcess
             credentials = options.Credentials,
             initialSequence = options.InitialSequence,
             discussionState = options.DiscussionState,
+            roleMemoryRecall = options.RoleMemoryRecall,
+            recoveryContext = options.RecoveryContext,
         }, cancellationToken);
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

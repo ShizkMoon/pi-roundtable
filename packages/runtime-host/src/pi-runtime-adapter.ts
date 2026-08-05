@@ -54,6 +54,7 @@ import {
 import { resolveProviderCapabilityProfile } from "./provider-capability-profile.js";
 import type { ProviderContextDiagnosticListener } from "./provider-context-diagnostics.js";
 import { parseProviderUsageSample } from "./provider-usage.js";
+import { createWebSearchTool, type WebSearchProvider } from "./web-search.js";
 
 export interface RuntimeCredentialProvider {
   resolveApiKey(providerId: string): Promise<string | undefined>;
@@ -103,6 +104,10 @@ export interface PiSessionCreateOptions {
   approvalHandler?: (request: McpToolApprovalRequest) => Promise<boolean>;
   customTools?: readonly ToolDefinition[];
   diagnosticListener?: ProviderContextDiagnosticListener;
+  webSearch?: {
+    provider: WebSearchProvider;
+    approvalMode: "always" | "on_first_use" | "never";
+  };
 }
 
 export interface PiSessionFactory {
@@ -140,6 +145,10 @@ export interface PiRuntimeAdapterOptions {
   toolApprovalTimeoutMs?: number;
   runtimeGeneration?: number;
   diagnosticListener?: ProviderContextDiagnosticListener;
+  webSearch?: {
+    provider: WebSearchProvider;
+    approvalMode: "always" | "on_first_use" | "never";
+  };
 }
 
 export class PiRuntimeError extends Error {
@@ -522,6 +531,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   #compactionTracker: ContextCompactionTrackerV1 | undefined;
   #lastUsageSignature: string | undefined;
   readonly #pendingToolApprovals = new Map<string, PendingToolApproval>();
+  #webSearchFirstUseApproved = false;
 
   constructor(options: PiRuntimeAdapterOptions) {
     this.#options = {
@@ -796,6 +806,14 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         approvalHandler: (request) => this.#requestToolApproval(request),
         customTools: [
           ...(this.#options.customTools ?? []),
+          ...(this.#options.webSearch === undefined
+            ? []
+            : [createWebSearchTool({
+                provider: this.#options.webSearch.provider,
+                ...(this.#options.webSearch.approvalMode === "never"
+                  ? {}
+                  : { approve: (toolCallId) => this.#approveWebSearch(toolCallId) }),
+              })]),
           ...(this.#options.subagentSpawner === undefined
             ? []
             : [this.#createSubagentTool(this.#options.subagentSpawner)]),
@@ -902,6 +920,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       pending.resolve(false);
     }
     this.#pendingToolApprovals.clear();
+    this.#webSearchFirstUseApproved = false;
     try {
       if (shouldAbort) {
         if (session.isCompacting && session.abortCompaction !== undefined) {
@@ -981,6 +1000,28 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
         expiresAt,
       }, causationId);
     });
+  }
+
+  async #approveWebSearch(toolCallId: string): Promise<boolean> {
+    const webSearch = this.#options.webSearch;
+    if (webSearch === undefined || webSearch.approvalMode === "never") {
+      return true;
+    }
+    if (webSearch.approvalMode === "on_first_use" && this.#webSearchFirstUseApproved) {
+      return true;
+    }
+    const approved = await this.#requestToolApproval({
+      approvalId: `approval.web-search.${randomUUID()}`,
+      toolCallId,
+      serverId: "provider.native",
+      serverDisplayName: "Model provider",
+      toolName: "provider.web_search",
+      toolLabel: "Web search",
+    });
+    if (approved && webSearch.approvalMode === "on_first_use") {
+      this.#webSearchFirstUseApproved = true;
+    }
+    return approved;
   }
 
   #createSubagentTool(spawnSubagent: (task: string) => Promise<string>): ToolDefinition {

@@ -33,12 +33,24 @@ export interface ResolvedRoleRuntimeConfiguration {
   thinkingLevel?: ThinkingLevel;
   systemPrompt: string;
   skillPaths: string[];
+  frozenMemory: readonly FrozenRoleMemory[];
+  recoveryContext?: string;
+  webSearch?: {
+    approvalMode: "always" | "on_first_use" | "never";
+    executionMode: "direct" | "subagent_preferred" | "subagent_required";
+  };
   credentialLease: RoleCredentialLease;
   delegation: {
     networkAccess: "forbidden" | "subagent_required" | "subagent_preferred" | "direct_allowed";
     resultMode: "summary_with_citations" | "summary" | "full";
     maxConcurrentSubagents: number;
   };
+}
+
+export interface FrozenRoleMemory {
+  readonly memoryId: string;
+  readonly revision: number;
+  readonly content: string;
 }
 
 export interface RoleContextAssemblyRequest {
@@ -48,6 +60,8 @@ export interface RoleContextAssemblyRequest {
   scope: RoleScope;
   runtimeGeneration: number;
   resolveCredential: CredentialReferenceResolver;
+  memoryRecall?: readonly FrozenRoleMemory[];
+  recoveryContext?: string;
 }
 
 /** Builds one role's private, frozen runtime configuration. */
@@ -77,6 +91,8 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
     scope,
     runtimeGeneration,
     resolveCredential,
+    memoryRecall = [],
+    recoveryContext,
   }: RoleContextAssemblyRequest): ResolvedRoleRuntimeConfiguration {
     if (participant.participantId !== roleId || participant.scope !== scope) {
       throw new Error("Participant identity or scope does not match the role command");
@@ -111,8 +127,18 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
       workspace,
       policy: participant.capabilitiesSnapshot,
       resolveCredential,
+      networkAccess: participant.delegationSnapshot.networkAccess,
     });
     const plugins = resolvePiPluginSet(capabilities.skillPaths, capabilities.mcpServers);
+    const frozenMemory = freezeMemoryRecall(memoryRecall);
+    if (capabilities.webSearch !== undefined &&
+        !providerModel.modelCapabilities.includes("tool_calling")) {
+      throw new Error("Participant web search grant requires a tool-capable model");
+    }
+    if (recoveryContext !== undefined &&
+        (recoveryContext.includes("\u0000") || Buffer.byteLength(recoveryContext, "utf8") > 192 * 1024)) {
+      throw new Error("Role recovery context exceeds the private runtime limit");
+    }
 
     return {
       displayName: participant.displayName,
@@ -136,6 +162,9 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
       // role prefix exactly once at its own boundary.
       systemPrompt: participant.systemPromptSnapshot,
       skillPaths: [...plugins.skillPaths],
+      frozenMemory,
+      ...(recoveryContext === undefined ? {} : { recoveryContext }),
+      ...(capabilities.webSearch === undefined ? {} : { webSearch: { ...capabilities.webSearch } }),
       credentialLease: new RoleCredentialLease({
         roleId,
         runtimeGeneration,
@@ -153,4 +182,25 @@ export class DefaultRoleContextAssembler implements RoleContextAssembler {
       },
     };
   }
+}
+
+function freezeMemoryRecall(memoryRecall: readonly FrozenRoleMemory[]): readonly FrozenRoleMemory[] {
+  if (memoryRecall.length > 4) {
+    throw new Error("Role memory recall exceeds the item limit");
+  }
+  let characters = 0;
+  const refs = new Set<string>();
+  return Object.freeze(memoryRecall.map((memory) => {
+    const memoryId = memory.memoryId.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(memoryId) ||
+        !Number.isSafeInteger(memory.revision) || memory.revision < 1 ||
+        memory.content.length === 0 || memory.content.includes("\u0000")) {
+      throw new Error("Role memory recall contains an invalid revision");
+    }
+    characters += memory.content.length;
+    if (characters > 6_000 || !refs.add(`${memoryId}@${memory.revision}`)) {
+      throw new Error("Role memory recall exceeds its budget or contains duplicates");
+    }
+    return Object.freeze({ memoryId, revision: memory.revision, content: memory.content });
+  }));
 }

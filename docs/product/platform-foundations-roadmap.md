@@ -1,6 +1,6 @@
 # Pi Roundtable 基础能力与 Windows 优先路线图
 
-- 更新日期：2026-08-04
+- 更新日期：2026-08-05
 - 适用范围：Pi-only、Windows local-first；Android 维持 UI-only
 - 状态口径：`implemented` 表示代码与自动化存在，`connected` 表示用户路径可达，
   `verified` 表示相应验收已在当前候选版本完成，`pending` 不得写成已交付
@@ -30,10 +30,11 @@ Pi Roundtable 的基础能力不是把更多第三方实现直接塞进桌面进
 | --- | --- | --- | --- | --- |
 | 自动上下文压缩 | implemented | connected | runtime-host 单元/集成测试 | 真实长会话记录压缩前后 token、遗漏率和延迟 |
 | 稳定前缀与 provider cache affinity | implemented | connected | 参数与稳定提示词测试 | 由真实 provider usage 验证 cache read/write，未支持的 provider 必须安全忽略 |
-| 角色长期记忆修订库 | implemented | pending | Windows 加密、迁移、并发和重启测试 | 管理 UI、人工审核写入、受限召回注入、无事件/导出泄漏 |
-| 结构化本地存储 | implemented v2 | connected for events; pending for memory UI | SQLite 精确 schema、新建/迁移/回滚/并发与 DPAPI 测试 | 备份/恢复、损坏隔离、数据保留和可选全文索引 |
+| 角色长期记忆修订库 | implemented | connected | Windows 加密、候选审核、修订与冻结召回测试 | meeting-close 候选、安全扫描、保留/隔离和真实长会话验收 |
+| 结构化本地存储 | implemented v3 + platform artifact slice | connected for events, memory and composer artifacts | SQLite 精确 schema、v2→v3 原子迁移、CAS 引用/配额/重启测试 | 完整 platform migration journal、备份/恢复、损坏隔离和数据保留 |
 | Pi Skill | implemented | connected | 已核验路径和 digest 测试 | 安装/更新/撤销的用户反馈与审计记录 |
 | MCP 工具插件 | implemented | connected | allowlist、审批、传输和冲突配置测试 | 运行配额、可取消任务和内容安全诊断 |
+| provider 内建 Web Search | implemented | connected for granted OpenAI routes | 受控 provider fixture、授权/模型/网络策略和隐私诊断测试 | 真实 provider、兼容 provider adapter 与长会话配额验收 |
 | raw Pi extension | intentionally unsupported in-process | unavailable | 能力声明测试 | 只有隔离进程 + 规范化工具桥完成后才可重新评估 |
 | Markdown | implemented renderer + safe input | renderer connected; document input pending | parser/render 与文档测试 | composer 附件、复制/导出一致性、无障碍 |
 | LaTeX/TeX | source fallback + safe input | source fallback connected | 代码块/数学源码测试 | KaTeX 级排版、超时/复杂度限制、复制源码 |
@@ -77,19 +78,22 @@ Pi Roundtable 的基础能力不是把更多第三方实现直接塞进桌面进
 - `user_approved`、`meeting_close_policy`、`automatic_policy` 三类写入授权；
 - 来源会议/事件、置信度、创建与更新时间；
 - 基于 expected revision 的 compare-and-swap，避免并发覆盖；
-- 当前 Windows 用户 DPAPI 加密；迁移后的 SQLite schema v2 与事件库共享写入门。
-- `roundtable.db` v3 与独立 `platform.db` 的表所有权、迁移日志和备份边界已在
-  [ADR 0013](../adr/0013-local-database-ownership-and-forward-migrations.md) 评审；生产表仍分别等待 v0.5/v0.6 迁移。
+- 当前 Windows 用户 DPAPI 加密；SQLite schema v3 与事件库共享写入门，并新增加密候选、
+  append-only recall audit、不可变 context snapshot 与 bounded retention job 表。
+- 独立 `platform.db` v1 已实现 composer artifact 所需的最小 descriptor/binding 索引；完整
+  module catalog、迁移日志、诊断与备份边界仍按
+  [ADR 0013](../adr/0013-local-database-ownership-and-forward-migrations.md) 继续为 `planned`。
 
 ### 4.2 接线策略
 
-下一阶段采用显式策略控制，而不是后台静默改人格：
+当前已接线的路径采用显式策略控制，而不是后台静默改人格：
 
 1. 人工创建/编辑永远可用，并可查看修订来源、撤销或归档。
 2. `review_required` 只生成候选；用户批准后才进入 active memory。
-3. `meeting_close` 在收会时生成差异候选，不能在角色正在发言时修改其稳定前缀。
-4. `selective` 召回必须有条目数和字符/token 双预算，初始目标最多 4 条、约 2400 字符；
-   按语义相关性、更新时间、记忆类型和置信度组合排序。
+3. `meeting_close` 自动生成差异候选仍为 `pending`；当前只接通人工候选，且角色运行时禁用
+   记忆修改，不能静默改变已冻结的上下文。
+4. `selective` 召回在每个角色启动时冻结，最多 4 条、总计 6,000 字符；当前按更新时间、
+   记忆类型和稳定 ID 确定性排序，语义相关性排序仍为 `pending`。
 5. 召回正文放入标记为“不可信背景事实”的私有角色上下文，不能生成公共事件，不能进入
    会话 JSON/Markdown 导出，也不能携带 DPAPI 密文。
 6. 自动写入需要 safety scan、来源证据和可见撤销；人格/System Prompt 演进与事实记忆分表。
@@ -122,8 +126,10 @@ Windows Runtime Owner 实施自己的边界：
 ### 6.1 输入架构
 
 所有文档先经过 `DocumentPipeline`，产出小型 `DocumentArtifactPreflight`：格式、文件名、
-字节数、处理模式、规范化文本和警告。原文件不是聊天字符串，跨设备协议未来只引用
-受作用域保护的 artifact ID。
+字节数、处理模式、规范化文本和警告。确认后，原文件由独立 `platform.db` descriptor/
+meeting binding 与 SHA-256 content-addressed store 管理；导入会重新打开并校验预检摘要，
+配额只清理未绑定的 LRU 内容。原文件不是聊天字符串，跨设备协议未来只引用受作用域
+保护的 artifact ID。
 
 安全门槛包括：32 MiB 原始文件、128 MiB OOXML 解压总量、2048 个 ZIP entry、文本上限、
 扩展名与 magic 双校验、路径穿越/压缩炸弹防护、禁用 DTD/external entity、拒绝宏格式。
@@ -176,9 +182,14 @@ Windows Installer 服务不可达或仅成功生成 MSI，都不能写成 lifecy
 
 ### R2：Windows 用户路径
 
-- [ ] 角色记忆管理页：候选、批准、修订历史、撤销/归档
-- [ ] 会话启动时冻结一次 bounded memory recall，并注入 host-private role context
-- [ ] 公开与私聊 composer 的附件选择、预检摘要、移除、发送失败保留
+- [x] 角色记忆管理页：候选、批准/拒绝、修订历史、停用/恢复与 provenance
+- [x] 会话启动时冻结一次 bounded memory recall，并注入 host-private role context
+- [ ] 公开与私聊 composer 的附件选择、预检摘要、移除、发送失败保留。状态：公开路径
+  `implemented`，私聊附件路径 `pending`
+- [x] 会话分组移动和带影响摘要的删除；事件、命令、SubAgent、候选、audit、snapshot 与
+  meeting artifact binding 完整清理，失败通过 staged delete 在重启时恢复
+- [x] 恢复时读取完整 normalized history，修复缺失/落后的 checkpoint，并按角色 audience
+  生成有界可见上下文；不声称恢复原始 Pi session
 - [ ] KaTeX 级数学排版，同时保留可复制源码与安全回退
 - [ ] PDF 有界正文提取；所有格式都显示来源文件与截断警告
 
@@ -188,7 +199,8 @@ R2 验收必须证明：记忆/附件不改变 `protocol/schema`，不进入无�
 ### R3：结构化输出与可观测性
 
 - [ ] artifact worker 与 Markdown/TeX/DrawIO/DOCX/XLSX/PPTX/PDF 输出
-- [ ] content-addressed local artifact index、配额、保留策略、备份/恢复
+- [ ] content-addressed local artifact index、配额、保留策略、备份/恢复。状态：CAS、事务索引、
+  shared binding、配额与 orphan reconciliation `implemented`；保留策略和备份/恢复 `pending`
 - [ ] 内容安全 OTel 指标：context ratio、compaction、cache、retrieval、artifact worker
 - [ ] 隔离 Pi extension bridge 的可行性原型；只有安全验收通过才调整兼容状态
 

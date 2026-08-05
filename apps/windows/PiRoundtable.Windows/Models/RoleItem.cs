@@ -109,6 +109,9 @@ public sealed class RoleItem : INotifyPropertyChanged
     public Dictionary<string, HashSet<string>> McpToolAllowlists { get; } =
         new(StringComparer.Ordinal);
 
+    public Dictionary<string, ToolGrantConfiguration> ToolGrants { get; } =
+        new(StringComparer.Ordinal);
+
     public string? InvitationId { get; }
 
     public string? InvitationPurpose { get; }
@@ -146,11 +149,11 @@ public sealed class RoleItem : INotifyPropertyChanged
     public string Summary => $"{ScopeLabel} · {Status}";
 
     public string CapabilitiesSummary =>
-        $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP · {McpToolCount} 工具";
+        $"{SkillIds.Count} Skills · {McpServerIds.Count} MCP · {McpToolCount + ToolGrants.Count} 工具";
 
     public string CapabilityGrantSummary =>
         $"{(string.IsNullOrWhiteSpace(ModelProfileId) ? "未路由模型" : ModelProfileId)} · " +
-        $"{SkillIds.Count} Skill · {McpServerIds.Count} MCP / {McpToolCount} 工具 · 工具逐次审批 · {NetworkAccessLabel}";
+        $"{SkillIds.Count} Skill · {McpServerIds.Count} MCP / {McpToolCount + ToolGrants.Count} 工具 · 显式授权 · {NetworkAccessLabel}";
 
     public int McpToolCount => McpToolAllowlists.Values.Sum(tools => tools.Count);
 
@@ -171,6 +174,23 @@ public sealed class RoleItem : INotifyPropertyChanged
     {
         McpServerIds.Remove(mcpServerId);
         McpToolAllowlists.Remove(mcpServerId);
+        NotifyCapabilitiesChanged();
+    }
+
+    public void SetToolGrant(string toolId, string approvalMode, string executionMode)
+    {
+        ToolGrants[toolId] = new ToolGrantConfiguration
+        {
+            ToolId = toolId,
+            ApprovalMode = approvalMode,
+            ExecutionMode = executionMode,
+        };
+        NotifyCapabilitiesChanged();
+    }
+
+    public void RemoveToolGrant(string toolId)
+    {
+        ToolGrants.Remove(toolId);
         NotifyCapabilitiesChanged();
     }
 

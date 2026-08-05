@@ -604,6 +604,8 @@
                                             <AppBarButton Click="ExportSessionJson_Click" IsEnabled="{Binding IsNotRunning}" Label="导出会话包 JSON" />
                                             <AppBarButton Click="ExportSessionMarkdown_Click" IsEnabled="{Binding IsNotRunning}" Label="导出可读 Markdown" />
                                             <AppBarButton Click="ImportSessionPackage_Click" IsEnabled="{Binding IsNotRunning}" Label="导入会话包（先预检）" />
+                                            <AppBarButton AutomationProperties.Name="移动会话到其他分组" Click="MoveSession_Click" IsEnabled="{Binding IsNotRunning}" Label="移动到其他分组" ToolTipService.ToolTip="移动会话到其他分组；运行中不可用" />
+                                            <AppBarButton AutomationProperties.Name="永久删除会话及本地数据" Click="DeleteSession_Click" IsEnabled="{Binding IsNotRunning}" Label="删除会话及本地数据" ToolTipService.ToolTip="显示影响摘要并确认永久删除" />
                                             <AppBarButton Click="CancelGeneration_Click" IsEnabled="{Binding CanOperate}" Label="停止生成" />
                                             <AppBarButton Click="CloseMeeting_Click" IsEnabled="{Binding CanClose}" Label="结束会议" />
                                         </CommandBar.SecondaryCommands>
@@ -888,6 +890,7 @@
                                     <Grid.RowDefinitions>
                                         <RowDefinition Height="Auto" />
                                         <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
                                     </Grid.RowDefinitions>
                                     <TextBox
                                         x:Name="PromptBox"
@@ -902,7 +905,29 @@
                                             <KeyboardAccelerator Invoked="SendPromptAccelerator_Invoked" Key="Enter" Modifiers="Control" />
                                         </TextBox.KeyboardAccelerators>
                                     </TextBox>
-                                    <Grid Grid.Row="1">
+                                    <ListView
+                                        Grid.Row="1"
+                                        MaxHeight="92"
+                                        AutomationProperties.Name="待发送文档"
+                                        ItemsSource="{Binding PendingAttachments}"
+                                        SelectionMode="None">
+                                        <ListView.ItemTemplate>
+                                            <DataTemplate x:DataType="models:DocumentAttachmentItem">
+                                                <Grid Padding="4" ColumnSpacing="8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel>
+                                                        <TextBlock FontWeight="SemiBold" Text="{x:Bind FileName}" TextTrimming="CharacterEllipsis" />
+                                                        <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind Summary}" />
+                                                    </StackPanel>
+                                                    <Button Grid.Column="1" AutomationProperties.Name="移除待发送文档" Click="RemoveAttachment_Click" Content="移除" Tag="{x:Bind ArtifactId}" />
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ListView.ItemTemplate>
+                                    </ListView>
+                                    <Grid Grid.Row="2">
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="*" />
                                             <ColumnDefinition Width="Auto" />
@@ -915,6 +940,7 @@
                                             Text="未写 @：全员参与；多个 @：仅点名角色参与，自动理解分工与顺序 · Ctrl+Enter 发送"
                                             TextWrapping="Wrap" />
                                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                            <Button AutomationProperties.Name="添加本地文档" Click="AddDocument_Click" Content="添加文档" IsEnabled="{Binding CanSend}" />
                                             <Button Click="Interrupt_Click" Content="打断并接管" IsEnabled="{Binding CanOperate}" />
                                             <Button AutomationProperties.Name="发送公开发言" Click="SendPrompt_Click" Content="发送" IsEnabled="{Binding CanSend}" Style="{StaticResource AccentButtonStyle}" />
                                         </StackPanel>
@@ -1027,12 +1053,68 @@
                                                     </DataTemplate>
                                                 </ListView.ItemTemplate>
                                             </ListView>
-                                            <Border Padding="12" Background="{ThemeResource SystemFillColorCautionBackgroundBrush}" CornerRadius="9">
-                                                <StackPanel Spacing="3">
-                                                    <TextBlock FontWeight="SemiBold" Foreground="{ThemeResource SystemFillColorCautionBrush}" Text="长期记忆与提示词演进" />
-                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="策略已持久化；记忆内容写入和提示词自优化执行仍为 planned。" TextWrapping="Wrap" />
+                                            <Expander Header="长期记忆 · 会话启动时冻结 recall">
+                                                <StackPanel Padding="0,8,0,0" Spacing="10">
+                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{Binding MemoryStatusText}" TextWrapping="Wrap" />
+                                                    <ListView
+                                                        MaxHeight="220"
+                                                        AutomationProperties.Name="角色长期记忆"
+                                                        ItemsSource="{Binding RoleMemories}"
+                                                        SelectedItem="{Binding SelectedMemory, Mode=TwoWay}">
+                                                        <ListView.ItemTemplate>
+                                                            <DataTemplate x:DataType="models:RoleMemoryItem">
+                                                                <StackPanel Padding="3,6" Spacing="2">
+                                                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind Content}" TextTrimming="CharacterEllipsis" />
+                                                                    <StackPanel Orientation="Horizontal" Spacing="8">
+                                                                        <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind RevisionLabel}" />
+                                                                        <TextBlock FontSize="11" Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" Text="{x:Bind StatusLabel}" />
+                                                                    </StackPanel>
+                                                                    <TextBlock FontFamily="Cascadia Mono" FontSize="10" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind ProvenanceLabel}" TextTrimming="CharacterEllipsis" />
+                                                                </StackPanel>
+                                                            </DataTemplate>
+                                                        </ListView.ItemTemplate>
+                                                    </ListView>
+                                                    <ComboBox Header="记忆类型" ItemsSource="{Binding MemoryKinds}" SelectedItem="{Binding MemoryKind, Mode=TwoWay}" />
+                                                    <TextBox MinHeight="88" AcceptsReturn="True" Header="记忆内容" Text="{Binding MemoryDraftContent, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" TextWrapping="Wrap" />
+                                                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
+                                                        <Button Click="NewMemory_Click" Content="新建" IsEnabled="{Binding IsNotRunning}" />
+                                                        <Button Click="SubmitMemoryCandidate_Click" Content="提交候选" IsEnabled="{Binding CanSubmitMemoryCandidate}" />
+                                                        <Button Click="MemoryHistory_Click" Content="版本审计" IsEnabled="{Binding CanToggleSelectedMemory}" />
+                                                        <Button Click="ToggleMemory_Click" Content="停用 / 恢复" IsEnabled="{Binding CanToggleSelectedMemory}" />
+                                                        <Button Click="SaveMemory_Click" Content="保存记忆" IsEnabled="{Binding CanSaveMemory}" Style="{StaticResource AccentButtonStyle}" />
+                                                    </StackPanel>
+                                                    <TextBlock FontSize="12" FontWeight="SemiBold" Text="记忆候选审核" />
+                                                    <ListView
+                                                        MaxHeight="180"
+                                                        AutomationProperties.Name="角色记忆候选审核"
+                                                        ItemsSource="{Binding MemoryCandidates}"
+                                                        SelectedItem="{Binding SelectedMemoryCandidate, Mode=TwoWay}">
+                                                        <ListView.ItemTemplate>
+                                                            <DataTemplate x:DataType="models:RoleMemoryCandidateItem">
+                                                                <StackPanel Padding="3,5" Spacing="2">
+                                                                    <TextBlock FontWeight="SemiBold" Text="{x:Bind Content}" TextTrimming="CharacterEllipsis" />
+                                                                    <TextBlock FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind AuditLabel}" />
+                                                                    <TextBlock FontFamily="Cascadia Mono" FontSize="10" Foreground="{ThemeResource TextFillColorSecondaryBrush}" Text="{x:Bind SourceLabel}" TextTrimming="CharacterEllipsis" />
+                                                                </StackPanel>
+                                                            </DataTemplate>
+                                                        </ListView.ItemTemplate>
+                                                    </ListView>
+                                                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
+                                                        <Button AutomationProperties.Name="拒绝选中的记忆候选" Click="RejectMemoryCandidate_Click" Content="拒绝候选" IsEnabled="{Binding CanReviewSelectedMemoryCandidate}" />
+                                                        <Button AutomationProperties.Name="批准选中的记忆候选并写入长期记忆" Click="ApproveMemoryCandidate_Click" Content="批准并写入" IsEnabled="{Binding CanReviewSelectedMemoryCandidate}" Style="{StaticResource AccentButtonStyle}" />
+                                                    </StackPanel>
+                                                    <ListView MaxHeight="150" AutomationProperties.Name="记忆版本审计" ItemsSource="{Binding MemoryHistory}" SelectionMode="None">
+                                                        <ListView.ItemTemplate>
+                                                            <DataTemplate x:DataType="models:RoleMemoryItem">
+                                                                <StackPanel Padding="3,4">
+                                                                    <TextBlock FontSize="11" FontWeight="SemiBold" Text="{x:Bind RevisionLabel}" />
+                                                                    <TextBlock FontSize="11" Text="{x:Bind Content}" TextWrapping="Wrap" />
+                                                                </StackPanel>
+                                                            </DataTemplate>
+                                                        </ListView.ItemTemplate>
+                                                    </ListView>
                                                 </StackPanel>
-                                            </Border>
+                                            </Expander>
                                             <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="8">
                                                 <Button AutomationProperties.Name="归档当前角色" Click="ArchiveRole_Click" Content="归档" IsEnabled="{Binding CanArchiveSelectedRole}" />
                                                 <Button AutomationProperties.Name="保存当前角色配置" Click="SaveRole_Click" Content="保存角色配置" IsEnabled="{Binding IsRoleConfigurationEditable}" Style="{StaticResource AccentButtonStyle}" />

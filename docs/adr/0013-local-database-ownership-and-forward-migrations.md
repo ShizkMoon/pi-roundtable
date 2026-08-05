@@ -1,50 +1,53 @@
 # ADR 0013: Separate meeting memory from platform operations
 
 - Status: accepted
-- Date: 2026-08-04
+- Date: 2026-08-05
 
 ## Context
 
-The Windows Runtime Owner already persists normalized meeting events, command
-receipts, checkpoints, and encrypted role-memory revisions in
-`roundtable.db`. Context snapshots and reviewed memory candidates belong near
-that authoritative meeting history. Module installation, artifact workers, and
-diagnostic retention have different lifetimes, backup policies, and corruption
-failure domains. Putting them all into the meeting database would couple every
-module or file-format migration to meeting recovery.
+The Windows Runtime Owner persists normalized meeting events, command receipts,
+checkpoints, encrypted role-memory revisions/candidates, and private recovery
+records in `roundtable.db`. Context snapshots and reviewed memory candidates
+belong near that authoritative meeting history. Module installation, artifact
+workers, artifact bytes, and diagnostic retention have different lifetimes,
+backup policies, and corruption failure domains. Putting them all into the
+meeting database would couple every module or file-format migration to meeting
+recovery.
 
-The repository needs reviewed storage contracts before either the
-`roundtable.db` v3 migration or the first `platform.db` migration is allowed to
-land. A specification is not an implemented table or a connected user path.
+The reviewed contracts were required before the `roundtable.db` v3 migration
+and first `platform.db` slice could land. This ADR now records both the
+implemented boundaries and the larger platform schema that remains planned. A
+table is not a connected user path, and a minimal artifact slice is not the
+complete platform database.
 
 ## Decision
 
-### 1. Existing `roundtable.db` v2 boundary
+### 1. Implemented `roundtable.db` v3 boundary
 
 `%LOCALAPPDATA%\PiRoundtable\data\roundtable.db` remains owned by Windows
-meeting and role-memory stores. Version 2 contains only:
+meeting and role-memory stores. Version 3 contains:
 
 - normalized meeting events, durable command receipts, runtime checkpoints,
   SubAgent recovery state, and legacy projection import state;
-- logical role memories and their append-only, DPAPI-protected revisions.
+- logical role memories and their append-only, DPAPI-protected revisions;
+- encrypted memory candidates, append-only recall audits, immutable role
+  context snapshots, and bounded memory-retention jobs.
 
 The memory kind is the current classification of one logical memory, not a
 revision field. Reclassification changes that logical label; immutable revision
 content, authority, provenance, confidence, and creation time remain unchanged.
 
 Initialization distinguishes a new database from an existing versioned one.
-Existing v1/v2 databases must match the exact reviewed table, column, primary
-key, unique-index, named-index, and foreign-key shape before use. Migrations run
-inside one SQLite transaction, reject unsupported future versions, and preserve
-the original database on any failure. An unexpected user table is corruption or
-ownership mixing, not an invitation to infer a schema.
+Existing v1/v2/v3 databases must match the exact reviewed table, column,
+primary-key, unique-index, named-index, and foreign-key shape before use.
+Migrations run inside one SQLite transaction, reject unsupported future
+versions, and preserve the original database on any failure. An unexpected user
+table is corruption or ownership mixing, not an invitation to infer a schema.
 
-### 2. Reviewed `roundtable.db` v3 contract
+### 2. Implemented `roundtable.db` v3 additions
 
-Version 3 is **planned**, not created by v0.4. Its first production migration is
-blocked until the v2 direct-schema tests and this contract remain green. The
-migration will add exactly four private table families while preserving every
-v2 table and row:
+The v2→v3 migration adds exactly four private table families while preserving
+every v2 table and row:
 
 1. `memory_candidates`
    - stable candidate ID, workspace ID, long-term role-profile ID, memory kind,
@@ -73,19 +76,22 @@ v2 table and row:
    - jobs may supersede or quarantine private memory state but cannot delete or
      rewrite normalized meeting history.
 
-V3 DDL, indices, limits, and the v2→v3 transaction will be introduced together
-with migration/rollback, restart, isolation, no-plaintext, and previous-version
-fixtures. No placeholder v3 table is allowed before that change.
+V3 DDL, indices, limits, and the v2→v3 transaction landed together with
+migration/rollback, restart, isolation, no-plaintext, and previous-version
+fixtures. The connected user path currently covers manual candidate review and
+bounded recall audits. Context-snapshot persistence/restore and retention-job
+execution remain planned even though their immutable storage contracts exist.
 
-### 3. Future `platform.db` v1 boundary
+### 3. Minimal `platform.db` v1 artifact boundary
 
-`%LOCALAPPDATA%\PiRoundtable\data\platform.db` is a separate **planned**
-database owned by the Windows platform/application-service layer. It never
-stores normalized meeting events, command receipts, role memories, provider
-credentials, raw Pi sessions, or document bodies that belong in content-
-addressed artifact files.
+`%LOCALAPPDATA%\PiRoundtable\data\platform.db` is a separate database owned by
+the Windows platform/application-service layer. Its implemented version-1 slice
+contains only content-addressed artifact descriptors and meeting bindings. It
+never stores normalized meeting events, command receipts, role memories,
+provider credentials, raw Pi sessions, or document bodies; artifact bytes live
+under a SHA-256 content-addressed root.
 
-Its reviewed version-1 ownership covers:
+The complete reviewed version-1 ownership is broader and remains planned for:
 
 - signed catalog observations, immutable module versions, and active-version
   pointers;
@@ -96,12 +102,14 @@ Its reviewed version-1 ownership covers:
 - private versioned diagnostic records and retention/export-preview state;
 - backup-set metadata and a platform migration journal.
 
-`platform_schema_info` has an independent integer version. A
-`platform_migration_journal` records operation ID, from/to version, phase,
-started/updated/completed timestamps, recovery disposition, and a closed
-redacted failure code. Large packages and generated files remain outside SQLite
-and are referenced by digest-scoped IDs. Active pointers change only after
-signed-catalog, artifact-integrity, dependency, and health checks commit.
+The implemented slice has an independent `platform_schema_info` integer version
+and validates its owned tables before use. `platform_migration_journal`, module
+catalog/install records, worker jobs, diagnostics, and backup metadata are not
+created as placeholders. The future journal records operation ID, from/to
+version, phase, timestamps, recovery disposition, and a closed redacted failure
+code. Large packages and generated files remain outside SQLite and are
+referenced by digest-scoped IDs. Active pointers change only after signed-
+catalog, artifact-integrity, dependency, and health checks commit.
 
 ### 4. Backup, restore, and diagnostics
 
@@ -121,10 +129,11 @@ content, local absolute paths, SQL containing private values, or DPAPI blobs.
 
 - Meeting recovery cannot be broken by a module-catalog or artifact-worker
   schema migration.
-- V0.5 may implement `roundtable.db` v3 only after the v2 compatibility gate;
-  v0.6 may create `platform.db` v1 only with its own interrupted-migration,
-  backup/restore, concurrent-open, and prior-version evidence.
+- `roundtable.db` v3 and the minimal artifact subset of `platform.db` v1 are
+  implemented with direct migration/storage tests. Backup/restore, corruption
+  quarantine, and the complete platform migration journal remain release gates.
 - Diagnostics can later share `platform.db` retention without becoming public
   protocol events or contaminating meeting storage.
-- This ADR implements the v3/platform ownership specifications only. V3 tables,
-  `platform.db`, backup engines, diagnostic stores, and their UI remain planned.
+- This ADR governs the implemented v3 tables and minimal platform artifact
+  slice. Backup engines, diagnostic/module stores, general artifact workers,
+  complete platform migrations, and their UI remain planned.

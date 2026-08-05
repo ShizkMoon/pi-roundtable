@@ -2,7 +2,14 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
-import type { CapabilityPolicy, WorkspaceProfile } from "@pi-roundtable/protocol";
+import type {
+  ApprovalMode,
+  CapabilityPolicy,
+  DelegationPolicy,
+  ExecutionMode,
+  WorkspaceProfile,
+} from "@pi-roundtable/protocol";
+import { WEB_SEARCH_TOOL_ID } from "./web-search.js";
 
 import {
   validateRemoteMcpEndpoint,
@@ -15,11 +22,16 @@ export interface RoleCapabilityResolutionRequest {
   workspace: WorkspaceProfile;
   policy: CapabilityPolicy;
   resolveCredential: CredentialReferenceResolver;
+  networkAccess: DelegationPolicy["networkAccess"];
 }
 
 export interface ResolvedRoleCapabilities {
   skillPaths: string[];
   mcpServers: ResolvedMcpServerRuntimeConfiguration[];
+  webSearch?: {
+    approvalMode: ApprovalMode;
+    executionMode: ExecutionMode;
+  };
 }
 
 /** Resolves frozen grants without granting authority from prompt text. */
@@ -49,6 +61,7 @@ export class WorkspaceCapabilityResolver implements CapabilityResolver {
     workspace,
     policy,
     resolveCredential,
+    networkAccess,
   }: RoleCapabilityResolutionRequest): ResolvedRoleCapabilities {
     const skillPaths = policy.skillIds.map((skillId) => {
       const skill = workspace.skills.find(
@@ -136,9 +149,32 @@ export class WorkspaceCapabilityResolver implements CapabilityResolver {
       },
     );
 
-    // policy.toolGrants is deliberately not converted into runtime tools. A
-    // manifest may restrict a known executor, but cannot create one.
-    return { skillPaths, mcpServers };
+    const webSearchGrants = policy.toolGrants.filter(
+      (grant) => grant.toolId === WEB_SEARCH_TOOL_ID,
+    );
+    if (webSearchGrants.length > 1) {
+      throw new Error("Participant web search grant is duplicated");
+    }
+    const webSearch = webSearchGrants[0];
+    if (webSearch !== undefined) {
+      if (networkAccess === "forbidden") {
+        throw new Error("Participant web search grant conflicts with forbidden network access");
+      }
+      if (webSearch.executionMode === "direct" && networkAccess !== "direct_allowed") {
+        throw new Error("Direct web search requires direct_allowed network policy");
+      }
+      if (webSearch.executionMode !== "direct" && networkAccess === "direct_allowed") {
+        throw new Error("SubAgent web search grant requires a SubAgent network policy");
+      }
+      if (webSearch.executionMode !== "direct" && webSearch.approvalMode !== "never") {
+        throw new Error("SubAgent web search requires a pre-approved never-prompt grant");
+      }
+    }
+    return {
+      skillPaths,
+      mcpServers,
+      ...(webSearch === undefined ? {} : { webSearch: { ...webSearch } }),
+    };
   }
 
   #resolveApprovedSkillPath(locator: string): string {
