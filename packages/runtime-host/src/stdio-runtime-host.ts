@@ -167,6 +167,8 @@ export class StdioRuntimeHost {
                   frame.credentials,
                   frame.initialSequence,
                   frame.discussionState,
+                  frame.roleMemoryRecall,
+                  frame.recoveryContext,
                 );
                 this.host.start();
                 if (frame.session.phase === "live") {

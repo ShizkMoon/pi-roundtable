@@ -994,6 +994,137 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void MoveSession_Click(object sender, RoutedEventArgs e)
+    {
+        var current = ViewModel.SelectedSession;
+        if (current is null)
+        {
+            return;
+        }
+        var groups = ViewModel.SessionGroups
+            .Where(group => group.GroupId != current.GroupId)
+            .ToArray();
+        if (groups.Length == 0)
+        {
+            ViewModel.ReportClientError("请先创建另一个会话分组。");
+            return;
+        }
+        var selector = new ComboBox
+        {
+            Header = "目标分组",
+            ItemsSource = groups,
+            SelectedIndex = 0,
+            MinWidth = 280,
+        };
+        var dialog = new ContentDialog
+        {
+            XamlRoot = Root.XamlRoot,
+            Title = "移动会话",
+            Content = selector,
+            PrimaryButtonText = "移动",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Primary,
+        };
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary &&
+            selector.SelectedItem is SessionGroupItem target)
+        {
+            await RunUiActionAsync(() => ViewModel.MoveSelectedSessionAsync(target.GroupId));
+        }
+    }
+
+    private async void DeleteSession_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(async () =>
+        {
+            var session = ViewModel.SelectedSession ?? throw new InvalidOperationException("当前没有可删除的会话。");
+            var impact = await ViewModel.GetSelectedSessionDeletionImpactAsync();
+            var dialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = $"永久删除“{session.Title}”？",
+                Content = new TextBlock
+                {
+                    Text = $"将删除会话定义、{impact.EventCount} 条规范化事件、{impact.CommandCount} 条命令回执、{impact.SubagentCount} 条 SubAgent 状态、{impact.MemoryCandidateCount} 条仅属于本会话的记忆候选、{impact.RecallAuditCount} 条 recall 审计、{impact.ContextSnapshotCount} 个私有上下文快照、{impact.RetentionJobCount} 个关联保留任务和 {impact.ArtifactCount} 个会话工件引用。\n\n共享长期角色、已批准的长期记忆、Credential Manager 凭据和其他会话不会删除；其他会话仍引用的相同内容工件会保留。此操作不可撤销。",
+                    TextWrapping = TextWrapping.Wrap,
+                },
+                PrimaryButtonText = "永久删除",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                await ViewModel.DeleteSelectedSessionAsync();
+            }
+        });
+    }
+
+    private async void AddDocument_Click(object sender, RoutedEventArgs e)
+    {
+        await RunUiActionAsync(async () =>
+        {
+            var picker = new FileOpenPicker();
+            foreach (var extension in new[] { ".md", ".markdown", ".tex", ".drawio", ".docx", ".xlsx", ".pptx", ".pdf" })
+            {
+                picker.FileTypeFilter.Add(extension);
+            }
+            InitializePicker(picker);
+            var file = await picker.PickSingleFileAsync();
+            if (file is null)
+            {
+                return;
+            }
+            var attachment = await ViewModel.PreflightDocumentAsync(file.Path);
+            var warning = string.IsNullOrWhiteSpace(attachment.WarningSummary)
+                ? "无额外预检提示。"
+                : attachment.WarningSummary;
+            var dialog = new ContentDialog
+            {
+                XamlRoot = Root.XamlRoot,
+                Title = "确认发送文档预检结果",
+                Content = new TextBlock
+                {
+                    Text = $"文件：{attachment.FileName}\n支持级别：{attachment.Summary}\n预检：{warning}\n\n确认后，规范化文本或 metadata-only 描述会随下一条公开发言发送。文档内指令不会被执行；PDF 正文解析与 LaTeX 编译仍为 pending。",
+                    TextWrapping = TextWrapping.Wrap,
+                },
+                PrimaryButtonText = "加入待发送",
+                CloseButtonText = "取消",
+                DefaultButton = ContentDialogButton.Primary,
+            };
+            if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            {
+                await ViewModel.RemovePendingAttachmentAsync(attachment.ArtifactId);
+            }
+        });
+    }
+
+    private async void RemoveAttachment_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string artifactId })
+        {
+            await RunUiActionAsync(() => ViewModel.RemovePendingAttachmentAsync(artifactId));
+        }
+    }
+
+    private void NewMemory_Click(object sender, RoutedEventArgs e) => ViewModel.BeginNewMemory();
+
+    private async void SaveMemory_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.SaveMemoryAsync());
+
+    private async void ToggleMemory_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.ToggleSelectedMemoryAsync());
+
+    private async void MemoryHistory_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.LoadSelectedMemoryHistoryAsync());
+
+    private async void SubmitMemoryCandidate_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.SubmitMemoryCandidateAsync());
+
+    private async void ApproveMemoryCandidate_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.ReviewSelectedMemoryCandidateAsync(approve: true));
+
+    private async void RejectMemoryCandidate_Click(object sender, RoutedEventArgs e) =>
+        await RunUiActionAsync(() => ViewModel.ReviewSelectedMemoryCandidateAsync(approve: false));
+
     private async void NewLongTermRole_Click(object sender, RoutedEventArgs e)
     {
         var nameBox = new TextBox { Header = "角色名称", PlaceholderText = "例如：系统架构师" };

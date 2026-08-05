@@ -30,7 +30,11 @@ internal sealed class WindowsApplicationCompositionRoot : IDisposable
                 new ClientSettingsStore(),
                 new ProviderModelDiscoveryService(),
                 new CatalogImportService(),
-                new LlmCatalogAnalysisService()),
+                new LlmCatalogAnalysisService(),
+                new MeetingCommandGateway(),
+                new RoleMemoryStore(),
+                new DocumentPipeline(),
+                new ArtifactStore()),
             new WindowsUpdateService())
     {
     }
@@ -112,7 +116,11 @@ internal sealed class MainViewModelServices : IDisposable
         ClientSettingsStore clientSettingsStore,
         ProviderModelDiscoveryService providerModelDiscovery,
         CatalogImportService catalogImport,
-        LlmCatalogAnalysisService llmCatalogAnalysis)
+        LlmCatalogAnalysisService llmCatalogAnalysis,
+        MeetingCommandGateway commandGateway,
+        IRoleMemoryStore roleMemoryStore,
+        IDocumentPipeline documentPipeline,
+        IArtifactStore artifactStore)
     {
         RuntimeHostFactory = runtimeHostFactory ?? throw new ArgumentNullException(nameof(runtimeHostFactory));
         MeetingCoreFactory = meetingCoreFactory ?? throw new ArgumentNullException(nameof(meetingCoreFactory));
@@ -125,6 +133,17 @@ internal sealed class MainViewModelServices : IDisposable
         ProviderModelDiscovery = providerModelDiscovery ?? throw new ArgumentNullException(nameof(providerModelDiscovery));
         CatalogImport = catalogImport ?? throw new ArgumentNullException(nameof(catalogImport));
         LlmCatalogAnalysis = llmCatalogAnalysis ?? throw new ArgumentNullException(nameof(llmCatalogAnalysis));
+        CommandGateway = commandGateway ?? throw new ArgumentNullException(nameof(commandGateway));
+        RoleMemoryStore = roleMemoryStore ?? throw new ArgumentNullException(nameof(roleMemoryStore));
+        DocumentPipeline = documentPipeline ?? throw new ArgumentNullException(nameof(documentPipeline));
+        ArtifactStore = artifactStore ?? throw new ArgumentNullException(nameof(artifactStore));
+        WorkspaceController = new WorkspaceController(WorkspaceStore, SessionStore, ClientSettingsStore);
+        RoleProfileController = new RoleProfileController(CredentialStore, ProviderModelDiscovery);
+        CatalogController = new CatalogController(CatalogImport, LlmCatalogAnalysis);
+        SessionController = new MeetingSessionController(RuntimeHostFactory, EventStore);
+        RecoveryContextBuilder = new MeetingRecoveryContextBuilder();
+        ProjectionController = new MeetingProjectionController(MeetingCoreFactory, EventStore);
+        SessionLifecycle = new SessionLifecycleController(SessionStore, EventStore, ArtifactStore);
     }
 
     public IRuntimeHostFactory RuntimeHostFactory { get; }
@@ -138,6 +157,17 @@ internal sealed class MainViewModelServices : IDisposable
     public ProviderModelDiscoveryService ProviderModelDiscovery { get; }
     public CatalogImportService CatalogImport { get; }
     public LlmCatalogAnalysisService LlmCatalogAnalysis { get; }
+    public MeetingCommandGateway CommandGateway { get; }
+    public WorkspaceController WorkspaceController { get; }
+    public RoleProfileController RoleProfileController { get; }
+    public CatalogController CatalogController { get; }
+    public MeetingSessionController SessionController { get; }
+    public MeetingRecoveryContextBuilder RecoveryContextBuilder { get; }
+    public MeetingProjectionController ProjectionController { get; }
+    public SessionLifecycleController SessionLifecycle { get; }
+    public IRoleMemoryStore RoleMemoryStore { get; }
+    public IDocumentPipeline DocumentPipeline { get; }
+    public IArtifactStore ArtifactStore { get; }
 
     public void Dispose()
     {
@@ -151,7 +181,14 @@ internal sealed class MainViewModelServices : IDisposable
         }
         finally
         {
-            LlmCatalogAnalysis.Dispose();
+            try
+            {
+                LlmCatalogAnalysis.Dispose();
+            }
+            finally
+            {
+                ProjectionController.Dispose();
+            }
         }
     }
 }

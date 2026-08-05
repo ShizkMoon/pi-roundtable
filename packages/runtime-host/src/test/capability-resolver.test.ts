@@ -40,6 +40,7 @@ test("resolves only approved Skill and MCP grants and leaves generic tools non-e
     }).resolve({
       workspace,
       policy,
+      networkAccess: "direct_allowed",
       resolveCredential: (reference) =>
         reference === "secret://mcp-token" ? "mcp-secret" : undefined,
     });
@@ -82,10 +83,43 @@ test("rejects an MCP launcher outside the explicit allowlist", () => {
         }],
         toolGrants: [],
       },
+      networkAccess: "direct_allowed",
       resolveCredential: () => undefined,
     }),
     /outside the approved launcher allowlist/,
   );
+});
+
+test("enables web search only when grant and network execution policy agree", () => {
+  const workspace = createWorkspace("unused", "unused");
+  workspace.skills = [];
+  workspace.mcpServers = [];
+  const policy: CapabilityPolicy = {
+    skillIds: [],
+    mcpGrants: [],
+    toolGrants: [{
+      toolId: "provider.web_search",
+      approvalMode: "never",
+      executionMode: "subagent_required",
+    }],
+  };
+  const resolved = new WorkspaceCapabilityResolver().resolve({
+    workspace,
+    policy,
+    networkAccess: "subagent_required",
+    resolveCredential: () => undefined,
+  });
+  assert.deepEqual(resolved.webSearch, {
+    toolId: "provider.web_search",
+    approvalMode: "never",
+    executionMode: "subagent_required",
+  });
+  assert.throws(() => new WorkspaceCapabilityResolver().resolve({
+    workspace,
+    policy,
+    networkAccess: "forbidden",
+    resolveCredential: () => undefined,
+  }), /conflicts with forbidden network access/);
 });
 
 function createWorkspace(skillManifest: string, mcpInstallation: string): WorkspaceProfile {

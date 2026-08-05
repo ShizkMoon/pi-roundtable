@@ -20,6 +20,14 @@ export interface LocalHostInitializeFrame {
   credentials: Record<string, string>;
   initialSequence: number;
   discussionState?: DiscussionSchedulerSnapshot;
+  roleMemoryRecall?: Readonly<Record<string, readonly LocalRoleMemoryRecall[]>>;
+  recoveryContext?: Readonly<Record<string, string>>;
+}
+
+export interface LocalRoleMemoryRecall {
+  memoryId: string;
+  revision: number;
+  content: string;
 }
 
 export interface LocalHostCommandFrame {
@@ -161,6 +169,8 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
       }
       credentials[reference] = secret;
     }
+    const roleMemoryRecall = parseRoleMemoryRecall(value.roleMemoryRecall, requestId);
+    const recoveryContext = parseRecoveryContext(value.recoveryContext, requestId);
     return {
       type: "initialize",
       requestId,
@@ -168,6 +178,8 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
       session: value.session as unknown as RoundtableSession,
       credentials,
       initialSequence: value.initialSequence as number,
+      ...(roleMemoryRecall === undefined ? {} : { roleMemoryRecall }),
+      ...(recoveryContext === undefined ? {} : { recoveryContext }),
       ...(value.discussionState === undefined
         ? {}
         : isRecord(value.discussionState)
@@ -199,4 +211,121 @@ export function parseLocalHostInput(line: string): LocalHostInputFrame {
     );
   }
   return { type: "command", command: value.command as unknown as MeetingCommand };
+}
+
+function parseRoleMemoryRecall(
+  value: unknown,
+  requestId: string,
+): Readonly<Record<string, readonly LocalRoleMemoryRecall[]>> | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value) || Object.keys(value).length > 64) {
+    throw new LocalHostProtocolError(
+      "invalid_frame",
+      "Initialize roleMemoryRecall must be a bounded role map",
+      requestId,
+    );
+  }
+  const result: Record<string, readonly LocalRoleMemoryRecall[]> = Object.create(null);
+  let totalBytes = 0;
+  for (const [roleId, rawItems] of Object.entries(value)) {
+    if (!isIdentity(roleId) || !Array.isArray(rawItems) || rawItems.length > 4) {
+      throw new LocalHostProtocolError(
+        "invalid_frame",
+        "Initialize roleMemoryRecall contains an invalid role or item count",
+        requestId,
+      );
+    }
+    const refs = new Set<string>();
+    result[roleId] = Object.freeze(rawItems.map((rawItem): LocalRoleMemoryRecall => {
+      if (
+        !isRecord(rawItem) ||
+        !isIdentity(rawItem.memoryId) ||
+        !Number.isSafeInteger(rawItem.revision) ||
+        (rawItem.revision as number) < 1 ||
+        typeof rawItem.content !== "string" ||
+        rawItem.content.length === 0 ||
+        rawItem.content.includes("\u0000") ||
+        rawItem.content.length > 8_000
+      ) {
+        throw new LocalHostProtocolError(
+          "invalid_frame",
+          "Initialize roleMemoryRecall contains an invalid revision",
+          requestId,
+        );
+      }
+      const reference = `${rawItem.memoryId}@${rawItem.revision as number}`;
+      if (!refs.add(reference)) {
+        throw new LocalHostProtocolError(
+          "invalid_frame",
+          "Initialize roleMemoryRecall contains duplicate revisions",
+          requestId,
+        );
+      }
+      totalBytes += Buffer.byteLength(rawItem.content, "utf8");
+      return Object.freeze({
+        memoryId: rawItem.memoryId,
+        revision: rawItem.revision as number,
+        content: rawItem.content,
+      });
+    }));
+  }
+  if (totalBytes > 256 * 1024) {
+    throw new LocalHostProtocolError(
+      "invalid_frame",
+      "Initialize roleMemoryRecall exceeds the byte limit",
+      requestId,
+    );
+  }
+  return Object.freeze(result);
+}
+
+function parseRecoveryContext(
+  value: unknown,
+  requestId: string,
+): Readonly<Record<string, string>> | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value) || Object.keys(value).length > 64) {
+    throw new LocalHostProtocolError(
+      "invalid_frame",
+      "Initialize recoveryContext must be a bounded role map",
+      requestId,
+    );
+  }
+  const result: Record<string, string> = Object.create(null);
+  let totalBytes = 0;
+  for (const [roleId, content] of Object.entries(value)) {
+    if (!isIdentity(roleId) || typeof content !== "string" || content.includes("\u0000")) {
+      throw new LocalHostProtocolError(
+        "invalid_frame",
+        "Initialize recoveryContext contains invalid content",
+        requestId,
+      );
+    }
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes > 192 * 1024) {
+      throw new LocalHostProtocolError(
+        "invalid_frame",
+        "Initialize recoveryContext role content exceeds the byte limit",
+        requestId,
+      );
+    }
+    totalBytes += bytes;
+    result[roleId] = content;
+  }
+  if (totalBytes > 768 * 1024) {
+    throw new LocalHostProtocolError(
+      "invalid_frame",
+      "Initialize recoveryContext exceeds the byte limit",
+      requestId,
+    );
+  }
+  return Object.freeze(result);
+}
+
+function isIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
 }

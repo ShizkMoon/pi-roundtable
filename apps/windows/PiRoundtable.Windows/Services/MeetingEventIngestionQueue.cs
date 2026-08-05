@@ -5,7 +5,8 @@ internal interface IMeetingEventIngestionQueueFactory
     MeetingEventIngestionQueue Create(
         Func<RuntimeMeetingEvent, Task> acceptEventAsync,
         Func<string, Task> reportFaultAsync,
-        Action<string>? trace = null);
+        Action<string>? trace = null,
+        Action<string>? diagnostic = null);
 }
 
 internal sealed class MeetingEventIngestionQueueFactory : IMeetingEventIngestionQueueFactory
@@ -13,22 +14,25 @@ internal sealed class MeetingEventIngestionQueueFactory : IMeetingEventIngestion
     public MeetingEventIngestionQueue Create(
         Func<RuntimeMeetingEvent, Task> acceptEventAsync,
         Func<string, Task> reportFaultAsync,
-        Action<string>? trace = null)
+        Action<string>? trace = null,
+        Action<string>? diagnostic = null)
     {
         ArgumentNullException.ThrowIfNull(acceptEventAsync);
         ArgumentNullException.ThrowIfNull(reportFaultAsync);
-        return new MeetingEventIngestionQueue(acceptEventAsync, reportFaultAsync, trace);
+        return new MeetingEventIngestionQueue(acceptEventAsync, reportFaultAsync, trace, diagnostic);
     }
 }
 
 internal sealed class MeetingEventIngestionQueue(
     Func<RuntimeMeetingEvent, Task> acceptEventAsync,
     Func<string, Task> reportFaultAsync,
-    Action<string>? trace = null)
+    Action<string>? trace = null,
+    Action<string>? diagnostic = null)
 {
     private readonly Func<RuntimeMeetingEvent, Task> _acceptEventAsync = acceptEventAsync;
     private readonly Func<string, Task> _reportFaultAsync = reportFaultAsync;
     private readonly Action<string>? _trace = trace;
+    private readonly Action<string>? _diagnostic = diagnostic;
     private readonly object _gate = new();
     private Task _tail = Task.CompletedTask;
     private ulong _runtimeGeneration;
@@ -91,11 +95,13 @@ internal sealed class MeetingEventIngestionQueue(
             if (meetingEvent.RuntimeGeneration != _runtimeGeneration)
             {
                 Trace($"ignore sequence={meetingEvent.Sequence} reason=generation expected={_runtimeGeneration} actual={meetingEvent.RuntimeGeneration}");
+                Diagnose("已安全丢弃旧 Runtime generation 的迟到事件；当前会议状态未改变。");
                 return;
             }
             if (meetingEvent.Sequence <= _acceptedSequence)
             {
                 Trace($"ignore sequence={meetingEvent.Sequence} reason=duplicate accepted={_acceptedSequence}");
+                Diagnose("已安全忽略重复事件；本地历史未重复写入。");
                 return;
             }
             expectedSequence = _acceptedSequence + 1;
@@ -144,6 +150,18 @@ internal sealed class MeetingEventIngestionQueue(
         catch
         {
             // Diagnostic output must never affect event ingestion.
+        }
+    }
+
+    private void Diagnose(string message)
+    {
+        try
+        {
+            _diagnostic?.Invoke(message);
+        }
+        catch
+        {
+            // Closed diagnostics cannot affect event ingestion.
         }
     }
 }

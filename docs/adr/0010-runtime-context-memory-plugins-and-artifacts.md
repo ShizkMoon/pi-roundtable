@@ -43,9 +43,13 @@ entities, traversal paths, or compression bombs.
 - Existing meetings and public event contracts remain compatible.
 - Prefix caching improves when a provider supports it; providers that do not
   support caching safely ignore the hint.
-- Memory storage is implemented, but automatic extraction and prompt recall
-  require an explicit policy-controlled Windows integration rather than an
-  invisible database side effect.
+- Manual memory candidate review and bounded next-session recall are implemented
+  through explicit Windows/Runtime Host integration. Automatic meeting-close
+  extraction, safety scanning, and retention remain separate planned work.
 - Markdown/TeX/DrawIO/OOXML input can be normalized safely. PDF body extraction,
   KaTeX-quality typesetting, and office/PDF output remain separate deliverables,
   not implied by format recognition.
+- Confirmed public-composer inputs are stored in a private content-addressed
+  artifact store with independent metadata, quota, meeting references, and
+  restart reconciliation. This minimal slice does not imply general artifact
+  workers, previews, private-composer parity, or backup/restore.

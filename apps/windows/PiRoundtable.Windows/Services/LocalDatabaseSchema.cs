@@ -9,7 +9,7 @@ namespace PiRoundtable.Windows.Services;
 /// </summary>
 internal static class LocalDatabaseSchema
 {
-    internal const int CurrentVersion = 2;
+    internal const int CurrentVersion = 3;
     private const int MaximumBusyRetries = 3;
     private const int SchemaLockAttemptTimeoutSeconds = 1;
     private const int SchemaLockAttemptTimeoutMilliseconds = 1_000;
@@ -98,6 +98,61 @@ internal static class LocalDatabaseSchema
         ]),
     ];
 
+    private static readonly TableDefinition[] Version3Tables =
+    [
+        .. Version2Tables,
+        new("memory_candidates",
+        [
+            new("candidate_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 1),
+            new("workspace_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("role_profile_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("source_meeting_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("source_event_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 0),
+            new("memory_kind", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("protected_content", "BLOB", IsRequired: true, PrimaryKeyOrder: 0),
+            new("confidence", "REAL", IsRequired: false, PrimaryKeyOrder: 0),
+            new("status", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("decision_revision", "INTEGER", IsRequired: true, PrimaryKeyOrder: 0),
+            new("created_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("updated_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+        ]),
+        new("memory_recall_audits",
+        [
+            new("audit_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 1),
+            new("meeting_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("workspace_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("role_profile_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("runtime_generation", "INTEGER", IsRequired: true, PrimaryKeyOrder: 0),
+            new("considered_refs", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("selected_refs", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("injected_refs", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("created_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+        ]),
+        new("role_context_snapshots",
+        [
+            new("snapshot_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 1),
+            new("meeting_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("role_profile_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("runtime_generation", "INTEGER", IsRequired: true, PrimaryKeyOrder: 0),
+            new("source_sequence", "INTEGER", IsRequired: true, PrimaryKeyOrder: 0),
+            new("policy_version", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("prefix_fingerprint", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("protected_snapshot", "BLOB", IsRequired: true, PrimaryKeyOrder: 0),
+            new("created_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+        ]),
+        new("memory_retention_jobs",
+        [
+            new("job_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 1),
+            new("workspace_id", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("role_profile_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 0),
+            new("source_meeting_id", "TEXT", IsRequired: false, PrimaryKeyOrder: 0),
+            new("status", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("not_before", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("created_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+            new("updated_at", "TEXT", IsRequired: true, PrimaryKeyOrder: 0),
+        ]),
+    ];
+
     private static readonly IndexDefinition[] Version1Indexes =
     [
         new("meeting_events", null, IsUnique: true, "pk", IsPartial: false,
@@ -151,6 +206,52 @@ internal static class LocalDatabaseSchema
             new("role_profile_id", IsDescending: false, "BINARY"),
             new("memory_id", IsDescending: false, "BINARY"),
             new("revision", IsDescending: false, "BINARY"),
+        ]),
+    ];
+
+    private static readonly IndexDefinition[] Version3Indexes =
+    [
+        .. Version2Indexes,
+        new("memory_candidates", null, IsUnique: true, "pk", IsPartial: false,
+        [
+            new("candidate_id", IsDescending: false, "BINARY"),
+        ]),
+        new("memory_candidates", "ix_memory_candidates_review", IsUnique: false, "c", IsPartial: false,
+        [
+            new("workspace_id", IsDescending: false, "BINARY"),
+            new("role_profile_id", IsDescending: false, "BINARY"),
+            new("status", IsDescending: false, "BINARY"),
+            new("updated_at", IsDescending: true, "BINARY"),
+        ]),
+        new("memory_recall_audits", null, IsUnique: true, "pk", IsPartial: false,
+        [
+            new("audit_id", IsDescending: false, "BINARY"),
+        ]),
+        new("memory_recall_audits", "ix_memory_recall_meeting", IsUnique: false, "c", IsPartial: false,
+        [
+            new("meeting_id", IsDescending: false, "BINARY"),
+            new("role_profile_id", IsDescending: false, "BINARY"),
+            new("runtime_generation", IsDescending: false, "BINARY"),
+        ]),
+        new("role_context_snapshots", null, IsUnique: true, "pk", IsPartial: false,
+        [
+            new("snapshot_id", IsDescending: false, "BINARY"),
+        ]),
+        new("role_context_snapshots", "ix_role_context_restore", IsUnique: true, "c", IsPartial: false,
+        [
+            new("meeting_id", IsDescending: false, "BINARY"),
+            new("role_profile_id", IsDescending: false, "BINARY"),
+            new("runtime_generation", IsDescending: false, "BINARY"),
+            new("source_sequence", IsDescending: false, "BINARY"),
+        ]),
+        new("memory_retention_jobs", null, IsUnique: true, "pk", IsPartial: false,
+        [
+            new("job_id", IsDescending: false, "BINARY"),
+        ]),
+        new("memory_retention_jobs", "ix_memory_retention_due", IsUnique: false, "c", IsPartial: false,
+        [
+            new("status", IsDescending: false, "BINARY"),
+            new("not_before", IsDescending: false, "BINARY"),
         ]),
     ];
 
@@ -268,6 +369,11 @@ internal static class LocalDatabaseSchema
             await MigrateVersion1To2Async(connection, transaction, cancellationToken);
             version = 2;
         }
+        if (version == 2)
+        {
+            await MigrateVersion2To3Async(connection, transaction, cancellationToken);
+            version = 3;
+        }
         EnsureSupportedVersion(version);
         await ValidateSchemaAsync(connection, transaction, version, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
@@ -379,6 +485,74 @@ internal static class LocalDatabaseSchema
             """, cancellationToken);
     }
 
+    private static async Task MigrateVersion2To3Async(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await ExecuteAsync(connection, transaction, """
+            CREATE TABLE memory_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                role_profile_id TEXT NOT NULL,
+                source_meeting_id TEXT NOT NULL,
+                source_event_id TEXT,
+                memory_kind TEXT NOT NULL,
+                protected_content BLOB NOT NULL,
+                confidence REAL,
+                status TEXT NOT NULL,
+                decision_revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX ix_memory_candidates_review
+            ON memory_candidates(workspace_id, role_profile_id, status, updated_at DESC);
+
+            CREATE TABLE memory_recall_audits (
+                audit_id TEXT PRIMARY KEY,
+                meeting_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                role_profile_id TEXT NOT NULL,
+                runtime_generation INTEGER NOT NULL,
+                considered_refs TEXT NOT NULL,
+                selected_refs TEXT NOT NULL,
+                injected_refs TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX ix_memory_recall_meeting
+            ON memory_recall_audits(meeting_id, role_profile_id, runtime_generation);
+
+            CREATE TABLE role_context_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                meeting_id TEXT NOT NULL,
+                role_profile_id TEXT NOT NULL,
+                runtime_generation INTEGER NOT NULL,
+                source_sequence INTEGER NOT NULL,
+                policy_version TEXT NOT NULL,
+                prefix_fingerprint TEXT NOT NULL,
+                protected_snapshot BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX ix_role_context_restore
+            ON role_context_snapshots(meeting_id, role_profile_id, runtime_generation, source_sequence);
+
+            CREATE TABLE memory_retention_jobs (
+                job_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                role_profile_id TEXT,
+                source_meeting_id TEXT,
+                status TEXT NOT NULL,
+                not_before TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX ix_memory_retention_due
+            ON memory_retention_jobs(status, not_before);
+
+            UPDATE schema_info SET schema_version = 3 WHERE singleton = 1;
+            """, cancellationToken);
+    }
+
     private static void EnsureSupportedVersion(int version)
     {
         if (version is < 1 or > CurrentVersion)
@@ -417,6 +591,7 @@ internal static class LocalDatabaseSchema
         {
             1 => Version1Tables,
             2 => Version2Tables,
+            3 => Version3Tables,
             _ => throw new InvalidDataException($"不支持的本地数据库版本：{version}。"),
         };
         var actualTableNames = await ReadUserTableNamesAsync(connection, transaction, cancellationToken);
@@ -437,7 +612,13 @@ internal static class LocalDatabaseSchema
             connection,
             transaction,
             expectedTables,
-            version == 1 ? Version1Indexes : Version2Indexes,
+            version switch
+            {
+                1 => Version1Indexes,
+                2 => Version2Indexes,
+                3 => Version3Indexes,
+                _ => throw new InvalidDataException($"不支持的本地数据库版本：{version}。"),
+            },
             cancellationToken);
         if (version >= 2)
         {
