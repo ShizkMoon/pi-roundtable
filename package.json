@@ -1,6 +1,6 @@
 {
   "name": "pi-roundtable",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Native GUI-first multi-agent roundtable platform",
   "type": "module",
