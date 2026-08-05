@@ -3,18 +3,18 @@
   "productId": "PiRoundtable.Windows",
   "channel": "stable",
   "architecture": "x64",
-  "version": "0.4.0",
-  "publishedAt": "2026-08-04T18:28:25.3269459+00:00",
+  "version": "0.4.1",
+  "publishedAt": "2026-08-05T13:27:06.3200712+00:00",
   "asset": {
-    "url": "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.4.0/PiRoundtable-0.4.0-win-x64.msi",
-    "fileName": "PiRoundtable-0.4.0-win-x64.msi",
-    "size": 148848943,
-    "sha256": "D9399C65596BAF368AB790122992A2C0C104771764CCA7CBB02B49C4A711CC4F",
+    "url": "https://github.com/ShizkMoon/pi-roundtable/releases/download/v0.4.1/PiRoundtable-0.4.1-win-x64.msi",
+    "fileName": "PiRoundtable-0.4.1-win-x64.msi",
+    "size": 148869540,
+    "sha256": "FEFBD3C9AD7856ED040F6C8FC5E80D3A9FE54AD7838BFCAE7EADA6B8F020601F",
     "authenticodeRequired": false
   },
   "signature": {
     "algorithm": "ECDSA_P256_SHA256",
     "keyId": "stable-2026-08",
-    "value": "4m95icAjDwiDnO9jgW1SB7CxCtINkqduccsGpKKigJ0XMfgqbsWMgyOTqGb6SRRUwaoUIPp3LhE10ugKO8PocA=="
+    "value": "+NYzo5WarHqOU16AQYq+Tf7pI9Uo2Wg29z2eUg9wkZRky826IfHru7jzfJOPxD6g0SvXVnk+Ck380OCfa57ojw=="
   }
 }

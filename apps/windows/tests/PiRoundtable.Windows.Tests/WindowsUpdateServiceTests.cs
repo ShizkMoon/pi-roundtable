@@ -624,12 +624,12 @@ public sealed class WindowsUpdateServiceTests
             },
             ReleaseAssetBaseUri: new Uri("https://github.com/ShizkMoon/pi-roundtable/releases/download/")));
 
-        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-05T00:00:00Z"));
+        var verified = verifier.ParseAndVerify(File.ReadAllBytes(manifestPath), DateTimeOffset.Parse("2026-08-06T00:00:00Z"));
 
-        Assert.AreEqual(new Version(0, 4, 0), verified.Version);
+        Assert.AreEqual(new Version(0, 4, 1), verified.Version);
         Assert.AreEqual("stable-2026-08", verified.Document.Signature.KeyId);
-        Assert.AreEqual(148848943, verified.Document.Asset.Size);
-        Assert.AreEqual("D9399C65596BAF368AB790122992A2C0C104771764CCA7CBB02B49C4A711CC4F", verified.Document.Asset.Sha256);
+        Assert.AreEqual(148869540, verified.Document.Asset.Size);
+        Assert.AreEqual("FEFBD3C9AD7856ED040F6C8FC5E80D3A9FE54AD7838BFCAE7EADA6B8F020601F", verified.Document.Asset.Sha256);
         Assert.IsFalse(verified.Document.Asset.AuthenticodeRequired);
     }
 
