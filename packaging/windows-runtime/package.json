@@ -8,7 +8,7 @@
     "@earendil-works/pi-coding-agent": "0.83.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@pi-roundtable/protocol": "file:./protocol",
-    "undici": "8.9.0"
+    "undici": "8.10.2"
   },
   "overrides": {
     "@earendil-works/pi-coding-agent": {
