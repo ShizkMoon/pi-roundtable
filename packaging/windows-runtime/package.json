@@ -6,7 +6,7 @@
   "dependencies": {
     "@earendil-works/pi-ai": "0.83.0",
     "@earendil-works/pi-coding-agent": "0.83.0",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@pi-roundtable/protocol": "file:./protocol",
     "undici": "8.9.0"
   },
